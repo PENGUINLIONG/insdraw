@@ -34,7 +34,7 @@ impl Default for Vector {
 }
 impl Vector {
     pub fn new(x: f32, y: f32, z: f32) -> Self { unsafe { Vector(_mm_set_ps(0.0, z, y, x)) } }
-    pub fn dot(self, rhs: Self) -> f32 { unsafe { transmute(_mm_extract_ps(_mm_dp_ps(self.0, rhs.0, 0xf1), 0)) } }
+    pub fn dot(self, rhs: Self) -> f32 { unsafe { _mm_cvtss_f32(_mm_dp_ps(self.0, rhs.0, 0xf1)) } }
     pub fn cross(self, rhs: Self) -> Self {
         unsafe {
             let a = _mm_shuffle_ps(rhs.0, rhs.0, 0b11001001);
@@ -54,7 +54,10 @@ impl Vector {
 pub struct Point(__m128);
 impl PartialEq for Point {
     fn eq(&self, rhs: &Self) -> bool {
-        unsafe { _mm_test_all_ones(transmute(_mm_cmp_ps(self.0, rhs.0, _CMP_EQ_OQ))) == 1 }
+        unsafe { _mm_movemask_ps(_mm_cmpeq_ps(self.0, rhs.0)) == 0x0f }
+    }
+    fn ne(&self, rhs: &Self) -> bool {
+        unsafe { _mm_movemask_ps(_mm_cmpneq_ps(self.0, rhs.0)) == 0x0f }
     }
 }
 impl Default for Point {
