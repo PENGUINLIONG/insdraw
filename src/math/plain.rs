@@ -70,14 +70,67 @@ impl Point {
 
 
 
+#[derive(Clone, Copy, Debug)]
+pub struct Transform(__m128, __m128, __m128); // Row-major, 3x4 matrix, left-mul for transform.
+impl Mul<Vector> for Transform {
+    type Output = Vector;
+    fn mul(self, rhs: Vector) -> Vector {
+        unsafe {
+            let c = _mm_insert_ps(rhs.0, _mm_set1_ps(1.0), 0x00);
+            Vector(_mm_or_ps(_mm_or_ps(_mm_dp_ps(self.0, c, 0xf1), _mm_dp_ps(self.1, c, 0xf2)), _mm_dp_ps(self.2, c, 0xf4)))
+        }
+    }
+}
+impl Mul<Transform> for Transform {
+    type Output = Self;
+    fn mul(self, rhs: Self) -> Self {
+        unsafe {
+            let z = _mm_set_ps(1.0, 0.0, 0.0, 0.0);
+            let c1c2lo = _mm_unpacklo_ps(rhs.0, rhs.1);
+            let c1c2hi = _mm_unpacklo_ps(rhs.2, z);
+            let c3c4lo = _mm_unpackhi_ps(rhs.0, rhs.1);
+            let c3c4hi = _mm_unpackhi_ps(rhs.2, z);
+            let c1 = _mm_movelh_ps(c1c2lo, c1c2hi);
+            let c2 = _mm_movehl_ps(c1c2hi, c1c2lo);
+            let c3 = _mm_movelh_ps(c3c4lo, c3c4hi);
+            let c4 = _mm_movehl_ps(c3c4hi, c3c4lo);
+            let r1 = _mm_or_ps(_mm_or_ps(_mm_dp_ps(self.0, c1, 0xf1), _mm_dp_ps(self.0, c2, 0xf2)), _mm_or_ps(_mm_dp_ps(self.0, c3, 0xf4), _mm_dp_ps(self.0, c4, 0xf8)));
+            let r2 = _mm_or_ps(_mm_or_ps(_mm_dp_ps(self.1, c1, 0xf1), _mm_dp_ps(self.1, c2, 0xf2)), _mm_or_ps(_mm_dp_ps(self.1, c3, 0xf4), _mm_dp_ps(self.1, c4, 0xf8)));
+            let r3 = _mm_or_ps(_mm_or_ps(_mm_dp_ps(self.2, c1, 0xf1), _mm_dp_ps(self.2, c2, 0xf2)), _mm_or_ps(_mm_dp_ps(self.2, c3, 0xf4), _mm_dp_ps(self.2, c4, 0xf8)));
+            Transform(r1, r2, r3)
+        }
+    }
+}
+impl PartialEq for Transform {
+    fn eq(&self, rhs: &Transform) -> bool {
+        unsafe {
+            _mm_movemask_ps(_mm_cmpeq_ps(self.0, rhs.0)) & _mm_movemask_ps(_mm_cmpeq_ps(self.1, rhs.1)) & _mm_movemask_ps(_mm_cmpeq_ps(self.2, rhs.2)) == 0x0f
+        }
+    }
+}
+impl Transform {
+    pub fn eye() -> Transform {
+        unsafe {
+            Transform(
+                _mm_set_ps(0.0, 0.0, 0.0, 1.0),
+                _mm_set_ps(0.0, 0.0, 1.0, 0.0),
+                _mm_set_ps(0.0, 1.0, 0.0, 0.0),
+            )
+        }
+    }
+}
+
+
 
 #[cfg(test)]
 mod test {
-    use super::{Point, Vector};
+    use super::{*};
     #[test]
     fn test_eq() {
         assert_eq!(Vector::new(1.0, 1.0, 1.0), Vector::new(1.0, 1.0, 1.0));
         assert!(Vector::new(0.0, 1.0, 1.0) != Vector::new(1.0, 1.0, 1.0));
+        assert!(Vector::new(1.0, 0.0, 1.0) != Vector::new(1.0, 1.0, 1.0));
+        assert!(Vector::new(1.0, 1.0, 0.0) != Vector::new(1.0, 1.0, 1.0));
     }
     #[test]
     fn test_vec_arith() {
@@ -104,5 +157,13 @@ mod test {
     #[test]
     fn test_pt_affine() {
         assert_eq!(Point::new(1.0, 2.0, 3.0).affine(Vector::new(1.0, 2.0, 3.0)), Point::new(2.0, 4.0, 6.0));
+    }
+    #[test]
+    fn test_trans_identity() {
+        assert_eq!(Transform::eye() * Transform::eye(), Transform::eye());
+    }
+    #[test]
+    fn test_trans() {
+        assert_eq!(Transform::eye() * Vector::new(1.0, 1.0, 1.0), Vector::new(1.0, 1.0, 1.0));
     }
 }
