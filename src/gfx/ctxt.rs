@@ -2,9 +2,10 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::iter::repeat;
 use std::ffi::{CStr, CString};
+use log::{info};
 use ash::vk;
 use ash::{vk_make_version, Entry, Instance, Device};
-use ash::version::{EntryV1_0, EntryV1_1, InstanceV1_0, InstanceV1_1, DeviceV1_0, DeviceV1_1};
+use ash::version::{EntryV1_0, InstanceV1_0, DeviceV1_0};
 use super::GraphicsError;
 
 #[derive(Default)]
@@ -60,15 +61,17 @@ impl ContextBuilder {
         self.feats = feats;
         self
     }
-    fn try_create_inst(&self) -> Result<Instance, GraphicsError> {
+    fn try_create_inst(&self) -> Result<(Entry, Instance), GraphicsError> {
         use ash::extensions::{khr::Surface, khr::Win32Surface};
         let entry = Entry::new()?;
         // Create vulkan instance.
+        let app_name = CString::new(self.app_name).unwrap();
+        let engine_name = CString::new("insdraw").unwrap();
         let app_info = vk::ApplicationInfo::builder()
             .api_version(vk_make_version!(1, 1, 0))
-            .application_name(&CString::new(self.app_name).unwrap())
+            .application_name(&app_name)
             .application_version(vk_make_version!(0, 0, 1))
-            .engine_name(CStr::from_bytes_with_nul(b"insdraw\0").unwrap())
+            .engine_name(&engine_name)
             .engine_version(vk_make_version!(0, 0, 1))
             .build();
         let inst_create_info = vk::InstanceCreateInfo::builder()
@@ -79,7 +82,7 @@ impl ContextBuilder {
             ])
             .build();
         let inst = unsafe { entry.create_instance(&inst_create_info, None)? };
-        Ok(inst)
+        Ok((entry, inst))
     }
     fn try_create_dev(&mut self, inst: &Instance, physdev: vk::PhysicalDevice) -> Result<(Device, HashMap<&'static str, vk::Queue>), GraphicsError> {
         // In following codes, `i` is queue family index; `j` is queue index in
@@ -152,21 +155,28 @@ impl ContextBuilder {
         Ok((dev, queues))
     }
     pub fn build(mut self) -> Result<Context, GraphicsError> {
-        let inst = self.try_create_inst()?;
-        let (dev, queues) = unsafe { inst.enumerate_physical_devices() }?.into_iter()
+        let (entry, inst) = self.try_create_inst()?;
+        info!("created vulkan instance");
+        let physdevs = unsafe { inst.enumerate_physical_devices() }?;
+        info!("discovered {} physical devices", physdevs.len());
+        let (dev, queues) = physdevs.into_iter()
             .find_map(|physdev| {
-                match &self.dev_sel {
-                    Some(sel) => {
-                        let props = unsafe { inst.get_physical_device_properties(physdev) };
-                        if sel(&props) {
-                            self.try_create_dev(&inst, physdev).ok()
-                        } else { None }
-                    },
-                    None => None,
+                if let Some(sel) = &self.dev_sel {
+                    let prop = unsafe { inst.get_physical_device_properties(physdev) };
+                    let dev_name = unsafe { CStr::from_ptr(prop.device_name.as_ptr()).to_string_lossy() };
+                    info!("checking out '{}' ({:?})...", dev_name, prop.device_type);
+                    if sel(&prop) {
+                        if let Ok(x) = self.try_create_dev(&inst, physdev) {
+                            info!("created device on '{}'", dev_name);
+                            return Some(x)
+                        }
+                    }
                 }
+                None
             })
             .ok_or(GraphicsError::NoCapablePhysicalDevice)?;
         let ctxt = Context {
+            entry: entry,
             inst: inst,
             dev: dev,
             queues: queues,
@@ -175,6 +185,7 @@ impl ContextBuilder {
     }
 }
 pub struct Context {
+    entry: Entry,
     inst: Instance,
     dev: Device,
     queues: HashMap<&'static str, vk::Queue>,
