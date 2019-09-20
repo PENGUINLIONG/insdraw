@@ -44,11 +44,25 @@ pub struct ContextBuilder {
     app_name: &'static str,
     icfgs: Vec<InterfaceConfig>,
     dev_sel: Option<Box<dyn Fn(&vk::PhysicalDeviceProperties) -> bool>>,
+    api_exts: Vec<CString>,
+    dev_exts: Vec<CString>,
     feats: vk::PhysicalDeviceFeatures,
 }
 impl ContextBuilder {
     pub fn filter_device<DevSel: 'static + Fn(&vk::PhysicalDeviceProperties) -> bool>(mut self, dev_sel: DevSel) -> Self {
         self.dev_sel = Some(Box::new(dev_sel));
+        self
+    }
+    pub fn with_api_extensions(mut self, api_exts: &'static [&'static str]) -> Self {
+        self.api_exts = api_exts.iter()
+            .map(|&x| CString::new(x).unwrap())
+            .collect::<Vec<_>>();
+        self
+    }
+    pub fn with_device_extensions(mut self, dev_exts: &'static [&'static str]) -> Self {
+        self.dev_exts = dev_exts.iter()
+            .map(|&x| CString::new(x).unwrap())
+            .collect::<Vec<_>>();
         self
     }
     pub fn with_interface(mut self, icfg: InterfaceConfig) -> Self {
@@ -74,12 +88,12 @@ impl ContextBuilder {
             .engine_name(&engine_name)
             .engine_version(vk_make_version!(0, 0, 1))
             .build();
+        let api_exts = self.api_exts.iter()
+            .map(|x| x.as_ptr())
+            .collect::<Vec<_>>();
         let inst_create_info = vk::InstanceCreateInfo::builder()
             .application_info(&app_info)
-            .enabled_extension_names(&[
-                Surface::name().as_ptr(),
-                Win32Surface::name().as_ptr(),
-            ])
+            .enabled_extension_names(&api_exts)
             .build();
         let inst = unsafe { entry.create_instance(&inst_create_info, None)? };
         Ok((entry, inst))
@@ -139,15 +153,20 @@ impl ContextBuilder {
             })
             .collect::<Vec<_>>();
         // Create device.
+        let dev_exts = self.dev_exts.iter()
+            .map(|x| x.as_ptr())
+            .collect::<Vec<_>>();
         let dev_create_info = vk::DeviceCreateInfo::builder()
             .enabled_features(&self.feats)
             .queue_create_infos(&create_infos)
+            .enabled_extension_names(&dev_exts)
             .build();
         let dev = unsafe { inst.create_device(physdev, &dev_create_info, None)? };
         // Extract queues.
         let queues = interface_qfam_idxs.into_iter()
             .map(|(i, j, k)| {
                 let name = self.icfgs[k].name;
+                info!("set up queue for interface '{}'", name);
                 let queue = unsafe { dev.get_device_queue(i as u32, j) };
                 (name, queue)
             })
@@ -164,10 +183,10 @@ impl ContextBuilder {
                 if let Some(sel) = &self.dev_sel {
                     let prop = unsafe { inst.get_physical_device_properties(physdev) };
                     let dev_name = unsafe { CStr::from_ptr(prop.device_name.as_ptr()).to_string_lossy() };
-                    info!("checking out '{}' ({:?})...", dev_name, prop.device_type);
+                    info!("checking '{}' ({:?})...", dev_name, prop.device_type);
                     if sel(&prop) {
                         if let Ok(x) = self.try_create_dev(&inst, physdev) {
-                            info!("created device on '{}'", dev_name);
+                            info!("created device on '{}' ({:?})", dev_name, prop.device_type);
                             return Some(x)
                         }
                     }
