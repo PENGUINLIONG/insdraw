@@ -70,6 +70,32 @@ impl Point {
 
 
 
+trait PointSet: AsRef<[Point]> {
+    fn get_bounds(&self) -> (Point, Point) {
+        let pts = self.as_ref();
+        let n = pts.len();
+        unsafe {
+            let (mut min, mut max) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+            for i in (0..n).step_by(2) {
+                let x = _mm256_insertf128_ps(_mm256_castps128_ps256(pts[i].0), pts[i + 1].0, 1);
+                min = _mm256_min_ps(min, x);
+                max = _mm256_max_ps(max, x);
+            }
+            let mut min = _mm_min_ps(_mm256_extractf128_ps(min, 0), _mm256_extractf128_ps(min, 1));
+            let mut max = _mm_max_ps(_mm256_extractf128_ps(max, 0), _mm256_extractf128_ps(max, 1));
+            if n & 1 == 1 {
+                let last = pts[n - 1].0;
+                min = _mm_min_ps(min, last);
+                max = _mm_max_ps(max, last);
+            }
+            (Point(min), Point(max))
+        }
+    }
+}
+impl<T> PointSet for T where T: AsRef<[Point]> {}
+
+
+
 #[derive(Clone, Copy, Debug)]
 pub struct Transform(__m128, __m128, __m128); // Row-major, 3x4 matrix, left-mul for transform.
 impl Mul<Vector> for Transform {
@@ -109,6 +135,14 @@ impl PartialEq for Transform {
     }
 }
 impl Transform {
+    pub fn new(x: Vector, y: Vector, z: Vector, shift: Vector) -> Transform {
+        unsafe {
+            let x = _mm_or_ps(x.0, _mm_shuffle_ps(shift.0, shift.0, 0x3f));
+            let y = _mm_or_ps(y.0, _mm_shuffle_ps(shift.0, shift.0, 0x7f));
+            let z = _mm_or_ps(z.0, _mm_shuffle_ps(shift.0, shift.0, 0xbf));
+            Transform(x, y, z)
+        }
+    }
     pub fn eye() -> Transform {
         unsafe {
             Transform(
@@ -160,10 +194,20 @@ mod test {
     }
     #[test]
     fn test_trans_identity() {
-        assert_eq!(Transform::eye() * Transform::eye(), Transform::eye());
+        let eye = Transform::eye();
+        let ones = Vector::new(1.0, 1.0, 1.0);
+        assert_eq!(eye * eye, eye);
+        let vec = Vector::new(1.0, 2.0, 3.0);
+        let trans = Transform::new(vec, vec, vec, ones);
+        assert_eq!(eye * trans, Transform::new(vec, vec, vec, ones));
     }
     #[test]
     fn test_trans() {
-        assert_eq!(Transform::eye() * Vector::new(1.0, 1.0, 1.0), Vector::new(1.0, 1.0, 1.0));
+        let eye = Transform::eye();
+        let ones = Vector::new(1.0, 1.0, 1.0);
+        assert_eq!(eye * ones, ones);
+        let vec = Vector::new(1.0, 2.0, 3.0);
+        let trans = Transform::new(vec, vec, vec, vec);
+        assert_eq!(trans * ones, ones * 6.0);
     }
 }
