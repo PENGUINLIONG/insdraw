@@ -32,15 +32,6 @@ impl PartialEq for Vector {
 impl Default for Vector {
     fn default() -> Self { unsafe { Vector(_mm_setzero_ps()) } }
 }
-impl Mul<Transform> for Vector {
-    type Output = Vector;
-    fn mul(self, rhs: Transform) -> Vector {
-        unsafe {
-            let c = _mm_or_ps(self.0, _mm_set_ps(1.0, 0.0, 0.0, 0.0));
-            Vector(_mm_or_ps(_mm_or_ps(_mm_dp_ps(rhs.0, c, 0xf1), _mm_dp_ps(rhs.1, c, 0xf2)), _mm_dp_ps(rhs.2, c, 0xf4)))
-        }
-    }
-}
 impl Vector {
     pub fn new(x: f32, y: f32, z: f32) -> Self { unsafe { Vector(_mm_set_ps(0.0, z, y, x)) } }
     pub fn dot(self, rhs: Self) -> f32 { unsafe { _mm_cvtss_f32(_mm_dp_ps(self.0, rhs.0, 0xf1)) } }
@@ -81,7 +72,7 @@ impl Default for Point {
     fn default() -> Self { unsafe { Point(_mm_setzero_ps()) } }
 }
 impl Point {
-    pub fn new(x: f32, y: f32, z: f32) -> Self { unsafe { Point(_mm_set_ps(0.0, z, y, x)) } }
+    pub fn new(x: f32, y: f32, z: f32) -> Self { unsafe { Point(_mm_set_ps(1.0, z, y, x)) } }
 }
 
 
@@ -113,7 +104,7 @@ impl<T> PointSet for T where T: AsRef<[Point]> {}
 
 
 /// 4x4 column-major matrix, this can do no algebra and should be only used as a
-/// data container.
+/// data container. Left-mul for transformation in GLSL code.
 pub struct Matrix(__m128, __m128, __m128, __m128);
 trait ToMatrix {
     // Convert a linear operator to Vulkan-compatible column-major matrix,
@@ -121,7 +112,7 @@ trait ToMatrix {
     fn to_matrix(&self) -> Matrix;
 }
 
-/// 3x4 row-major matrix, right-mul to apply transform. Less memory and
+/// 3x4 row-major matrix, left-mul to apply transform. Less memory and
 /// instructions per multiplication is needed on host side.
 #[derive(Clone, Copy, Debug)]
 pub struct Transform(__m128, __m128, __m128);
@@ -129,11 +120,20 @@ impl Mul<Transform> for Transform {
     type Output = Self;
     fn mul(self, rhs: Self) -> Self {
         unsafe {
-            let Matrix(x, y, z, w) = rhs.to_matrix();
-            let r1 = _mm_or_ps(_mm_or_ps(_mm_dp_ps(self.0, x, 0xf1), _mm_dp_ps(self.0, y, 0xf2)), _mm_or_ps(_mm_dp_ps(self.0, z, 0xf4), _mm_dp_ps(self.0, w, 0xf8)));
-            let r2 = _mm_or_ps(_mm_or_ps(_mm_dp_ps(self.1, x, 0xf1), _mm_dp_ps(self.1, y, 0xf2)), _mm_or_ps(_mm_dp_ps(self.1, z, 0xf4), _mm_dp_ps(self.1, w, 0xf8)));
-            let r3 = _mm_or_ps(_mm_or_ps(_mm_dp_ps(self.2, x, 0xf1), _mm_dp_ps(self.2, y, 0xf2)), _mm_or_ps(_mm_dp_ps(self.2, z, 0xf4), _mm_dp_ps(self.2, w, 0xf8)));
+            let Matrix(x, y, z, w) = self.to_matrix();
+            let r1 = _mm_or_ps(_mm_or_ps(_mm_dp_ps(rhs.0, x, 0xf1), _mm_dp_ps(rhs.0, y, 0xf2)), _mm_or_ps(_mm_dp_ps(rhs.0, z, 0xf4), _mm_dp_ps(rhs.0, w, 0xf8)));
+            let r2 = _mm_or_ps(_mm_or_ps(_mm_dp_ps(rhs.1, x, 0xf1), _mm_dp_ps(rhs.1, y, 0xf2)), _mm_or_ps(_mm_dp_ps(rhs.1, z, 0xf4), _mm_dp_ps(rhs.1, w, 0xf8)));
+            let r3 = _mm_or_ps(_mm_or_ps(_mm_dp_ps(rhs.2, x, 0xf1), _mm_dp_ps(rhs.2, y, 0xf2)), _mm_or_ps(_mm_dp_ps(rhs.2, z, 0xf4), _mm_dp_ps(rhs.2, w, 0xf8)));
             Transform(r1, r2, r3)
+        }
+    }
+}
+impl Mul<Vector> for Transform {
+    type Output = Vector;
+    fn mul(self, rhs: Vector) -> Vector {
+        unsafe {
+            let c = _mm_or_ps(rhs.0, _mm_set_ps(1.0, 0.0, 0.0, 0.0));
+            Vector(_mm_or_ps(_mm_or_ps(_mm_dp_ps(self.0, c, 0xf1), _mm_dp_ps(self.1, c, 0xf2)), _mm_dp_ps(self.2, c, 0xf4)))
         }
     }
 }
@@ -187,7 +187,7 @@ impl Transform {
     }
 }
 impl ToMatrix for Transform {
-    pub fn to_matrix(&self) -> Matrix {
+    fn to_matrix(&self) -> Matrix {
         unsafe {
             let z = _mm_set_ps(1.0, 0.0, 0.0, 0.0);
             let c1c2lo = _mm_unpacklo_ps(self.0, self.1);
@@ -254,9 +254,9 @@ mod test {
     fn test_trans() {
         let eye = Transform::eye();
         let ones = Vector::new(1.0, 1.0, 1.0);
-        assert_eq!(ones * eye, ones);
+        assert_eq!(eye * ones, ones);
         let vec = Vector::new(1.0, 2.0, 3.0);
         let trans = Transform::new(vec, vec, vec, vec);
-        assert_eq!(ones * trans, Vector::new(4.0, 8.0, 12.0));
+        assert_eq!(trans * ones, Vector::new(4.0, 8.0, 12.0));
     }
 }

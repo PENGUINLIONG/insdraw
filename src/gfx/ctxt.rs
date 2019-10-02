@@ -53,29 +53,29 @@ impl ContextBuilder {
         self.dev_sel = Some(Box::new(dev_sel));
         self
     }
-    pub fn with_api_extensions(mut self, api_exts: &'static [&'static str]) -> Self {
+    pub fn with_api_extensions(&mut self, api_exts: &'static [&'static str]) -> Self {
         self.api_exts = api_exts.iter()
             .map(|&x| CString::new(x).unwrap())
             .collect::<Vec<_>>();
         self
     }
-    pub fn with_device_extensions(mut self, dev_exts: &'static [&'static str]) -> Self {
+    pub fn with_device_extensions(&mut self, dev_exts: &'static [&'static str]) -> Self {
         self.dev_exts = dev_exts.iter()
             .map(|&x| CString::new(x).unwrap())
             .collect::<Vec<_>>();
         self
     }
-    pub fn with_interface(mut self, icfg: InterfaceConfig) -> Self {
+    pub fn with_interface(&mut self, icfg: InterfaceConfig) -> Self {
         // Sort queue configs by flag complexity, in descending order. Complex
         // requirements should be met first.
         self.icfgs.push(icfg);
         self
     }
-    pub fn with_features(mut self, feats: vk::PhysicalDeviceFeatures) -> Self {
+    pub fn with_features(&mut self, feats: vk::PhysicalDeviceFeatures) -> Self {
         self.feats = feats;
         self
     }
-    fn try_create_inst(&self) -> Result<(Entry, Instance), GraphicsError> {
+    fn try_create_inst(&self) -> GraphicsResult<(Entry, Instance)> {
         use ash::extensions::{khr::Surface, khr::Win32Surface};
         let entry = Entry::new()?;
         // Create vulkan instance.
@@ -98,7 +98,7 @@ impl ContextBuilder {
         let inst = unsafe { entry.create_instance(&inst_create_info, None)? };
         Ok((entry, inst))
     }
-    fn try_create_dev(&mut self, inst: &Instance, physdev: vk::PhysicalDevice) -> Result<(Device, HashMap<&'static str, vk::Queue>), GraphicsError> {
+    fn try_create_dev(&mut self, inst: &Instance, physdev: vk::PhysicalDevice) -> GraphicsResult<(Device, HashMap<&'static str, vk::Queue>)> {
         // In following codes, `i` is queue family index; `j` is queue index in
         // a family; and `k` is the index of interface.
 
@@ -173,7 +173,7 @@ impl ContextBuilder {
             .collect::<HashMap<_, _>>();
         Ok((dev, queues))
     }
-    pub fn build(mut self) -> Result<Context, GraphicsError> {
+    pub fn build(&mut self) -> GraphicsResult<Context> {
         let (entry, inst) = self.try_create_inst()?;
         info!("created vulkan instance");
         let physdevs = unsafe { inst.enumerate_physical_devices() }?;
@@ -204,10 +204,11 @@ impl ContextBuilder {
     }
 }
 pub struct Context {
-    entry: Entry,
-    inst: Instance,
+    // Don't change the order. Things should be dropped from top to bottom.
+    queues: HashMap<&str, vk::Queue>,
     dev: Device,
-    queues: HashMap<&'static str, vk::Queue>,
+    inst: Instance,
+    entry: Entry,
 }
 impl Context {
     pub fn builder(app_name: &'static str) -> ContextBuilder {
