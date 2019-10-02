@@ -1,9 +1,12 @@
+use std::result;
 
 mod error;
 mod ctxt;
 
 pub use error::*;
 pub use ctxt::*;
+
+type Result<T> = result::Result<T, Error>;
 
 /*
 pub struct RenderConfig {

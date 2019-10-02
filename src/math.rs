@@ -239,7 +239,7 @@ mod test {
     }
     #[test]
     fn test_pt_affine() {
-        assert_eq!(Point::new(1.0, 2.0, 3.0).affine(Vector::new(1.0, 2.0, 3.0)), Point::new(2.0, 4.0, 6.0));
+        assert_eq!(Point::new(1.0, 2.0, 3.0) + Vector::new(1.0, 2.0, 3.0), Point::new(2.0, 4.0, 6.0));
     }
     #[test]
     fn test_trans_identity() {
@@ -249,14 +249,5 @@ mod test {
         let vec = Vector::new(1.0, 2.0, 3.0);
         let trans = Transform::new(vec, vec, vec, ones);
         assert_eq!(eye * trans, Transform::new(vec, vec, vec, ones));
-    }
-    #[test]
-    fn test_trans() {
-        let eye = Transform::eye();
-        let ones = Vector::new(1.0, 1.0, 1.0);
-        assert_eq!(eye * ones, ones);
-        let vec = Vector::new(1.0, 2.0, 3.0);
-        let trans = Transform::new(vec, vec, vec, vec);
-        assert_eq!(trans * ones, Vector::new(4.0, 8.0, 12.0));
     }
 }
