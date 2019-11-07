@@ -1,7 +1,5 @@
 #version 450 core
 
-layout(constant_id=0) const int NLIGHT = 1;
-
 // # Input
 //
 // Interpolated fragment representation.
@@ -27,10 +25,10 @@ struct Light {
     vec3 pos;
     vec3 color;
 };
-layout(std140, set=1) readonly
-uniform Lighting {
+layout(std430, set=1, binding=0) readonly
+buffer Lighting {
     vec4 cam_pos;
-    Light[NLIGHT] lights;
+    Light[] lights;
 };
 //
 // Material information.

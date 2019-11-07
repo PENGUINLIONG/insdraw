@@ -20,7 +20,7 @@ fn main() {
         .unwrap();
     let spvs = collect_spirv_binaries("assets/effects/uniform-pbr");
     info!("collected spirvs: {:?}", spvs.iter().map(|x| x.0.as_ref()).collect::<Vec<&str>>());
-    let _ = reflect_spirv(&spvs["uniform-pbr.vert"]).unwrap();
+    let _ = reflect_spirv(&spvs["uniform-pbr.frag"]).unwrap();
 }
 
 // Descriptor Semantics
@@ -114,6 +114,7 @@ const LIGHTING_SET: u32         = 1;
 const INPUT_ATTACHMENT_SET: u32 = 2;
 
 use std::collections::HashMap;
+use std::ffi::CStr;
 use log::{info, error};
 
 fn reflect_spirv(spv: &SpirvBinary) -> Result<(), ()> {
@@ -127,22 +128,36 @@ fn reflect_spirv(spv: &SpirvBinary) -> Result<(), ()> {
     let mut module: refl::SpvReflectShaderModule = unsafe { std::mem::zeroed() };
     let res = unsafe { refl::spvReflectCreateShaderModule(spv.0.len() * std::mem::size_of::<u32>(), spv.0.as_ptr() as *const c_void, &mut module) };
     if res != SUCCESS {
-        error!("cannot load spirv");
+        let msg = spirv_reflect::convert::result_to_string(res);
+        error!("cannot load spirv: {}", msg);
         return Err(())
     }
     info!("successfully loaded spirv");
 
-    let nbind = module.descriptor_binding_count as usize;
-    info!("found {} descriptor bindings", nbind);
-    let desc_binds = unsafe { slice::from_raw_parts(module.descriptor_bindings, nbind) };
+    let ndesc_bind = module.descriptor_binding_count as usize;
+    info!("found {} descriptor bindings", ndesc_bind);
+    let desc_binds = unsafe { slice::from_raw_parts(module.descriptor_bindings, ndesc_bind) };
 
     for desc_bind in desc_binds {
         info!("set={}, binding={}: '{:?}'", desc_bind.set, desc_bind.binding, unsafe { CStr::from_ptr(desc_bind.name) });
         let members = unsafe { slice::from_raw_parts(desc_bind.block.members, desc_bind.block.member_count as usize) };
         for member in members {
-            let name = unsafe { std::ffi::CStr::from_ptr(member.name) }.to_string_lossy();
+            let name = unsafe { CStr::from_ptr(member.name) }.to_string_lossy();
             info!("  {} @ {} : {}", name, member.absolute_offset, member.padded_size);
         }
+    }
+
+    let ndesc_set = module.descriptor_set_count as usize;
+    info!("found {} descriptor sets", ndesc_set);
+    let desc_sets = &module.descriptor_sets[..ndesc_set];
+
+    for desc_set in desc_sets {
+        let nbinds = desc_set.binding_count as usize;
+        let binds = unsafe { slice::from_raw_parts(desc_set.bindings, nbinds) };
+        let binds = binds.into_iter()
+            .map(|bind| unsafe { **bind }.binding)
+            .collect::<Vec<u32>>();
+        info!("set={} bindings={:?}", desc_set.set, binds);
     }
 
     let npush_const = module.push_constant_block_count as usize;
@@ -153,8 +168,29 @@ fn reflect_spirv(spv: &SpirvBinary) -> Result<(), ()> {
         info!("offset={}, size={}", push_const.absolute_offset, push_const.padded_size);
         let members = unsafe { slice::from_raw_parts(push_const.members, push_const.member_count as usize) };
         for member in members {
-            let name = unsafe { std::ffi::CStr::from_ptr(member.name) }.to_string_lossy();
+            let name = unsafe { CStr::from_ptr(member.name) }.to_string_lossy();
             info!("  {} @ {} : {}", name, member.absolute_offset, member.padded_size);
+        }
+    }
+
+    let nentry = module.entry_point_count as usize;
+    info!("found {} entry points", nentry);
+    let entries = unsafe { slice::from_raw_parts(module.entry_points, nentry) };
+
+    for entry in entries {
+        let name = unsafe { CStr::from_ptr(entry.name) }.to_string_lossy();
+        let nin_var = entry.input_variable_count as usize;
+        let nout_var = entry.output_variable_count as usize;
+        info!("{}, #in={}, #out={}", name, nin_var, nout_var);
+        let in_vars = unsafe { slice::from_raw_parts(entry.input_variables, nin_var) };
+        for in_var in in_vars {
+            let name = unsafe { CStr::from_ptr(in_var.name) }.to_string_lossy();
+            info!("  in  {} @ {}", name, in_var.location);
+        }
+        let out_vars = unsafe { slice::from_raw_parts(entry.output_variables, nout_var) };
+        for out_var in out_vars {
+            let name = unsafe { CStr::from_ptr(out_var.name) }.to_string_lossy();
+            info!("  out {} @ {}", name, out_var.location);
         }
     }
 
