@@ -4,9 +4,10 @@
 use crate::gfx::*;
 use std::mem::size_of;
 use std::marker::PhantomData;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::iter::{FromIterator, Peekable};
 use std::ffi::CStr;
+use std::ops::{Range, RangeInclusive};
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 use log::{debug, info, warn, error};
@@ -106,7 +107,7 @@ enum ExecutionModel {
 #[derive(Debug)]
 struct EntryPoint<'a> {
     exec_model: ExecutionModel,
-    fn_id: u32,
+    func: u32,
     name: &'a str,
     interface_ids: &'a [u32],
 }
@@ -141,7 +142,6 @@ enum ColorFormat {
 }
 #[derive(Debug)]
 enum Type<'a> {
-    Void,
     Bool,
     Int {
         nbit: u32,
@@ -179,10 +179,11 @@ enum Type<'a> {
         elem_ty: TypeId,
     },
     Struct {
-        member_tys: &'a [TypeId]
+        member_tys: &'a [TypeId],
     },
     Pointer {
-        referee_ty: TypeId,
+        target_ty: TypeId,
+        store_cls: StorageClass,
     },
 }
 
@@ -204,7 +205,6 @@ enum BuiltIn {
     FragDepth = 22,
     HelperInvocation = 23,
 }
-
 #[derive(Debug)]
 enum Decoration {
     SpecId(u32),
@@ -221,6 +221,30 @@ enum Decoration {
     Offset(usize),
     InputAttachmentIndex(u32),
 }
+#[derive(Debug, FromPrimitive)]
+enum StorageClass {
+    UniformConstant = 0,
+    Input = 1,
+    Uniform = 2,
+    Output = 3,
+    Function = 7, // Texture calls to sampler object will translate to this.
+    PushConstant = 9,
+    StorageBuffer = 12,
+}
+
+type VariableId = u32;
+#[derive(Debug)]
+struct Variable {
+    ty: u32,
+    store_cls: StorageClass,
+}
+
+type FunctionId = u32;
+#[derive(Default, Debug)]
+struct Function {
+    accessed_vars: HashSet<u32>,
+    calls: HashSet<u32>,
+}
 
 
 fn extract_entry_points<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<Vec<EntryPoint<'a>>> {
@@ -234,8 +258,10 @@ fn extract_entry_points<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<Vec<
         if instr.opcode() == OP_ENTRY_POINT {
             let mut operands = instr.operands();
             let entry_point = EntryPoint {
-                exec_model: ExecutionModel::from_u32(operands.read_u32()?).unwrap(),
-                fn_id: operands.read_u32()?,
+                exec_model: operands.read_u32()
+                    .map(FromPrimitive::from_u32)?
+                    .ok_or(Error::UnsupportedSpirv)?,
+                func: operands.read_u32()?,
                 name: operands.read_str()?,
                 interface_ids: operands.read_list()?,
             };
@@ -248,13 +274,13 @@ fn extract_entry_points<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<Vec<
 fn extract_names<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u32, Option<u32>), &'a str>> {
     const OP_NAME: u32 = 5;
     const OP_MEMBER_NAME: u32 = 6;
-    const RANGE: std::ops::Range<u32> = OP_NAME..(OP_MEMBER_NAME + 1);
+    const RANGE: RangeInclusive<u32> = OP_NAME..=OP_MEMBER_NAME;
 
     let mut name_map = HashMap::<(u32, Option<u32>), &'a str>::new();
-    while let Some(instr) = instrs.next() {
+    while let Some(instr) = instrs.peek() {
         if !RANGE.contains(&instr.opcode()) { instrs.next(); } else { break; }
     }
-    while let Some(instr) = instrs.next() {
+    while let Some(instr) = instrs.peek() {
         let opcode = instr.opcode();
         if RANGE.contains(&opcode) {
             let mut operands = instr.operands();
@@ -270,7 +296,7 @@ fn extract_names<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u3
 fn extract_decos<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u32, Option<u32>), Decoration>> {
     const OP_DECORATE: u32 = 71;
     const OP_MEMBER_DECORATE: u32 = 72;
-    const RANGE: std::ops::Range<u32> = OP_DECORATE..(OP_MEMBER_DECORATE + 1);
+    const RANGE: RangeInclusive<u32> = OP_DECORATE..=OP_MEMBER_DECORATE;
     const DECO_SPEC_ID: u32 = 1;
     const DECO_BLOCK: u32 = 2;
     const DECO_BUFFER_BLOCK: u32 = 3;
@@ -286,10 +312,10 @@ fn extract_decos<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u3
     const DECO_INPUT_ATTACHMENT_INDEX: u32 = 43;
 
     let mut deco_map = HashMap::<(u32, Option<u32>), Decoration>::new();
-    while let Some(instr) = instrs.next() {
+    while let Some(instr) = instrs.peek() {
         if !RANGE.contains(&instr.opcode()) { instrs.next(); } else { break; }
     }
-    while let Some(instr) = instrs.next() {
+    while let Some(instr) = instrs.peek() {
         let opcode = instr.opcode();
         if RANGE.contains(&opcode) {
             let mut operands = instr.operands();
@@ -306,12 +332,12 @@ fn extract_decos<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u3
                 DECO_COL_MAJOR => Decoration::ColMajor,
                 DECO_ARRAY_STRIDE => Decoration::ArrayStride(get_first(params)? as usize),
                 DECO_MATRIX_STRIDE => Decoration::MatrixStride(get_first(params)? as usize),
-                DECO_BUILT_IN => Decoration::BuiltIn(params.first().to_owned().and_then(|x| BuiltIn::from_u32(*x)).ok_or(Error::CorruptedSpirv)?),
+                DECO_BUILT_IN => Decoration::BuiltIn(params.first().to_owned().and_then(|x| BuiltIn::from_u32(*x)).ok_or(Error::UnsupportedSpirv)?),
                 DECO_LOCATION => Decoration::Location(get_first(params)?),
                 DECO_BINDING => Decoration::Binding(get_first(params)?),
                 DECO_OFFSET => Decoration::Offset(get_first(params)? as usize),
                 DECO_INPUT_ATTACHMENT_INDEX => Decoration::InputAttachmentIndex(get_first(params)?),
-                _ => continue, // Ignore unsupported decos.
+                _ => { instrs.next(); continue; }, // Ignore unsupported decos.
             };
             deco_map.insert((target_id, member_id), deco);
         } else { break; }
@@ -320,7 +346,7 @@ fn extract_decos<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u3
 
     Ok(deco_map)
 }
-fn extract_types<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<u32, Type<'a>>> {
+fn extract_types<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<(HashMap<TypeId, Type<'a>>, HashMap<VariableId, Variable>)> {
     const OP_TYPE_VOID: u32 = 19;
     const OP_TYPE_BOOL: u32 = 20;
     const OP_TYPE_INT: u32 = 21;
@@ -335,7 +361,8 @@ fn extract_types<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<u32
     const OP_TYPE_STRUCT: u32 = 30;
     const OP_TYPE_POINTER: u32 = 32;
     const OP_TYPE_FUNCTION: u32 = 33;
-    const OP_ACCESS_CHAIN: u32 = 65;
+    const OP_VARIABLE: u32 = 59;
+    const RANGE: RangeInclusive<u32> = OP_TYPE_VOID..=OP_TYPE_FUNCTION;
 
     macro_rules! spv_ty {
         ($ty_map: ident, $instr: ident, $type: ident) => { spv_ty!($ty_map, $instr, $type, {}) };
@@ -351,14 +378,15 @@ fn extract_types<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<u32
         (_ty $operands: ident $type: ident $($id: ident $field_ty: ident)* ) => { Type::$type { $($id: $operands.$field_ty()?,)* } };
     }
 
-    let mut in_scope = false;
-    let mut ty_map: HashMap<u32, Type<'a>> = HashMap::new();
+    let mut ty_map: HashMap<TypeId, Type<'a>> = HashMap::new();
+    let mut var_map: HashMap<VariableId, Variable> = HashMap::new();
     while let Some(instr) = instrs.peek() {
-        if !(OP_TYPE_VOID..(OP_TYPE_FUNCTION + 1)).contains(&instr.opcode()) { instrs.next(); } else { break; }
+        let opcode = instr.opcode();
+        if !RANGE.contains(&opcode) && opcode != OP_VARIABLE { instrs.next(); } else { break; }
     }
     while let Some(instr) = instrs.peek() {
         match instr.opcode() {
-            OP_TYPE_VOID => spv_ty!(ty_map, instr, Void),
+            OP_TYPE_VOID => { /* Never a resource type. */ },
             OP_TYPE_BOOL => spv_ty!(ty_map, instr, Bool),
             OP_TYPE_INT => spv_ty!(ty_map, instr, Int, { is_signed <- read_bool, nbit <- read_u32 }),
             OP_TYPE_FLOAT => spv_ty!(ty_map, instr, Float, { nbit <- read_u32 }),
@@ -371,20 +399,19 @@ fn extract_types<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<u32
                     prim_ty: operands.read_u32()?,
                     dim: operands.read_u32()
                         .map(FromPrimitive::from_u32)?
-                        .ok_or(Error::CorruptedSpirv)?,
+                        .ok_or(Error::UnsupportedSpirv)?,
                     content_ty: operands.read_u32()
                         .map(FromPrimitive::from_u32)?
-                        .ok_or(Error::CorruptedSpirv)?,
+                        .ok_or(Error::UnsupportedSpirv)?,
                     is_array: operands.read_bool()?,
                     is_multisampled: operands.read_bool()?,
                     usage: operands.read_u32()
                         .map(FromPrimitive::from_u32)?
-                        .ok_or(Error::CorruptedSpirv)?,
+                        .ok_or(Error::UnsupportedSpirv)?,
                     fmt: operands.read_u32()
                         .map(FromPrimitive::from_u32)?
-                        .ok_or(Error::CorruptedSpirv)?,
+                        .ok_or(Error::UnsupportedSpirv)?,
                 };
-                let _access = operands.read_u32();
                 if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
             },
             OP_TYPE_SAMPLER => spv_ty!(ty_map, instr, Sampler),
@@ -392,15 +419,86 @@ fn extract_types<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<u32
             OP_TYPE_ARRAY => spv_ty!(ty_map, instr, Array, { elem_ty <- read_u32, nelem <- read_u32 }),
             OP_TYPE_RUNTIME_ARRAY => spv_ty!(ty_map, instr, RuntimeArray, { elem_ty <- read_u32 }),
             OP_TYPE_STRUCT => spv_ty!(ty_map, instr, Struct, { member_tys <- read_list }),
+            OP_TYPE_POINTER => {
+                let mut operands = instr.operands();
+                let id = operands.read_u32()?;
+                let ty = Type::Pointer {
+                    store_cls: operands.read_u32()
+                        .map(FromPrimitive::from_u32)?
+                        .ok_or(Error::UnsupportedSpirv)?,
+                    target_ty: operands.read_u32()?,
+                };
+                if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
+            },
             OP_TYPE_FUNCTION => { /* Don't need this. */ },
+            OP_VARIABLE => {
+                let mut operands = instr.operands();
+                let ty = operands.read_u32()?;
+                let id = operands.read_u32()?;
+                let store_cls = operands.read_u32()
+                    .map(FromPrimitive::from_u32)?
+                    .ok_or(Error::UnsupportedSpirv)?;
+                let var = Variable {
+                    ty: ty,
+                    store_cls: store_cls,
+                };
+                if var_map.insert(id, var).is_some() { return Err(Error::CorruptedSpirv); }
+            },
             _ => break,
         }
         instrs.next();
     }
-    Ok(ty_map)
+    Ok((ty_map, var_map))
 }
+fn extract_funcs<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<FunctionId, Function>> {
+    const OP_FUNCTION: u32 = 54;
+    const OP_FUNCTION_END: u32 = 56;
+    const OP_FUNCTION_CALL: u32 = 57;
+    const OP_ACCESS_CHAIN: u32 = 65;
+    const OP_LOAD: u32 = 61;
+    const OP_STORE: u32 = 62;
+    const OP_IN_BOUNDS_ACCESS_CHAIN: u32 = 66;
 
-
+    let mut func_map: HashMap<FunctionId, Function> = HashMap::new();
+    while instrs.peek().is_some() {
+        let mut func: &mut Function = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+        while let Some(instr) = instrs.next() {
+            if instr.opcode() == OP_FUNCTION {
+                let mut operands = instr.operands();
+                let _rty = operands.read_u32()?;
+                let id = operands.read_u32()?;
+                func = func_map.entry(id).or_default();
+                break;
+            }
+        }
+        while let Some(instr) = instrs.next() {
+            match instr.opcode() {
+                OP_FUNCTION_CALL => {
+                    let mut operands = instr.operands();
+                    let _rty = operands.read_u32()?;
+                    let _id = operands.read_u32()?;
+                    let callee = operands.read_u32()?;
+                    func.calls.insert(callee);
+                },
+                OP_ACCESS_CHAIN | OP_LOAD => {
+                    let mut operands = instr.operands();
+                    let _rty = operands.read_u32()?;
+                    let _id = operands.read_u32()?;
+                    let target = operands.read_u32()?;
+                    func.accessed_vars.insert(target);
+                },
+                OP_STORE => {
+                    let mut operands = instr.operands();
+                    let target = operands.read_u32()?;
+                    func.accessed_vars.insert(target);
+                },
+                OP_FUNCTION_END => break,
+                _ => { },
+            }
+        }
+    }
+    Ok(func_map)
+}
 
 pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
     use log::debug;
@@ -411,7 +509,11 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
     debug!("{:?}", name_map);
     let deco_map = extract_decos(&mut instrs)?;
     debug!("{:?}", deco_map);
-    let ty_map = extract_types(&mut instrs)?;
+    let (ty_map, var_map) = extract_types(&mut instrs)?;
     debug!("{:?}", ty_map);
+    debug!("{:?}", var_map);
+    let func_map = extract_funcs(&mut instrs)?;
+    debug!("{:?}", func_map);
+
     Ok(())
 }
