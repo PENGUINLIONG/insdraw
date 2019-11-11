@@ -36,85 +36,116 @@ enum ExecutionModel {
     Vertex = 0,
     Fragment = 4,
 }
+#[derive(Debug)]
+struct EntryPoint<'a> {
+    exec_model: ExecutionModel,
+    name: &'a str,
+}
 
-fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
-    use log::debug;
-    use crate::gfx::Error;
 
-    type TypeId = u32;
-    #[derive(Debug, FromPrimitive)]
-    enum ImageDim {
-        Image1D = 0,
-        Image2D = 1,
-        Image3D = 2,
-        CubeMap = 3,
-        SubpassData = 6,
-    }
-    #[derive(Debug, FromPrimitive)]
-    enum ImageContentType {
-        Unknown = 2,
-        Color = 0,
-        Depth = 1,
-    }
-    #[derive(Debug, FromPrimitive)]
-    enum ImageUsage {
-        Unknown = 0,
-        Sampled = 1,
-        Storage = 2,
-    }
-    #[derive(Debug, FromPrimitive)]
-    enum ColorFormat {
-        Unknown = 0,
-        Rgba32f = 1,
-    }
-    #[derive(Debug)]
-    enum Type<'a> {
-        Void,
-        Bool,
-        Int {
-            nbit: u32,
-            is_signed: bool,
-        },
-        Float {
-            nbit: u32,
-        },
-        Vector {
-            elem_ty: TypeId,
-            nelem: u32,
-        },
-        Matrix {
-            col_ty: TypeId,
-            ncol: u32,
-        },
-        Image {
-            prim_ty: TypeId,
-            dim: ImageDim,
-            content_ty: ImageContentType,
-            is_array: bool,
-            is_multisampled: bool,
-            usage: ImageUsage,
-            fmt: ColorFormat,
-        },
-        Sampler,
-        SampledImage {
-            img_ty: TypeId,
-        },
-        Array {
-            elem_ty: TypeId,
-            nelem: u32,
-        },
-        RuntimeArray {
-            elem_ty: TypeId,
-        },
-        Struct {
-            member_tys: &'a [TypeId]
-        },
-        Pointer {
-            referee_ty: TypeId,
-        },
-    }
 
+type TypeId = u32;
+#[derive(Debug, FromPrimitive)]
+enum ImageDim {
+    Image1D = 0,
+    Image2D = 1,
+    Image3D = 2,
+    CubeMap = 3,
+    SubpassData = 6,
+}
+#[derive(Debug, FromPrimitive)]
+enum ImageContentType {
+    Unknown = 2,
+    Color = 0,
+    Depth = 1,
+}
+#[derive(Debug, FromPrimitive)]
+enum ImageUsage {
+    Unknown = 0,
+    Sampled = 1,
+    Storage = 2,
+}
+#[derive(Debug, FromPrimitive)]
+enum ColorFormat {
+    Unknown = 0,
+    Rgba32f = 1,
+}
+#[derive(Debug)]
+enum Type<'a> {
+    Void,
+    Bool,
+    Int {
+        nbit: u32,
+        is_signed: bool,
+    },
+    Float {
+        nbit: u32,
+    },
+    Vector {
+        elem_ty: TypeId,
+        nelem: u32,
+    },
+    Matrix {
+        col_ty: TypeId,
+        ncol: u32,
+    },
+    Image {
+        prim_ty: TypeId,
+        dim: ImageDim,
+        content_ty: ImageContentType,
+        is_array: bool,
+        is_multisampled: bool,
+        usage: ImageUsage,
+        fmt: ColorFormat,
+    },
+    Sampler,
+    SampledImage {
+        img_ty: TypeId,
+    },
+    Array {
+        elem_ty: TypeId,
+        nelem: u32,
+    },
+    RuntimeArray {
+        elem_ty: TypeId,
+    },
+    Struct {
+        member_tys: &'a [TypeId]
+    },
+    Pointer {
+        referee_ty: TypeId,
+    },
+}
+
+use std::iter::Peekable;
+use log::debug;
+use crate::gfx::{Error, Result, Instr, Instrs};
+
+fn extract_entry_points<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<Vec<EntryPoint<'a>>> {
     const OP_ENTRY_POINT: u32 = 15;
+
+    let mut entry_points = Vec::with_capacity(1);
+    while let Some(instr) = instrs.peek() {
+        if instr.opcode() != OP_ENTRY_POINT { instrs.next(); } else { break; }
+    }
+    while let Some(instr) = instrs.peek() {
+        if instr.opcode() == OP_ENTRY_POINT {
+            let mut operands = instr.operands();
+            let exec_model = ExecutionModel::from_u32(operands.read_u32()?).unwrap();
+            let _entry_fn_id = operands.read_u32()?;
+            let name = operands.read_str()?;
+            let _interface_ids = operands.read_list()?;
+            let entry_point = EntryPoint {
+                exec_model: exec_model,
+                name: name,
+            };
+            entry_points.push(entry_point);
+            instrs.next();
+        } else { break; }
+    }
+    Ok(entry_points)
+}
+fn extract_types<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<u32, Type<'a>>> {
     const OP_TYPE_VOID: u32 = 19;
     const OP_TYPE_BOOL: u32 = 20;
     const OP_TYPE_INT: u32 = 21;
@@ -128,6 +159,7 @@ fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
     const OP_TYPE_RUNTIME_ARRAY: u32 = 29;
     const OP_TYPE_STRUCT: u32 = 30;
     const OP_TYPE_POINTER: u32 = 32;
+    const OP_TYPE_FUNCTION: u32 = 33;
     const OP_ACCESS_CHAIN: u32 = 65;
 
     macro_rules! spv_ty {
@@ -137,26 +169,20 @@ fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
                 let mut operands = $instr.operands();
                 let id = operands.read_u32()?;
                 let ty = spv_ty!(_ty operands $type $($id $field_ty)*);
-                if $ty_map.insert(id, ty).is_some() {
-                    return Err(Error::CorruptedSpirv);
-                }
+                if $ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
             }
         };
         (_ty $operands: ident $type: ident) => { Type::$type };
         (_ty $operands: ident $type: ident $($id: ident $field_ty: ident)* ) => { Type::$type { $($id: $operands.$field_ty()?,)* } };
     }
 
-    let mut ty_map: HashMap<u32, Type> = HashMap::new();
-    for instr in module.instrs() {
+    let mut in_scope = false;
+    let mut ty_map: HashMap<u32, Type<'a>> = HashMap::new();
+    while let Some(instr) = instrs.peek() {
+        if !(OP_TYPE_VOID..(OP_TYPE_FUNCTION + 1)).contains(&instr.opcode()) { instrs.next(); } else { break; }
+    }
+    while let Some(instr) = instrs.peek() {
         match instr.opcode() {
-            OP_ENTRY_POINT => {
-                let mut operands = instr.operands();
-                let exec_model = ExecutionModel::from_u32(operands.read_u32()?).unwrap();
-                let _entry_fn_id = operands.read_u32()?;
-                let name = operands.read_str()?;
-                let interface_ids = operands.read_list()?;
-                debug!("{:?}, {:?}, {:?}", exec_model, name, interface_ids);
-            },
             OP_TYPE_VOID => spv_ty!(ty_map, instr, Void),
             OP_TYPE_BOOL => spv_ty!(ty_map, instr, Bool),
             OP_TYPE_INT => spv_ty!(ty_map, instr, Int, { is_signed <- read_bool, nbit <- read_u32 }),
@@ -183,24 +209,34 @@ fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
                         .map(FromPrimitive::from_u32)?
                         .ok_or(Error::CorruptedSpirv)?,
                 };
-                if ty_map.insert(id, ty).is_some() {
-                    return Err(Error::CorruptedSpirv);
-                }
+                let _access = operands.read_u32();
+                if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
             },
             OP_TYPE_SAMPLER => spv_ty!(ty_map, instr, Sampler),
             OP_TYPE_SAMPLED_IMAGE => spv_ty!(ty_map, instr, SampledImage, { img_ty <- read_u32 }),
             OP_TYPE_ARRAY => spv_ty!(ty_map, instr, Array, { elem_ty <- read_u32, nelem <- read_u32 }),
             OP_TYPE_RUNTIME_ARRAY => spv_ty!(ty_map, instr, RuntimeArray, { elem_ty <- read_u32 }),
             OP_TYPE_STRUCT => spv_ty!(ty_map, instr, Struct, { member_tys <- read_list }),
-            _ => continue,
+            OP_TYPE_FUNCTION => { /* Don't need this. */ },
+            _ => break,
         }
+        instrs.next();
     }
+    Ok(ty_map)
+}
+
+fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
+    use log::debug;
+
+    let mut instrs = module.instrs().peekable();
+    let entry_points = extract_entry_points(&mut instrs);
+    debug!("{:?}", entry_points);
+    let ty_map = extract_types(&mut instrs);
     debug!("{:?}", ty_map);
     Ok(())
 }
 
 use std::collections::HashMap;
-use std::ffi::CStr;
 use log::{info, error};
 use std::path::Path;
 

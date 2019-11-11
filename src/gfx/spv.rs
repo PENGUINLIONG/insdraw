@@ -74,16 +74,18 @@ impl<'a> Operands<'a> {
             Ok(*x)
         } else { Err(Error::CorruptedSpirv) }
     }
-    pub fn read_str(&mut self) -> Result<&'a CStr> {
+    pub fn read_str(&mut self) -> Result<&'a str> {
         use std::os::raw::c_char;
         let ptr = self.0.as_ptr() as *const c_char;
         let char_slice = unsafe { std::slice::from_raw_parts(ptr, self.0.len() * 4) };
         if let Some(nul_pos) = char_slice.into_iter().position(|x| *x == 0) {
             let nword = nul_pos / 4 + 1;
             self.0 = &self.0[nword..];
-            let cstr = unsafe { CStr::from_ptr(ptr) };
-            Ok(cstr)
-        } else { Err(Error::CorruptedSpirv) }
+            if let Ok(string) = unsafe { CStr::from_ptr(ptr) }.to_str() {
+                return Ok(string);
+            }
+        }
+        Err(Error::CorruptedSpirv)
     }
     pub fn read_list(&mut self) -> Result<&'a [u32]> {
         let rv = self.0;
