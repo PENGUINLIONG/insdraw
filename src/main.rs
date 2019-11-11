@@ -2,7 +2,7 @@ pub mod gfx;
 pub mod math;
 pub mod topo;
 
-use gfx::{Context, InterfaceConfig};
+use crate::gfx::{Context, InterfaceConfig, SpirvBinary};
 use ash::vk;
 
 fn main() {
@@ -20,186 +20,190 @@ fn main() {
         .unwrap();
     let spvs = collect_spirv_binaries("assets/effects/uniform-pbr");
     info!("collected spirvs: {:?}", spvs.iter().map(|x| x.0.as_ref()).collect::<Vec<&str>>());
-    let _ = reflect_spirv(&spvs["uniform-pbr.frag"]).unwrap();
-}
-
-// Descriptor Semantics
-//
-// In InsDraw, 2 or 3 descriptor sets are used for each pipeline stage.
-// Descriptor set #1 is used for material data, which can be defined freely by 
-// users; #2 is a fixed-size uniform block or a variable size storage buffer
-// used to store bone transformation matrices; #3 is a fixed-size uniform block
-// or a variable size storage buffer used to store lighting data.
-//
-// # Array Sizing
-//
-// # Standard Lighting
-//
-//
-//
+    let module = &spvs["uniform-pbr.frag"];
 
 
-enum MaterialValueType {
-    /// 32-bit signed integer.
-    Int,
-    /// 32-bit IEEE 754 floating-point number.
-    Float,
-    /// 4-component vector.
-    Vector,
-    /// 4x4 column-major matrix.
-    Matrix,
+
+    module_lab(module).unwrap();
 }
 
-enum ImageDimension {
-    Image2D
+
+use num_derive::FromPrimitive;
+use num_traits::FromPrimitive;
+
+#[derive(Debug, FromPrimitive)]
+enum ExecutionModel {
+    Vertex = 0,
+    Fragment = 4,
 }
 
-/// Represents a binding in descriptor set #1 in a shader module.
-enum MaterialBinding {
-    BufferedBlock {
-        /// Binding point of the buffered block.
-        binding: u32,
-        /// Absolute offset from the beginning of the buffer.
-        offset: u32,
-        /// Type of the variable.
-        ty: MaterialValueType,
-    },
-    SampledImage {
-        /// Binding point of the sampled image.
-        binding: u32,
-        /// Dimension configuration of the image.
-        dimension: ImageDimension,
-        /// Number of layers of the image, when the image object is an array.
-        nlayer: Option<u32>,
-    },
-}
+fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
+    use log::debug;
+    use crate::gfx::Error;
 
-struct UniformBufferAllocationInfo {
-    /// Exact size of uniform buffer to be allocated.
-    buf_size: u32,
-}
-struct StorageBufferAllocationInfo {
-    // Minimal size of shader storage buffer to be allocated. The actual
-    // length of buffer can vary when there is a unsized array at the end.
-    min_buf_size: u32,
-    /// Whether the binding is decorated as read-only, which can help the
-    /// memory allocator to resere better performing buffers.
-    readonly: bool,
-}
-struct Sampler {
-    /// Dimension configuration of the image.
-    dimension: ImageDimension,
-    /// Number of layers of the image, when the image object is an array.
-    nlayer: Option<u32>,
-}
+    type TypeId = u32;
+    #[derive(Debug, FromPrimitive)]
+    enum ImageDim {
+        Image1D = 0,
+        Image2D = 1,
+        Image3D = 2,
+        CubeMap = 3,
+        SubpassData = 6,
+    }
+    #[derive(Debug, FromPrimitive)]
+    enum ImageContentType {
+        Unknown = 2,
+        Color = 0,
+        Depth = 1,
+    }
+    #[derive(Debug, FromPrimitive)]
+    enum ImageUsage {
+        Unknown = 0,
+        Sampled = 1,
+        Storage = 2,
+    }
+    #[derive(Debug, FromPrimitive)]
+    enum ColorFormat {
+        Unknown = 0,
+        Rgba32f = 1,
+    }
+    #[derive(Debug)]
+    enum Type<'a> {
+        Void,
+        Bool,
+        Int {
+            nbit: u32,
+            is_signed: bool,
+        },
+        Float {
+            nbit: u32,
+        },
+        Vector {
+            elem_ty: TypeId,
+            nelem: u32,
+        },
+        Matrix {
+            col_ty: TypeId,
+            ncol: u32,
+        },
+        Image {
+            prim_ty: TypeId,
+            dim: ImageDim,
+            content_ty: ImageContentType,
+            is_array: bool,
+            is_multisampled: bool,
+            usage: ImageUsage,
+            fmt: ColorFormat,
+        },
+        Sampler,
+        SampledImage {
+            img_ty: TypeId,
+        },
+        Array {
+            elem_ty: TypeId,
+            nelem: u32,
+        },
+        RuntimeArray {
+            elem_ty: TypeId,
+        },
+        Struct {
+            member_tys: &'a [TypeId]
+        },
+        Pointer {
+            referee_ty: TypeId,
+        },
+    }
 
-/// Represents a binding in descriptor set #1 in a shader module.
-enum PipelineResourceInfo {
-    UniformBuffer(UniformBufferAllocationInfo),
-    StorageBuffer(StorageBufferAllocationInfo),
-    SampledImage,
-}
-/// Represents material .
-struct MaterialDefinition {
-    buf_size: u32,
-    //mat_vars: HashMap<String, MaterialVariable>,
-    bindings: HashMap<u32, MaterialBinding>,
-}
-struct MaterialBindingInfo {
-    //uniform: 
-}
+    const OP_ENTRY_POINT: u32 = 15;
+    const OP_TYPE_VOID: u32 = 19;
+    const OP_TYPE_BOOL: u32 = 20;
+    const OP_TYPE_INT: u32 = 21;
+    const OP_TYPE_FLOAT: u32 = 22;
+    const OP_TYPE_VECTOR: u32 = 23;
+    const OP_TYPE_MATRIX: u32 = 24;
+    const OP_TYPE_IMAGE: u32 = 25;
+    const OP_TYPE_SAMPLER: u32 = 26;
+    const OP_TYPE_SAMPLED_IMAGE: u32 = 27;
+    const OP_TYPE_ARRAY: u32 = 28;
+    const OP_TYPE_RUNTIME_ARRAY: u32 = 29;
+    const OP_TYPE_STRUCT: u32 = 30;
+    const OP_TYPE_POINTER: u32 = 32;
+    const OP_ACCESS_CHAIN: u32 = 65;
 
-const MATERIAL_SET: u32         = 0;
-const LIGHTING_SET: u32         = 1;
-const INPUT_ATTACHMENT_SET: u32 = 2;
+    macro_rules! spv_ty {
+        ($ty_map: ident, $instr: ident, $type: ident) => { spv_ty!($ty_map, $instr, $type, {}) };
+        ($ty_map: ident, $instr: ident, $type: ident, { $($id: ident <- $field_ty: ident),* }) => {
+            {
+                let mut operands = $instr.operands();
+                let id = operands.read_u32()?;
+                let ty = spv_ty!(_ty operands $type $($id $field_ty)*);
+                if $ty_map.insert(id, ty).is_some() {
+                    return Err(Error::CorruptedSpirv);
+                }
+            }
+        };
+        (_ty $operands: ident $type: ident) => { Type::$type };
+        (_ty $operands: ident $type: ident $($id: ident $field_ty: ident)* ) => { Type::$type { $($id: $operands.$field_ty()?,)* } };
+    }
+
+    let mut ty_map: HashMap<u32, Type> = HashMap::new();
+    for instr in module.instrs() {
+        match instr.opcode() {
+            OP_ENTRY_POINT => {
+                let mut operands = instr.operands();
+                let exec_model = ExecutionModel::from_u32(operands.read_u32()?).unwrap();
+                let _entry_fn_id = operands.read_u32()?;
+                let name = operands.read_str()?;
+                let interface_ids = operands.read_list()?;
+                debug!("{:?}, {:?}, {:?}", exec_model, name, interface_ids);
+            },
+            OP_TYPE_VOID => spv_ty!(ty_map, instr, Void),
+            OP_TYPE_BOOL => spv_ty!(ty_map, instr, Bool),
+            OP_TYPE_INT => spv_ty!(ty_map, instr, Int, { is_signed <- read_bool, nbit <- read_u32 }),
+            OP_TYPE_FLOAT => spv_ty!(ty_map, instr, Float, { nbit <- read_u32 }),
+            OP_TYPE_VECTOR => spv_ty!(ty_map, instr, Vector, { elem_ty <- read_u32, nelem <- read_u32 }),
+            OP_TYPE_MATRIX => spv_ty!(ty_map, instr, Matrix, { col_ty <- read_u32, ncol <- read_u32 }),
+            OP_TYPE_IMAGE => {
+                let mut operands = instr.operands();
+                let id = operands.read_u32()?;
+                let ty = Type::Image {
+                    prim_ty: operands.read_u32()?,
+                    dim: operands.read_u32()
+                        .map(FromPrimitive::from_u32)?
+                        .ok_or(Error::CorruptedSpirv)?,
+                    content_ty: operands.read_u32()
+                        .map(FromPrimitive::from_u32)?
+                        .ok_or(Error::CorruptedSpirv)?,
+                    is_array: operands.read_bool()?,
+                    is_multisampled: operands.read_bool()?,
+                    usage: operands.read_u32()
+                        .map(FromPrimitive::from_u32)?
+                        .ok_or(Error::CorruptedSpirv)?,
+                    fmt: operands.read_u32()
+                        .map(FromPrimitive::from_u32)?
+                        .ok_or(Error::CorruptedSpirv)?,
+                };
+                if ty_map.insert(id, ty).is_some() {
+                    return Err(Error::CorruptedSpirv);
+                }
+            },
+            OP_TYPE_SAMPLER => spv_ty!(ty_map, instr, Sampler),
+            OP_TYPE_SAMPLED_IMAGE => spv_ty!(ty_map, instr, SampledImage, { img_ty <- read_u32 }),
+            OP_TYPE_ARRAY => spv_ty!(ty_map, instr, Array, { elem_ty <- read_u32, nelem <- read_u32 }),
+            OP_TYPE_RUNTIME_ARRAY => spv_ty!(ty_map, instr, RuntimeArray, { elem_ty <- read_u32 }),
+            OP_TYPE_STRUCT => spv_ty!(ty_map, instr, Struct, { member_tys <- read_list }),
+            _ => continue,
+        }
+    }
+    debug!("{:?}", ty_map);
+    Ok(())
+}
 
 use std::collections::HashMap;
 use std::ffi::CStr;
 use log::{info, error};
-
-fn reflect_spirv(spv: &SpirvBinary) -> Result<(), ()> {
-    use std::slice;
-    use std::collections::HashMap;
-    use std::convert::TryInto;
-    use std::ffi::{c_void, CStr};
-    use spirv_reflect::ffi as refl;
-    use spirv_reflect::ffi::SpvReflectResult_SPV_REFLECT_RESULT_SUCCESS as SUCCESS;
-
-    let mut module: refl::SpvReflectShaderModule = unsafe { std::mem::zeroed() };
-    let res = unsafe { refl::spvReflectCreateShaderModule(spv.0.len() * std::mem::size_of::<u32>(), spv.0.as_ptr() as *const c_void, &mut module) };
-    if res != SUCCESS {
-        let msg = spirv_reflect::convert::result_to_string(res);
-        error!("cannot load spirv: {}", msg);
-        return Err(())
-    }
-    info!("successfully loaded spirv");
-
-    let ndesc_bind = module.descriptor_binding_count as usize;
-    info!("found {} descriptor bindings", ndesc_bind);
-    let desc_binds = unsafe { slice::from_raw_parts(module.descriptor_bindings, ndesc_bind) };
-
-    for desc_bind in desc_binds {
-        info!("set={}, binding={}: '{:?}'", desc_bind.set, desc_bind.binding, unsafe { CStr::from_ptr(desc_bind.name) });
-        let members = unsafe { slice::from_raw_parts(desc_bind.block.members, desc_bind.block.member_count as usize) };
-        for member in members {
-            let name = unsafe { CStr::from_ptr(member.name) }.to_string_lossy();
-            info!("  {} @ {} : {}", name, member.absolute_offset, member.padded_size);
-        }
-    }
-
-    let ndesc_set = module.descriptor_set_count as usize;
-    info!("found {} descriptor sets", ndesc_set);
-    let desc_sets = &module.descriptor_sets[..ndesc_set];
-
-    for desc_set in desc_sets {
-        let nbinds = desc_set.binding_count as usize;
-        let binds = unsafe { slice::from_raw_parts(desc_set.bindings, nbinds) };
-        let binds = binds.into_iter()
-            .map(|bind| unsafe { **bind }.binding)
-            .collect::<Vec<u32>>();
-        info!("set={} bindings={:?}", desc_set.set, binds);
-    }
-
-    let npush_const = module.push_constant_block_count as usize;
-    info!("found {} push constant blocks", npush_const);
-    let push_consts = unsafe { slice::from_raw_parts(module.push_constant_blocks, npush_const) };
-
-    for push_const in push_consts {
-        info!("offset={}, size={}", push_const.absolute_offset, push_const.padded_size);
-        let members = unsafe { slice::from_raw_parts(push_const.members, push_const.member_count as usize) };
-        for member in members {
-            let name = unsafe { CStr::from_ptr(member.name) }.to_string_lossy();
-            info!("  {} @ {} : {}", name, member.absolute_offset, member.padded_size);
-        }
-    }
-
-    let nentry = module.entry_point_count as usize;
-    info!("found {} entry points", nentry);
-    let entries = unsafe { slice::from_raw_parts(module.entry_points, nentry) };
-
-    for entry in entries {
-        let name = unsafe { CStr::from_ptr(entry.name) }.to_string_lossy();
-        let nin_var = entry.input_variable_count as usize;
-        let nout_var = entry.output_variable_count as usize;
-        info!("{}, #in={}, #out={}", name, nin_var, nout_var);
-        let in_vars = unsafe { slice::from_raw_parts(entry.input_variables, nin_var) };
-        for in_var in in_vars {
-            let name = unsafe { CStr::from_ptr(in_var.name) }.to_string_lossy();
-            info!("  in  {} @ {}", name, in_var.location);
-        }
-        let out_vars = unsafe { slice::from_raw_parts(entry.output_variables, nout_var) };
-        for out_var in out_vars {
-            let name = unsafe { CStr::from_ptr(out_var.name) }.to_string_lossy();
-            info!("  out {} @ {}", name, out_var.location);
-        }
-    }
-
-    unsafe { refl::spvReflectDestroyShaderModule(&mut module) };
-    Ok(())
-}
-
 use std::path::Path;
-struct SpirvBinary(Vec<u32>);
+
 fn collect_spirv_binaries<P: AsRef<Path>>(path: P) -> HashMap<String, SpirvBinary> {
     use std::convert::TryInto;
     use std::ffi::OsStr;
@@ -230,12 +234,12 @@ fn collect_spirv_binaries<P: AsRef<Path>>(path: P) -> HashMap<String, SpirvBinar
                     0x07 => u32::from_be_bytes,
                     _ => return None,
                 })
-                .collect::<Vec<_>>();
+                .collect::<SpirvBinary>();
             let name = x.file_stem()
                 .and_then(OsStr::to_str)
                 .map(ToOwned::to_owned)
                 .unwrap();
-            Some((name, SpirvBinary(spv)))
+            Some((name, spv))
         })
         .collect::<HashMap<_, _>>()
 }

@@ -2,11 +2,13 @@ use std::result;
 
 mod error;
 mod ctxt;
+mod spv;
 
 pub use error::*;
 pub use ctxt::*;
+pub use spv::*;
 
-type Result<T> = result::Result<T, Error>;
+pub type Result<T> = result::Result<T, Error>;
 
 /*
 pub struct RenderConfig {

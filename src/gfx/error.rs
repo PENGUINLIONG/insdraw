@@ -9,6 +9,7 @@ pub enum Error {
     RuntimeError(InstanceError),
     VulkanError(VkResultCode),
     NoCapablePhysicalDevice,
+    CorruptedSpirv,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -18,6 +19,7 @@ impl fmt::Display for Error {
             RuntimeError(err) => write!(f, "{}", err),
             VulkanError(errcode) => write!(f, "{}", errcode.as_raw()),
             NoCapablePhysicalDevice => write!(f, "no capable device available"),
+            CorruptedSpirv => write!(f, "spirv binary is corrupted"),
         }
     }
 }
