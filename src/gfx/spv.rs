@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::iter::{FromIterator, Peekable};
 use std::ffi::CStr;
 use std::ops::{Range, RangeInclusive};
+use std::convert::{TryFrom, TryInto};
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 use log::{debug, info, warn, error};
@@ -500,20 +501,40 @@ fn extract_funcs<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<Fun
     Ok(func_map)
 }
 
+#[derive(Debug)]
+struct ReflectionBundle<'a> {
+    entry_points: Vec<EntryPoint<'a>>,
+    name_map: HashMap<(u32, Option<u32>), &'a str>,
+    deco_map: HashMap<(u32, Option<u32>), Decoration>,
+    ty_map: HashMap<TypeId, Type<'a>>,
+    var_map: HashMap<VariableId, Variable>,
+    func_map: HashMap<FunctionId, Function>,
+}
+impl<'a> TryFrom<&'a SpirvBinary> for ReflectionBundle<'a> {
+    type Error = Error;
+    fn try_from(module: &'a SpirvBinary) -> Result<ReflectionBundle<'a>> {
+        let mut instrs = module.instrs().peekable();
+        let entry_points = extract_entry_points(&mut instrs)?;
+        let name_map = extract_names(&mut instrs)?;
+        let deco_map = extract_decos(&mut instrs)?;
+        let (ty_map, var_map) = extract_types(&mut instrs)?;
+        let func_map = extract_funcs(&mut instrs)?;
+
+        let bundle = ReflectionBundle {
+            entry_points: entry_points,
+            name_map: name_map,
+            deco_map: deco_map,
+            ty_map: ty_map,
+            var_map: var_map,
+            func_map: func_map,
+        };
+        Ok(bundle)
+    }
+}
+
+/// Resolve the minimum contract for all entry points in the module.
 pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
     use log::debug;
-    let mut instrs = module.instrs().peekable();
-    let entry_points = extract_entry_points(&mut instrs)?;
-    debug!("{:?}", entry_points);
-    let name_map = extract_names(&mut instrs)?;
-    debug!("{:?}", name_map);
-    let deco_map = extract_decos(&mut instrs)?;
-    debug!("{:?}", deco_map);
-    let (ty_map, var_map) = extract_types(&mut instrs)?;
-    debug!("{:?}", ty_map);
-    debug!("{:?}", var_map);
-    let func_map = extract_funcs(&mut instrs)?;
-    debug!("{:?}", func_map);
-
+    let _: ReflectionBundle = module.try_into()?;
     Ok(())
 }
