@@ -186,6 +186,41 @@ enum Type<'a> {
     },
 }
 
+#[derive(Debug, FromPrimitive)]
+enum BuiltIn {
+    Position = 0,
+    PointSize = 1,
+    ClipDistance = 2,
+    CullDistance = 3,
+    VertexId = 5,
+    InstanceId = 6,
+    PrimitiveId = 7,
+    InvocationId = 8,
+    Layer = 9,
+    FragCoord = 15,
+    PointCoord = 16,
+    FrontFacing = 17,
+    SampleMask = 20,
+    FragDepth = 22,
+    HelperInvocation = 23,
+}
+
+#[derive(Debug)]
+enum Decoration {
+    SpecId(u32),
+    Block,
+    BufferBlock,
+    RowMajor,
+    ColMajor,
+    ArrayStride(usize),
+    MatrixStride(usize),
+    BuiltIn(BuiltIn),
+    Location(u32),
+    Binding(u32),
+    DescriptorSet(u32),
+    Offset(usize),
+    InputAttachmentIndex(u32),
+}
 
 
 fn extract_entry_points<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<Vec<EntryPoint<'a>>> {
@@ -232,7 +267,59 @@ fn extract_names<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u3
     }
     Ok(name_map)
 }
+fn extract_decos<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u32, Option<u32>), Decoration>> {
+    const OP_DECORATE: u32 = 71;
+    const OP_MEMBER_DECORATE: u32 = 72;
+    const RANGE: std::ops::Range<u32> = OP_DECORATE..(OP_MEMBER_DECORATE + 1);
+    const DECO_SPEC_ID: u32 = 1;
+    const DECO_BLOCK: u32 = 2;
+    const DECO_BUFFER_BLOCK: u32 = 3;
+    const DECO_ROW_MAJOR: u32 = 4;
+    const DECO_COL_MAJOR: u32 = 5;
+    const DECO_ARRAY_STRIDE: u32 = 6;
+    const DECO_MATRIX_STRIDE: u32 = 7;
+    const DECO_BUILT_IN: u32 = 11;
+    const DECO_LOCATION: u32 = 30;
+    const DECO_BINDING: u32 = 33;
+    const DECO_DESCRIPTOR_SET: u32 = 34;
+    const DECO_OFFSET: u32 = 35;
+    const DECO_INPUT_ATTACHMENT_INDEX: u32 = 43;
 
+    let mut deco_map = HashMap::<(u32, Option<u32>), Decoration>::new();
+    while let Some(instr) = instrs.next() {
+        if !RANGE.contains(&instr.opcode()) { instrs.next(); } else { break; }
+    }
+    while let Some(instr) = instrs.next() {
+        let opcode = instr.opcode();
+        if RANGE.contains(&opcode) {
+            let mut operands = instr.operands();
+            let target_id = operands.read_u32()?;
+            let member_id = if opcode == OP_MEMBER_DECORATE { Some(operands.read_u32()?) } else { None };
+            let deco = operands.read_u32()?;
+            let params = operands.read_list()?;
+            fn get_first<'a>(params: &'a [u32]) -> Result<u32> { params.first().map(u32::to_owned).ok_or(Error::CorruptedSpirv) }
+            let deco = match deco {
+                DECO_SPEC_ID => Decoration::SpecId(get_first(params)?),
+                DECO_BLOCK => Decoration::Block,
+                DECO_BUFFER_BLOCK => Decoration::BufferBlock,
+                DECO_ROW_MAJOR => Decoration::RowMajor,
+                DECO_COL_MAJOR => Decoration::ColMajor,
+                DECO_ARRAY_STRIDE => Decoration::ArrayStride(get_first(params)? as usize),
+                DECO_MATRIX_STRIDE => Decoration::MatrixStride(get_first(params)? as usize),
+                DECO_BUILT_IN => Decoration::BuiltIn(params.first().to_owned().and_then(|x| BuiltIn::from_u32(*x)).ok_or(Error::CorruptedSpirv)?),
+                DECO_LOCATION => Decoration::Location(get_first(params)?),
+                DECO_BINDING => Decoration::Binding(get_first(params)?),
+                DECO_OFFSET => Decoration::Offset(get_first(params)? as usize),
+                DECO_INPUT_ATTACHMENT_INDEX => Decoration::InputAttachmentIndex(get_first(params)?),
+                _ => continue, // Ignore unsupported decos.
+            };
+            deco_map.insert((target_id, member_id), deco);
+        } else { break; }
+        instrs.next();
+    }
+
+    Ok(deco_map)
+}
 fn extract_types<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<u32, Type<'a>>> {
     const OP_TYPE_VOID: u32 = 19;
     const OP_TYPE_BOOL: u32 = 20;
@@ -322,6 +409,8 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
     debug!("{:?}", entry_points);
     let name_map = extract_names(&mut instrs)?;
     debug!("{:?}", name_map);
+    let deco_map = extract_decos(&mut instrs)?;
+    debug!("{:?}", deco_map);
     let ty_map = extract_types(&mut instrs)?;
     debug!("{:?}", ty_map);
     Ok(())
