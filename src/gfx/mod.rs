@@ -4,6 +4,7 @@ mod error;
 mod ctxt;
 mod spv;
 mod sym;
+pub mod contract;
 
 pub use error::*;
 pub use ctxt::*;
