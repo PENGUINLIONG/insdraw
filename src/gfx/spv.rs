@@ -1,7 +1,7 @@
 //! SPIR-V Reflection
 //!
 //! Reflect and extract SPIR-V declared materials.
-use crate::gfx::*;
+use crate::gfx::{Result, Error, Symbol};
 use std::mem::size_of;
 use std::marker::PhantomData;
 use std::collections::{HashMap, HashSet};
@@ -13,7 +13,6 @@ use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 use log::{debug, info, warn, error};
 
-use std::path::Path;
 pub struct SpirvBinary(Vec<u32>);
 impl From<Vec<u32>> for SpirvBinary {
     fn from(x: Vec<u32>) -> Self { SpirvBinary(x) }
@@ -125,7 +124,7 @@ enum ImageDim {
     SubpassData = 6,
 }
 #[derive(Debug, FromPrimitive)]
-enum ImageContentType {
+enum ImageAspect {
     Unknown = 2,
     Color = 0,
     Depth = 1,
@@ -136,10 +135,12 @@ enum ImageUsage {
     Sampled = 1,
     Storage = 2,
 }
-#[derive(Debug, FromPrimitive)]
+#[derive(Debug, Clone, Copy, FromPrimitive)]
 enum ColorFormat {
     Unknown = 0,
     Rgba32f = 1,
+    R32f = 3,
+    Rgba8 = 4,
 }
 #[derive(Debug)]
 enum Type<'a> {
@@ -162,7 +163,7 @@ enum Type<'a> {
     Image {
         prim_ty: TypeId,
         dim: ImageDim,
-        content_ty: ImageContentType,
+        content_ty: ImageAspect,
         is_array: bool,
         is_multisampled: bool,
         usage: ImageUsage,
@@ -513,6 +514,8 @@ struct ReflectionBundle<'a> {
 impl<'a> TryFrom<&'a SpirvBinary> for ReflectionBundle<'a> {
     type Error = Error;
     fn try_from(module: &'a SpirvBinary) -> Result<ReflectionBundle<'a>> {
+        // Don't change the order. See _2.4 Logical Layout of a Module_ of the
+        // SPIR-V specification for more information.
         let mut instrs = module.instrs().peekable();
         let entry_points = extract_entry_points(&mut instrs)?;
         let name_map = extract_names(&mut instrs)?;
