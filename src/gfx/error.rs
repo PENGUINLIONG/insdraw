@@ -11,6 +11,8 @@ pub enum Error {
     NoCapablePhysicalDevice,
     CorruptedSpirv,
     UnsupportedSpirv,
+    InflexibleMemory,
+    InvalidOperation,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -22,6 +24,8 @@ impl fmt::Display for Error {
             NoCapablePhysicalDevice => write!(f, "no capable device available"),
             CorruptedSpirv => write!(f, "spirv binary is corrupted"),
             UnsupportedSpirv => write!(f, "spirv binary used unsupported feature"),
+            InflexibleMemory => write!(f, "memory cannot be resized"),
+            InvalidOperation => write!(f, "an invalid operation was invoked internally"),
         }
     }
 }

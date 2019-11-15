@@ -50,6 +50,7 @@ impl<'a> Iterator for Instrs<'a> {
 }
 
 
+#[derive(Debug)]
 pub struct Instr<'a> {
     opcode: u32,
     operands: &'a [u32],
@@ -99,7 +100,7 @@ impl<'a> Operands<'a> {
 
 
 
-#[derive(Debug, FromPrimitive)]
+#[derive(PartialEq, Eq, Debug, FromPrimitive)]
 enum ExecutionModel {
     Vertex = 0,
     Fragment = 4,
@@ -109,104 +110,118 @@ struct EntryPoint<'a> {
     exec_model: ExecutionModel,
     func: u32,
     name: &'a str,
-    interface_ids: &'a [u32],
 }
-
-
 
 type TypeId = u32;
-#[derive(Debug, FromPrimitive)]
-enum ImageDim {
-    Image1D = 0,
-    Image2D = 1,
-    Image3D = 2,
-    CubeMap = 3,
-    SubpassData = 6,
+#[derive(Debug, Clone)]
+enum Type<'a> {
+    Numeric(NumericType),
+    Image(ImageType),
+    Array(TypeId, Option<u32>),
+    Struct(&'a [TypeId]),
+    Pointer(TypeId),
 }
-#[derive(Debug, FromPrimitive)]
-enum ImageAspect {
-    Unknown = 2,
-    Color = 0,
-    Depth = 1,
+#[derive(Debug, Clone, Default)]
+struct NumericType {
+    /// Bit-width of this type.
+    nbyte: u32,
+    /// For integral types the field indicate it's signed ness, true for signed
+    /// int and false for unsigned. Floating point number will have this field
+    /// `None`.
+    is_signed: Option<bool>,
+    /// Row number for matrix types and element number for vector types.
+    nrow: Option<u32>,
+    /// Column number for matrix types.
+    ncol: Option<u32>,
 }
-#[derive(Debug, FromPrimitive)]
-enum ImageUsage {
-    Unknown = 0,
-    Sampled = 1,
-    Storage = 2,
+impl NumericType {
+    pub fn i32() -> NumericType {
+        NumericType {
+            nbyte: 4,
+            is_signed: Some(true),
+            ..Default::default()
+        }
+    }
+    pub fn u32() -> NumericType {
+        NumericType {
+            nbyte: 4,
+            is_signed: Some(false),
+            ..Default::default()
+        }
+    }
+    pub fn f32() -> NumericType {
+        NumericType {
+            nbyte: 4,
+            is_signed: None,
+            ..Default::default()
+        }
+    }
+    pub fn vec(elem_ty: &NumericType, nrow: u32) -> NumericType {
+        NumericType {
+            nbyte: elem_ty.nbyte,
+            is_signed: elem_ty.is_signed,
+            nrow: Some(nrow),
+            ..Default::default()
+        }
+    }
+    pub fn mat(col_ty: &NumericType, ncol: u32) -> NumericType {
+        NumericType {
+            nbyte: col_ty.nbyte,
+            is_signed: col_ty.is_signed,
+            nrow: col_ty.nrow,
+            ncol: Some(ncol),
+        }
+    }
+
+    pub fn nbyte(&self) -> u32 { self.nbyte }
+    pub fn nrow(&self) -> u32 { self.nrow.unwrap_or(1) }
+    pub fn ncol(&self) -> u32 { self.ncol.unwrap_or(1) }
+
+    pub fn is_primitive(&self) -> bool { self.nrow.is_none() && self.ncol.is_none() }
+    pub fn is_vec(&self) -> bool { self.nrow.is_some() && self.ncol.is_none() }
+    pub fn is_mat(&self) -> bool { self.nrow.is_some() && self.ncol.is_some() }
+
+    pub fn is_sint(&self) -> bool { Some(true) == self.is_signed }
+    pub fn is_uint(&self) -> bool { Some(false) == self.is_signed }
+    pub fn is_float(&self) -> bool { None == self.is_signed }
 }
-#[derive(Debug, Clone, Copy, FromPrimitive)]
-enum ColorFormat {
-    Unknown = 0,
+#[derive(Debug, Clone, Copy)]
+pub enum ColorFormat {
     Rgba32f = 1,
     R32f = 3,
     Rgba8 = 4,
 }
-#[derive(Debug)]
-enum Type<'a> {
-    Bool,
-    Int {
-        nbit: u32,
-        is_signed: bool,
+#[derive(Debug, Clone, Copy)]
+pub enum ImageUnitFormat {
+    Color(ColorFormat),
+    Sampled,
+    Depth,
+}
+#[derive(Debug, Clone)]
+pub enum ImageType {
+    Image1D {
+        /// Format is `None` if the image is a sampled image. Otherwise the
+        /// storage image color format is given. This is the only type trait we
+        /// should care about at the host, because the SPIR-V might consume
+        /// another type converted by the sampler internally.
+        fmt: ImageUnitFormat,
+        is_array: bool,
     },
-    Float {
-        nbit: u32,
-    },
-    Vector {
-        elem_ty: TypeId,
-        nelem: u32,
-    },
-    Matrix {
-        col_ty: TypeId,
-        ncol: u32,
-    },
-    Image {
-        prim_ty: TypeId,
-        dim: ImageDim,
-        content_ty: ImageAspect,
+    Image2D {
+        fmt: ImageUnitFormat,
         is_array: bool,
         is_multisampled: bool,
-        usage: ImageUsage,
-        fmt: ColorFormat,
     },
-    Sampler,
-    SampledImage {
-        img_ty: TypeId,
+    Image3D {
+        fmt: ImageUnitFormat,
     },
-    Array {
-        elem_ty: TypeId,
-        nelem: u32,
+    CubeMap {
+        fmt: ImageUnitFormat,
+        is_array: bool,
     },
-    RuntimeArray {
-        elem_ty: TypeId,
-    },
-    Struct {
-        member_tys: &'a [TypeId],
-    },
-    Pointer {
-        target_ty: TypeId,
-        store_cls: StorageClass,
-    },
+    SubpassData,
 }
 
-#[derive(Debug, FromPrimitive)]
-enum BuiltIn {
-    Position = 0,
-    PointSize = 1,
-    ClipDistance = 2,
-    CullDistance = 3,
-    VertexId = 5,
-    InstanceId = 6,
-    PrimitiveId = 7,
-    InvocationId = 8,
-    Layer = 9,
-    FragCoord = 15,
-    PointCoord = 16,
-    FrontFacing = 17,
-    SampleMask = 20,
-    FragDepth = 22,
-    HelperInvocation = 23,
-}
 #[derive(Debug)]
 enum Decoration {
     SpecId(u32),
@@ -216,14 +231,14 @@ enum Decoration {
     ColMajor,
     ArrayStride(usize),
     MatrixStride(usize),
-    BuiltIn(BuiltIn),
+    BuiltIn,
     Location(u32),
     Binding(u32),
     DescriptorSet(u32),
     Offset(usize),
     InputAttachmentIndex(u32),
 }
-#[derive(Debug, FromPrimitive)]
+#[derive(Debug, Clone, Copy, FromPrimitive)]
 enum StorageClass {
     UniformConstant = 0,
     Input = 1,
@@ -237,15 +252,15 @@ enum StorageClass {
 type VariableId = u32;
 #[derive(Debug)]
 struct Variable {
-    ty: u32,
+    ty: TypeId,
     store_cls: StorageClass,
 }
 
 type FunctionId = u32;
 #[derive(Default, Debug)]
 struct Function {
-    accessed_vars: HashSet<u32>,
-    calls: HashSet<u32>,
+    accessed_vars: HashSet<VariableId>,
+    calls: HashSet<FunctionId>,
 }
 
 
@@ -265,7 +280,6 @@ fn extract_entry_points<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<Vec<
                     .ok_or(Error::UnsupportedSpirv)?,
                 func: operands.read_u32()?,
                 name: operands.read_str()?,
-                interface_ids: operands.read_list()?,
             };
             entry_points.push(entry_point);
             instrs.next();
@@ -295,7 +309,7 @@ fn extract_names<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u3
     }
     Ok(name_map)
 }
-fn extract_decos<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u32, Option<u32>), Decoration>> {
+fn extract_decos<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u32, Option<u32>), Vec<Decoration>>> {
     const OP_DECORATE: u32 = 71;
     const OP_MEMBER_DECORATE: u32 = 72;
     const RANGE: RangeInclusive<u32> = OP_DECORATE..=OP_MEMBER_DECORATE;
@@ -313,7 +327,7 @@ fn extract_decos<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u3
     const DECO_OFFSET: u32 = 35;
     const DECO_INPUT_ATTACHMENT_INDEX: u32 = 43;
 
-    let mut deco_map = HashMap::<(u32, Option<u32>), Decoration>::new();
+    let mut deco_map = HashMap::<(u32, Option<u32>), Vec<Decoration>>::new();
     while let Some(instr) = instrs.peek() {
         if !RANGE.contains(&instr.opcode()) { instrs.next(); } else { break; }
     }
@@ -334,14 +348,14 @@ fn extract_decos<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u3
                 DECO_COL_MAJOR => Decoration::ColMajor,
                 DECO_ARRAY_STRIDE => Decoration::ArrayStride(get_first(params)? as usize),
                 DECO_MATRIX_STRIDE => Decoration::MatrixStride(get_first(params)? as usize),
-                DECO_BUILT_IN => Decoration::BuiltIn(params.first().to_owned().and_then(|x| BuiltIn::from_u32(*x)).ok_or(Error::UnsupportedSpirv)?),
+                DECO_BUILT_IN => Decoration::BuiltIn,
                 DECO_LOCATION => Decoration::Location(get_first(params)?),
                 DECO_BINDING => Decoration::Binding(get_first(params)?),
                 DECO_OFFSET => Decoration::Offset(get_first(params)? as usize),
                 DECO_INPUT_ATTACHMENT_INDEX => Decoration::InputAttachmentIndex(get_first(params)?),
                 _ => { instrs.next(); continue; }, // Ignore unsupported decos.
             };
-            deco_map.insert((target_id, member_id), deco);
+            deco_map.entry((target_id, member_id)).or_default().push(deco);
         } else { break; }
         instrs.next();
     }
@@ -363,73 +377,177 @@ fn extract_types<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<(HashMap<Ty
     const OP_TYPE_STRUCT: u32 = 30;
     const OP_TYPE_POINTER: u32 = 32;
     const OP_TYPE_FUNCTION: u32 = 33;
+    const OP_CONSTANT_TRUE: u32 = 41;
+    const OP_CONSTANT_FALSE: u32 = 42;
+    const OP_CONSTANT: u32 = 43;
+    const OP_CONSTANT_COMPOSITE: u32 = 44;
+    const OP_CONSTANT_SAMPLER: u32 = 45;
+    const OP_CONSTANT_NULL: u32 = 46;
+    const OP_SPEC_CONSTANT_TRUE: u32 = 48;
+    const OP_SPEC_CONSTANT_FALSE: u32 = 49;
+    const OP_SPEC_CONSTANT: u32 = 50;
+    const OP_SPEC_CONSTANT_COMPOSITE: u32 = 51;
+    const OP_SPEC_CONSTANT_OP: u32 = 52;
     const OP_VARIABLE: u32 = 59;
-    const RANGE: RangeInclusive<u32> = OP_TYPE_VOID..=OP_TYPE_FUNCTION;
-
-    macro_rules! spv_ty {
-        ($ty_map: ident, $instr: ident, $type: ident) => { spv_ty!($ty_map, $instr, $type, {}) };
-        ($ty_map: ident, $instr: ident, $type: ident, { $($id: ident <- $field_ty: ident),* }) => {
-            {
-                let mut operands = $instr.operands();
-                let id = operands.read_u32()?;
-                let ty = spv_ty!(_ty operands $type $($id $field_ty)*);
-                if $ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
-            }
-        };
-        (_ty $operands: ident $type: ident) => { Type::$type };
-        (_ty $operands: ident $type: ident $($id: ident $field_ty: ident)* ) => { Type::$type { $($id: $operands.$field_ty()?,)* } };
-    }
+    const TYPE_RANGE: RangeInclusive<u32> = OP_TYPE_VOID..=OP_TYPE_FUNCTION;
+    const CONST_RANGE: RangeInclusive<u32> = OP_CONSTANT_TRUE..=OP_SPEC_CONSTANT_OP;
 
     let mut ty_map: HashMap<TypeId, Type<'a>> = HashMap::new();
     let mut var_map: HashMap<VariableId, Variable> = HashMap::new();
     while let Some(instr) = instrs.peek() {
         let opcode = instr.opcode();
-        if !RANGE.contains(&opcode) && opcode != OP_VARIABLE { instrs.next(); } else { break; }
+        if !TYPE_RANGE.contains(&opcode) &&
+            !CONST_RANGE.contains(&opcode) &&
+            opcode != OP_VARIABLE { instrs.next(); } else { break; }
     }
     while let Some(instr) = instrs.peek() {
         match instr.opcode() {
             OP_TYPE_VOID => { /* Never a resource type. */ },
-            OP_TYPE_BOOL => spv_ty!(ty_map, instr, Bool),
-            OP_TYPE_INT => spv_ty!(ty_map, instr, Int, { is_signed <- read_bool, nbit <- read_u32 }),
-            OP_TYPE_FLOAT => spv_ty!(ty_map, instr, Float, { nbit <- read_u32 }),
-            OP_TYPE_VECTOR => spv_ty!(ty_map, instr, Vector, { elem_ty <- read_u32, nelem <- read_u32 }),
-            OP_TYPE_MATRIX => spv_ty!(ty_map, instr, Matrix, { col_ty <- read_u32, ncol <- read_u32 }),
-            OP_TYPE_IMAGE => {
+            OP_TYPE_BOOL => { return Err(Error::UnsupportedSpirv) },
+            OP_TYPE_INT => {
                 let mut operands = instr.operands();
                 let id = operands.read_u32()?;
-                let ty = Type::Image {
-                    prim_ty: operands.read_u32()?,
-                    dim: operands.read_u32()
-                        .map(FromPrimitive::from_u32)?
-                        .ok_or(Error::UnsupportedSpirv)?,
-                    content_ty: operands.read_u32()
-                        .map(FromPrimitive::from_u32)?
-                        .ok_or(Error::UnsupportedSpirv)?,
-                    is_array: operands.read_bool()?,
-                    is_multisampled: operands.read_bool()?,
-                    usage: operands.read_u32()
-                        .map(FromPrimitive::from_u32)?
-                        .ok_or(Error::UnsupportedSpirv)?,
-                    fmt: operands.read_u32()
-                        .map(FromPrimitive::from_u32)?
-                        .ok_or(Error::UnsupportedSpirv)?,
+                let nbyte = operands.read_u32()? >> 3;
+                if nbyte != 4 { return Err(Error::UnsupportedSpirv) }
+                let is_signed = operands.read_bool()?;
+                let int_ty = if is_signed { NumericType::i32() } else { NumericType::u32() };
+                let ty = Type::Numeric(int_ty);
+                if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
+            },
+            OP_TYPE_FLOAT => {
+                let mut operands = instr.operands();
+                let id = operands.read_u32()?;
+                let nbyte = operands.read_u32()? >> 3;
+                if nbyte != 4 { return Err(Error::UnsupportedSpirv) }
+                let ty = Type::Numeric(NumericType::f32());
+                if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
+            },
+            OP_TYPE_VECTOR | OP_TYPE_MATRIX => {
+                let mut operands = instr.operands();
+                let id = operands.read_u32()?;
+                let elem_ty = operands.read_u32()?;
+                let elem_ty = ty_map.get(&elem_ty)
+                    .ok_or(Error::CorruptedSpirv)?;
+                let elem_ty = if let Type::Numeric(num_ty) = elem_ty {
+                    num_ty
+                } else { return Err(Error::CorruptedSpirv); };
+                let nelem = operands.read_u32()?;
+                let ty = if instr.opcode() == OP_TYPE_VECTOR {
+                    if !elem_ty.is_primitive() { return Err(Error::CorruptedSpirv); }
+                    Type::Numeric(NumericType::vec(elem_ty, nelem))
+                } else {
+                    if !elem_ty.is_vec() { return Err(Error::CorruptedSpirv); }
+                    Type::Numeric(NumericType::mat(elem_ty, nelem))
                 };
                 if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
             },
-            OP_TYPE_SAMPLER => spv_ty!(ty_map, instr, Sampler),
-            OP_TYPE_SAMPLED_IMAGE => spv_ty!(ty_map, instr, SampledImage, { img_ty <- read_u32 }),
-            OP_TYPE_ARRAY => spv_ty!(ty_map, instr, Array, { elem_ty <- read_u32, nelem <- read_u32 }),
-            OP_TYPE_RUNTIME_ARRAY => spv_ty!(ty_map, instr, RuntimeArray, { elem_ty <- read_u32 }),
-            OP_TYPE_STRUCT => spv_ty!(ty_map, instr, Struct, { member_tys <- read_list }),
+            OP_TYPE_IMAGE => {
+                const DIM_IMAGE_1D: u32 = 0;
+                const DIM_IMAGE_2D: u32 = 1;
+                const DIM_IMAGE_3D: u32 = 2;
+                const DIM_IMAGE_CUBE: u32 = 3;
+                const DIM_IMAGE_SUBPASS_DATA: u32 = 6;
+
+                let mut operands = instr.operands();
+                let id = operands.read_u32()?;
+                let unit_ty = operands.read_u32()?;
+                let dim = operands.read_u32()?;
+                let is_depth = match operands.read_u32()? {
+                    0 => false, 1 => true,
+                    _ => return Err(Error::UnsupportedSpirv),
+                };
+                let is_array = operands.read_bool()?;
+                let is_multisampled = operands.read_bool()?;
+                let is_sampled = match operands.read_u32()? {
+                    1 => true, 2 => false,
+                    _ => return Err(Error::UnsupportedSpirv),
+                };
+                // Only unit types allowed to be stored in storage images can
+                // have given format.
+                let fmt = if is_sampled {
+                    ImageUnitFormat::Sampled
+                } else if is_depth {
+                    ImageUnitFormat::Depth
+                } else {
+                    let color_fmt = match operands.read_u32()? {
+                        1 => ColorFormat::Rgba32f,
+                        3 => ColorFormat::R32f,
+                        4 => ColorFormat::Rgba8,
+                        _ => return Err(Error::UnsupportedSpirv),
+                    };
+                    ImageUnitFormat::Color(color_fmt)
+                };
+
+                let img_ty = match dim {
+                    DIM_IMAGE_1D => ImageType::Image1D {
+                        fmt: fmt,
+                        is_array: is_array,
+                    },
+                    DIM_IMAGE_2D => ImageType::Image2D {
+                        fmt: fmt,
+                        is_array: is_array,
+                        is_multisampled: is_multisampled,
+                    },
+                    DIM_IMAGE_3D => ImageType::Image3D {
+                        fmt: fmt,
+                    },
+                    DIM_IMAGE_CUBE => ImageType::CubeMap {
+                        fmt: fmt,
+                        is_array: is_array,
+                    },
+                    DIM_IMAGE_SUBPASS_DATA => ImageType::SubpassData,
+                    _ => return Err(Error::UnsupportedSpirv),
+                };
+                let ty = Type::Image(img_ty);
+                if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
+            },
+            OP_TYPE_SAMPLED_IMAGE => {
+                let mut operands = instr.operands();
+                let id = operands.read_u32()?;
+                let img_ty_id = operands.read_u32()?;
+                let ty = ty_map.get(&img_ty_id)
+                    .ok_or(Error::CorruptedSpirv)?;
+                if let Type::Image(_) = ty {
+                    if ty_map.insert(id, ty.clone()).is_some() { return Err(Error::CorruptedSpirv); }
+                } else { return Err(Error::CorruptedSpirv); }
+            }
+            OP_TYPE_SAMPLER => { /* Not in GLSL. */ },
+            OP_TYPE_ARRAY | OP_TYPE_RUNTIME_ARRAY => {
+                let mut operands = instr.operands();
+                let id = operands.read_u32()?;
+                let elem_ty_id = operands.read_u32()?;
+                let elem_ty = ty_map.get(&elem_ty_id)
+                    .ok_or(Error::CorruptedSpirv)?;
+                let ty = if let Type::Array(sub_elem_ty_id, sub_nelem) = elem_ty {
+                    // Variant-length array can only be the outermost type.
+                    let sub_nelem = sub_nelem.ok_or(Error::CorruptedSpirv)?;
+                    // Fold nesting sized arrays, sharing the same subtype.
+                    let nelem = if instr.opcode() == OP_TYPE_ARRAY {
+                        Some(sub_nelem * operands.read_u32()?)
+                    } else { None };
+                    Type::Array(*sub_elem_ty_id, nelem)
+                } else {
+                    // Non-nesting sized arrays. Just wrap another layer.
+                    let nelem = if instr.opcode() == OP_TYPE_ARRAY {
+                        Some(operands.read_u32()?)
+                    } else { None };
+                    Type::Array(elem_ty_id, nelem)
+                };
+                if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
+            },
+            OP_TYPE_STRUCT => {
+                // spv_ty!(ty_map, instr, Struct, { member_tys <- read_list })
+                let mut operands = instr.operands();
+                let id = operands.read_u32()?;
+                let ty = Type::Struct(operands.read_list()?);
+                if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
+            },
             OP_TYPE_POINTER => {
                 let mut operands = instr.operands();
                 let id = operands.read_u32()?;
-                let ty = Type::Pointer {
-                    store_cls: operands.read_u32()
-                        .map(FromPrimitive::from_u32)?
-                        .ok_or(Error::UnsupportedSpirv)?,
-                    target_ty: operands.read_u32()?,
-                };
+                let _store_cls = operands.read_u32()?;
+                let target_ty = operands.read_u32()?;
+                let ty = Type::Pointer(target_ty);
                 if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
             },
             OP_TYPE_FUNCTION => { /* Don't need this. */ },
@@ -446,9 +564,20 @@ fn extract_types<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<(HashMap<Ty
                 };
                 if var_map.insert(id, var).is_some() { return Err(Error::CorruptedSpirv); }
             },
-            _ => break,
+            opcode => {
+                if !CONST_RANGE.contains(&opcode) { break; }
+            },
         }
         instrs.next();
+    }
+    // Variables' types are always pointer types, which is not very useful for.
+    // We dereference the pointer and get the underlying actual types instead.
+    for var in var_map.values_mut() {
+        if let Some(Type::Pointer(target_ty)) = ty_map.get(&var.ty) {
+            var.ty = *target_ty;
+        } else {
+            return Err(Error::CorruptedSpirv);
+        }
     }
     Ok((ty_map, var_map))
 }
@@ -502,18 +631,20 @@ fn extract_funcs<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<Fun
     Ok(func_map)
 }
 
+use crate::gfx::contract::{VertexAttributeContract, AttachmentContract, PipelineStageContract, DescriptorContract};
+
 #[derive(Debug)]
-struct ReflectionBundle<'a> {
-    entry_points: Vec<EntryPoint<'a>>,
-    name_map: HashMap<(u32, Option<u32>), &'a str>,
-    deco_map: HashMap<(u32, Option<u32>), Decoration>,
-    ty_map: HashMap<TypeId, Type<'a>>,
-    var_map: HashMap<VariableId, Variable>,
-    func_map: HashMap<FunctionId, Function>,
+struct SpirvMetadata<'a> {
+    pub entry_points: Vec<EntryPoint<'a>>,
+    pub name_map: HashMap<(u32, Option<u32>), &'a str>,
+    pub deco_map: HashMap<(u32, Option<u32>), Vec<Decoration>>,
+    pub ty_map: HashMap<TypeId, Type<'a>>,
+    pub var_map: HashMap<VariableId, Variable>,
+    pub func_map: HashMap<FunctionId, Function>,
 }
-impl<'a> TryFrom<&'a SpirvBinary> for ReflectionBundle<'a> {
+impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
     type Error = Error;
-    fn try_from(module: &'a SpirvBinary) -> Result<ReflectionBundle<'a>> {
+    fn try_from(module: &'a SpirvBinary) -> Result<SpirvMetadata<'a>> {
         // Don't change the order. See _2.4 Logical Layout of a Module_ of the
         // SPIR-V specification for more information.
         let mut instrs = module.instrs().peekable();
@@ -523,7 +654,7 @@ impl<'a> TryFrom<&'a SpirvBinary> for ReflectionBundle<'a> {
         let (ty_map, var_map) = extract_types(&mut instrs)?;
         let func_map = extract_funcs(&mut instrs)?;
 
-        let bundle = ReflectionBundle {
+        let meta = SpirvMetadata {
             entry_points: entry_points,
             name_map: name_map,
             deco_map: deco_map,
@@ -531,13 +662,115 @@ impl<'a> TryFrom<&'a SpirvBinary> for ReflectionBundle<'a> {
             var_map: var_map,
             func_map: func_map,
         };
-        Ok(bundle)
+        Ok(meta)
     }
+}
+impl<'a> SpirvMetadata<'a> {
+    fn collect_fn_vars_impl(&self, func: FunctionId, vars: &mut HashSet<VariableId>) {
+        let func = &self.func_map[&func];
+        let it = func.accessed_vars.iter()
+            .filter(|x| self.var_map.contains_key(x));
+        vars.extend(it);
+        for call in func.calls.iter() {
+            self.collect_fn_vars_impl(*call, vars);
+        }
+    }
+    pub fn collect_fn_vars(&self, func: FunctionId) -> impl Iterator<Item=VariableId> {
+        let mut accessed_vars = HashSet::new();
+        self.collect_fn_vars_impl(func, &mut accessed_vars);
+        accessed_vars.into_iter()
+    }
+}
+
+#[derive(Debug)]
+struct VertexAttributeContractTemplate {
+    bind_point: u32,
+    location: u32,
+    /// Offset in each set of vertex data.
+    offset: usize,
+    /// Total byte count at this location.
+    nbyte: usize,
+}
+#[derive(Debug)]
+struct AttachmentContractTemplate {
+    location: u32,
+    /// Total byte count at this location.
+    nbyte: usize,
 }
 
 /// Resolve the minimum contract for all entry points in the module.
 pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
+    use std::ops::Deref;
     use log::debug;
-    let _: ReflectionBundle = module.try_into()?;
+    let meta: SpirvMetadata = module.try_into()?;
+
+    let entry_point = &meta.entry_points[0];
+    info!("{}", entry_point.name);
+    let exec_model = &entry_point.exec_model;
+
+    let mut desc_contracts = Vec::<DescriptorContract>::new();
+    let mut attr_offset: usize = 0;
+    let mut attr_templates = Vec::<VertexAttributeContractTemplate>::new();
+    let mut attm_templates = Vec::<AttachmentContractTemplate>::new();
+
+    for var_id in meta.collect_fn_vars(entry_point.func) {
+        let var = &meta.var_map.get(&var_id)
+            .ok_or(Error::CorruptedSpirv)?;
+        let ty = meta.ty_map.get(&var.ty)
+            .ok_or(Error::CorruptedSpirv)?;
+        let decos = meta.deco_map.get(&(var_id, None))
+            .map_or(&[] as &[Decoration], Deref::deref);
+        match var.store_cls {
+            StorageClass::Input if *exec_model == ExecutionModel::Vertex => {
+                let mut bind_point = 0;
+                let mut location = 0;
+                for deco in decos.iter() {
+                    match deco {
+                        Decoration::Location(x) => location = *x,
+                        Decoration::Binding(x) => bind_point = *x,
+                        _ => {},
+                    }
+                }
+                if let Type::Numeric(num_ty) = ty {
+                    let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
+                    for i in 0..num_ty.ncol() {
+                        let template = VertexAttributeContractTemplate {
+                            bind_point: bind_point,
+                            location: location,
+                            offset: attr_offset,
+                            nbyte: col_nbyte,
+                        };
+                        attr_templates.push(template);
+                        attr_offset += col_nbyte;
+                    }
+                }
+                // Leak out all inputs that are not attributes.
+            },
+            StorageClass::Output if *exec_model == ExecutionModel::Fragment => {
+                let mut location = 0;
+                for deco in decos.iter() {
+                    match deco {
+                        Decoration::Location(x) => location = *x,
+                        _ => {},
+                    }
+                }
+                if let Type::Numeric(num_ty) = ty {
+                    // Matrix is not valid attachment type.
+                    if num_ty.is_mat() { return Err(Error::CorruptedSpirv); }
+                    let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
+                    let template = AttachmentContractTemplate {
+                        location: location,
+                        nbyte: col_nbyte,
+                    };
+                    attm_templates.push(template);
+                } else { debug!("123"); }
+                // Leak out all outputs that are not attachments.
+            },
+            _ => {},
+        }
+    }
+    info!("{:?}", attr_templates);
+    info!("{:?}", attm_templates);
+
     Ok(())
 }
