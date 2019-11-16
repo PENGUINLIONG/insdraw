@@ -398,7 +398,7 @@ use crate::gfx::contract::{VertexAttributeContract, AttachmentContract, Pipeline
 struct SpirvMetadata<'a> {
     pub entry_points: Vec<EntryPoint<'a>>,
     pub name_map: HashMap<(ObjectId, Option<u32>), &'a str>,
-    pub deco_map: HashMap<(ObjectId, Option<u32>), HashMap<Decoration, &'a [u32]>>,
+    pub deco_map: HashMap<(ObjectId, Option<u32>, Decoration), &'a [u32]>,
     pub obj_map: HashMap<ObjectId, SpirvObject<'a>>,
 }
 impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
@@ -521,7 +521,9 @@ impl<'a> SpirvMetadata<'a> {
             let member_id = if opcode == OP_MEMBER_DECORATE { Some(operands.read_u32()?) } else { None };
             let deco = operands.read_u32()?;
             let params = operands.read_list()?;
-            self.deco_map.entry((target_id, member_id)).or_default().insert(deco, params);
+            if self.deco_map.insert((target_id, member_id, deco), params).is_some() {
+                return Err(Error::CorruptedSpirv);
+            }
             instrs.next();
         }
         Ok(())
@@ -603,11 +605,9 @@ impl<'a> SpirvMetadata<'a> {
                 let ls = operands.read_list()?;
                 let mut members = Vec::with_capacity(ls.len());
                 for (i, member) in ls.iter().enumerate() {
-                    let locator = &(id, Some(i as u32));
-                    let name = self.name_map.get(locator)
+                    let name = self.name_map.get(&(id, Some(i as u32)))
                         .map(|x| *x);
-                    let offset = self.deco_map.get(locator)
-                        .and_then(|x| x.get(&DECO_OFFSET))
+                    let offset = self.deco_map.get(&(id, Some(i as u32), DECO_OFFSET))
                         .and_then(|x| x.get(i))
                         .map(|x| *x as usize);
                     let member = StructMember {
@@ -771,20 +771,17 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
     let mut attr_offset: usize = 0;
     let mut attr_templates = Vec::<VertexAttributeContractTemplate>::new();
     let mut attm_templates = Vec::<AttachmentContractTemplate>::new();
-    let empty_decos = HashMap::default();
 
     for var_id in meta.collect_fn_vars(entry_point.func) {
         let var = &meta.get_var(var_id)?;
         let ty = meta.resolve_ref(var.ty)?;
-        let decos = meta.deco_map.get(&(var_id, None))
-            .unwrap_or(&empty_decos);
         match var.store_cls {
             STORE_CLS_INPUT if *exec_model == EXEC_MODEL_VERTEX => {
-                let bind_point = decos.get(&DECO_BINDING)
+                let bind_point = meta.deco_map.get(&(var_id, None, DECO_BINDING))
                     .and_then(|x| x.get(0))
                     .map(|x| *x)
                     .unwrap_or(0);
-                let location = decos.get(&DECO_LOCATION)
+                let location = meta.deco_map.get(&(var_id, None, DECO_LOCATION))
                     .and_then(|x| x.get(0))
                     .map(|x| *x)
                     .unwrap_or(0);
@@ -804,7 +801,7 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
                 // Leak out all inputs that are not attributes.
             },
             STORE_CLS_OUTPUT if *exec_model == EXEC_MODEL_FRAGMENT => {
-                let mut location = decos.get(&DECO_LOCATION)
+                let mut location = meta.deco_map.get(&(var_id, None, DECO_LOCATION))
                     .and_then(|x| x.get(0))
                     .map(|x| *x)
                     .unwrap_or(0);
