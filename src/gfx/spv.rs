@@ -671,21 +671,31 @@ impl<'a> SpirvMetadata<'a> {
             }
         }
         Ok(())
-    }/*
+    }
     fn collect_fn_vars_impl(&self, func: FunctionId, vars: &mut HashSet<VariableId>) {
-        let func = &self.func_map[&func];
-        let it = func.accessed_vars.iter()
-            .filter(|x| self.var_map.contains_key(x));
-        vars.extend(it);
-        for call in func.calls.iter() {
-            self.collect_fn_vars_impl(*call, vars);
+        if let Some(func) = &self.func_map.get(&func) {
+            let it = func.accessed_vars.iter()
+                .filter(|x| self.var_map.contains_key(x));
+            vars.extend(it);
+            for call in func.calls.iter() {
+                self.collect_fn_vars_impl(*call, vars);
+            }
         }
     }
     pub fn collect_fn_vars(&self, func: FunctionId) -> impl Iterator<Item=VariableId> {
         let mut accessed_vars = HashSet::new();
         self.collect_fn_vars_impl(func, &mut accessed_vars);
         accessed_vars.into_iter()
-    }*/
+    }
+    /// Resolve recurring layers of pointers to the pointer that refer to the
+    /// data directly.
+    fn resolve_ref(&self, ty: TypeId) -> Result<&Type<'a>> {
+        let ty = &self.ty_map.get(&ty)
+            .ok_or(Error::CorruptedSpirv)?;
+        if let Type::Pointer(ref_ty) = ty {
+            self.resolve_ref(*ref_ty)
+        } else { Ok(ty) }
+    }
 }
 
 #[derive(Debug)]
@@ -709,34 +719,34 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
     use std::ops::Deref;
     use log::debug;
     let meta: SpirvMetadata = module.try_into()?;
+    debug!("{:?}", meta);
 
     let entry_point = &meta.entry_points[0];
     info!("{}", entry_point.name);
     let exec_model = &entry_point.exec_model;
-/*
+
     let mut desc_contracts = Vec::<DescriptorContract>::new();
     let mut attr_offset: usize = 0;
     let mut attr_templates = Vec::<VertexAttributeContractTemplate>::new();
     let mut attm_templates = Vec::<AttachmentContractTemplate>::new();
+    let empty_decos = HashMap::default();
 
     for var_id in meta.collect_fn_vars(entry_point.func) {
         let var = &meta.var_map.get(&var_id)
             .ok_or(Error::CorruptedSpirv)?;
-        let ty = meta.ty_map.get(&var.ty)
-            .ok_or(Error::CorruptedSpirv)?;
+        let ty = meta.resolve_ref(var.ty)?;
         let decos = meta.deco_map.get(&(var_id, None))
-            .map_or(&[] as &[Decoration], Deref::deref);
+            .unwrap_or(&empty_decos);
         match var.store_cls {
-            StorageClass::Input if *exec_model == ExecutionModel::Vertex => {
-                let mut bind_point = 0;
-                let mut location = 0;
-                for deco in decos.iter() {
-                    match deco {
-                        Decoration::Location(x) => location = *x,
-                        Decoration::Binding(x) => bind_point = *x,
-                        _ => {},
-                    }
-                }
+            STORE_CLS_INPUT if *exec_model == EXEC_MODEL_VERTEX => {
+                let bind_point = decos.get(&DECO_BINDING)
+                    .and_then(|x| x.get(0))
+                    .map(|x| *x)
+                    .unwrap_or(0);
+                let location = decos.get(&DECO_LOCATION)
+                    .and_then(|x| x.get(0))
+                    .map(|x| *x)
+                    .unwrap_or(0);
                 if let Type::Numeric(num_ty) = ty {
                     let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
                     for i in 0..num_ty.ncol() {
@@ -749,17 +759,14 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
                         attr_templates.push(template);
                         attr_offset += col_nbyte;
                     }
-                }
+                } else { debug!("456"); }
                 // Leak out all inputs that are not attributes.
             },
-            StorageClass::Output if *exec_model == ExecutionModel::Fragment => {
-                let mut location = 0;
-                for deco in decos.iter() {
-                    match deco {
-                        Decoration::Location(x) => location = *x,
-                        _ => {},
-                    }
-                }
+            STORE_CLS_OUTPUT if *exec_model == EXEC_MODEL_FRAGMENT => {
+                let mut location = decos.get(&DECO_LOCATION)
+                    .and_then(|x| x.get(0))
+                    .map(|x| *x)
+                    .unwrap_or(0);
                 if let Type::Numeric(num_ty) = ty {
                     // Matrix is not valid attachment type.
                     if num_ty.is_mat() { return Err(Error::CorruptedSpirv); }
@@ -777,7 +784,6 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
     }
     info!("{:?}", attr_templates);
     info!("{:?}", attm_templates);
-    */
 
     Ok(())
 }
