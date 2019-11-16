@@ -345,35 +345,36 @@ pub struct ImageType {
 }
 #[derive(Debug, Clone, Copy)]
 pub struct ArrayType {
-    elem_ty: TypeId,
-    nelem: Option<ConstantId>,
+    elem_ty: ObjectId,
+    nelem: Option<ObjectId>,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct StructMember<'a> {
-    ty: TypeId,
+    ty: ObjectId,
     name: Option<&'a str>,
     offset: Option<usize>,
 }
-pub type TypeId = u32;
-#[derive(Debug, Clone)]
-pub enum Type<'a> {
-    Numeric(NumericType),
-    Image(ImageType),
-    Array(ArrayType),
-    Struct(Vec<StructMember<'a>>),
-    Pointer(TypeId),
-}
-type VariableId = u32;
 #[derive(Debug, Clone)]
 pub struct Variable {
-    ty: TypeId,
+    ty: ObjectId,
     store_cls: StorageClass,
 }
-type ConstantId = u32;
 #[derive(Debug, Clone)]
 pub struct Constant<'a> {
-    ty: TypeId,
+    ty: ObjectId,
     value: &'a [u32],
+}
+pub type ObjectId = u32;
+#[derive(Debug, Clone)]
+pub enum SpirvObject<'a> {
+    NumericType(NumericType),
+    ImageType(ImageType),
+    ArrayType(ArrayType),
+    StructType(Vec<StructMember<'a>>),
+    PointerType(ObjectId),
+    Variable(Variable),
+    Constant(Constant<'a>),
+    Function(Function),
 }
 
 type Decoration = u32;
@@ -385,11 +386,10 @@ pub struct ElementMetadata<'a> {
 }
 pub struct ElementMetadataMap<'a>(HashMap<(u32, Option<u32>), ElementMetadata<'a>>);
 
-type FunctionId = u32;
-#[derive(Default, Debug)]
-struct Function {
-    accessed_vars: HashSet<VariableId>,
-    calls: HashSet<FunctionId>,
+#[derive(Default, Debug, Clone)]
+pub struct Function {
+    accessed_vars: HashSet<ObjectId>,
+    calls: HashSet<ObjectId>,
 }
 
 use crate::gfx::contract::{VertexAttributeContract, AttachmentContract, PipelineStageContract, DescriptorContract};
@@ -397,12 +397,9 @@ use crate::gfx::contract::{VertexAttributeContract, AttachmentContract, Pipeline
 #[derive(Default, Debug)]
 struct SpirvMetadata<'a> {
     pub entry_points: Vec<EntryPoint<'a>>,
-    pub name_map: HashMap<(u32, Option<u32>), &'a str>,
-    pub deco_map: HashMap<(u32, Option<u32>), HashMap<Decoration, &'a [u32]>>,
-    pub ty_map: HashMap<u32, Type<'a>>,
-    pub var_map: HashMap<u32, Variable>,
-    pub const_map: HashMap<u32, Constant<'a>>,
-    pub func_map: HashMap<u32, Function>,
+    pub name_map: HashMap<(ObjectId, Option<u32>), &'a str>,
+    pub deco_map: HashMap<(ObjectId, Option<u32>), HashMap<Decoration, &'a [u32]>>,
+    pub obj_map: HashMap<ObjectId, SpirvObject<'a>>,
 }
 impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
     type Error = Error;
@@ -426,6 +423,56 @@ impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
     }
 }
 impl<'a> SpirvMetadata<'a> {
+    fn insert_obj(&mut self, id: ObjectId, obj: SpirvObject<'a>) -> Result<()> {
+        if self.obj_map.insert(id, obj).is_some() { return Err(Error::CorruptedSpirv); }
+        Ok(())
+    }
+    fn get_num_ty(&self, id: ObjectId) -> Result<&NumericType> {
+        self.obj_map.get(&id)
+            .and_then(|x| match x { SpirvObject::NumericType(ty) => Some(ty), _ => None })
+            .ok_or(Error::CorruptedSpirv)
+    }
+    fn get_img_ty(&self, id: ObjectId) -> Result<&ImageType> {
+        self.obj_map.get(&id)
+            .and_then(|x| match x { SpirvObject::ImageType(ty) => Some(ty), _ => None })
+            .ok_or(Error::CorruptedSpirv)
+    }
+    fn get_arr_ty(&self, id: ObjectId) -> Result<&ArrayType> {
+        self.obj_map.get(&id)
+            .and_then(|x| match x { SpirvObject::ArrayType(ty) => Some(ty), _ => None })
+            .ok_or(Error::CorruptedSpirv)
+    }
+    fn get_struct_ty(&self, id: ObjectId) -> Result<&Vec<StructMember<'a>>> {
+        self.obj_map.get(&id)
+            .and_then(|x| match x { SpirvObject::StructType(ty) => Some(ty), _ => None })
+            .ok_or(Error::CorruptedSpirv)
+    }
+    fn get_ptr_ty(&self, id: ObjectId) -> Result<&ObjectId> {
+        self.obj_map.get(&id)
+            .and_then(|x| match x { SpirvObject::PointerType(id) => Some(id), _ => None })
+            .ok_or(Error::CorruptedSpirv)
+    }
+    fn get_var(&self, id: ObjectId) -> Result<&Variable> {
+        self.obj_map.get(&id)
+            .and_then(|x| match x { SpirvObject::Variable(ty) => Some(ty), _ => None })
+            .ok_or(Error::CorruptedSpirv)
+    }
+    fn get_const(&self, id: ObjectId) -> Result<&Constant<'a>> {
+        self.obj_map.get(&id)
+            .and_then(|x| match x { SpirvObject::Constant(ty) => Some(ty), _ => None })
+            .ok_or(Error::CorruptedSpirv)
+    }
+    fn get_fn(&self, id: ObjectId) -> Result<&Function> {
+        self.obj_map.get(&id)
+            .and_then(|x| match x { SpirvObject::Function(ty) => Some(ty), _ => None })
+            .ok_or(Error::CorruptedSpirv)
+    }
+    fn get_fn_or_default_mut(&mut self, id: ObjectId) -> Result<&mut Function> {
+        let obj = self.obj_map.entry(id)
+            .or_insert_with(|| SpirvObject::Function(Function::default()));
+        match obj { SpirvObject::Function(ty) => Ok(ty), _ => Err(Error::CorruptedSpirv) }
+    }
+
     fn populate_entry_points(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()>{
         // Extract entry points.
         while let Some(instr) = instrs.peek() {
@@ -495,20 +542,17 @@ impl<'a> SpirvMetadata<'a> {
                     Some(false) => NumericType::u32(),
                     None => NumericType::f32(),
                 };
-                Type::Numeric(num_ty)
+                self.insert_obj(id, SpirvObject::NumericType(num_ty))?;
             },
             OP_TYPE_VECTOR | OP_TYPE_MATRIX => {
-                let elem_ty = self.ty_map.get(&operands.read_u32()?)
-                    .ok_or(Error::CorruptedSpirv)?;
+                let elem_ty = self.get_num_ty(operands.read_u32()?)?;
                 let nelem = operands.read_u32()?;
-                let num_ty = if let Type::Numeric(num_ty) = elem_ty {
-                    if opcode == OP_TYPE_VECTOR && num_ty.is_primitive() {
-                        NumericType::vec(&num_ty, nelem)
-                    } else if opcode == OP_TYPE_MATRIX && num_ty.is_vec() {
-                        NumericType::mat(&num_ty, nelem)
-                    } else { return Err(Error::CorruptedSpirv); }
+                let num_ty = if opcode == OP_TYPE_VECTOR && elem_ty.is_primitive() {
+                    NumericType::vec(&elem_ty, nelem)
+                } else if opcode == OP_TYPE_MATRIX && elem_ty.is_vec() {
+                    NumericType::mat(&elem_ty, nelem)
                 } else { return Err(Error::CorruptedSpirv); };
-                Type::Numeric(num_ty)
+                self.insert_obj(id, SpirvObject::NumericType(num_ty))?;
             },
             OP_TYPE_IMAGE => {
                 let _unit_ty = operands.read_u32()?;
@@ -530,31 +574,30 @@ impl<'a> SpirvMetadata<'a> {
                     fmt: ImageUnitFormat::from_spv_def(is_sampled, is_depth, color_fmt)?,
                     arng: ImageArrangement::from_spv_def(dim, is_array, is_multisampled)?,
                 };
-                Type::Image(img_ty)
+                self.insert_obj(id, SpirvObject::ImageType(img_ty))?;
             },
             OP_TYPE_SAMPLED_IMAGE => {
-                let img_ty_id = operands.read_u32()?;
-                let ty = self.ty_map.get(&img_ty_id)
-                    .ok_or(Error::CorruptedSpirv)?;
-                if let Type::Image(_) = ty { ty.clone() } else { return Err(Error::CorruptedSpirv); }
-            }
+                let ty = self.get_img_ty(operands.read_u32()?)?;
+                self.insert_obj(id, SpirvObject::ImageType(*ty));
+            },
             OP_TYPE_ARRAY | OP_TYPE_RUNTIME_ARRAY => {
                 let arr_ty = ArrayType {
                     elem_ty: operands.read_u32()?,
                     nelem: if instr.opcode() == OP_TYPE_ARRAY {
-                        let nelem_const = operands.read_u32()?;
-                        let nelem = self.const_map.get(&nelem_const)
-                            .filter(|constant| {
-                                if let Some(Type::Numeric(num_ty)) = self.ty_map.get(&constant.ty) {
-                                    num_ty.nbyte == 4 && num_ty.is_uint() && num_ty.is_primitive()
-                                } else { false }
-                            })
-                            .and_then(|x| x.value.get(0))
-                            .ok_or(Error::CorruptedSpirv)?;
+                        let nelem = self.get_const(operands.read_u32()?)
+                            .and_then(|constant| {
+                                let num_ty = self.get_num_ty(constant.ty)?;
+                                if num_ty.nbyte == 4 && num_ty.is_uint() && num_ty.is_primitive() {
+                                    if let Some(nelem) = constant.value.get(0) {
+                                        return Ok(nelem);
+                                    }
+                                }
+                                return Err(Error::CorruptedSpirv);
+                            })?;
                         Some(*nelem)
                     } else { None },
                 };
-                Type::Array(arr_ty)
+                self.insert_obj(id, SpirvObject::ArrayType(arr_ty))?;
             },
             OP_TYPE_STRUCT => {
                 let ls = operands.read_list()?;
@@ -574,16 +617,15 @@ impl<'a> SpirvMetadata<'a> {
                     };
                     members.push(member);
                 }
-                Type::Struct(members)
+                self.insert_obj(id, SpirvObject::StructType(members))?;
             },
             OP_TYPE_POINTER => {
                 let _store_cls = operands.read_u32()?;
                 let target_ty = operands.read_u32()?;
-                Type::Pointer(target_ty)
+                self.insert_obj(id, SpirvObject::PointerType(target_ty))?;
             },
             _ => return Err(Error::CorruptedSpirv),
         };
-        if self.ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
         Ok(())
     }
     fn populate_one_var(&mut self, instr: &Instr<'a>) -> Result<()> {
@@ -597,7 +639,7 @@ impl<'a> SpirvMetadata<'a> {
             ty: ty,
             store_cls: store_cls,
         };
-        if self.var_map.insert(id, var).is_some() { return Err(Error::CorruptedSpirv); }
+        self.insert_obj(id, SpirvObject::Variable(var))?;
         Ok(())
     }
     fn populate_one_const(&mut self, instr: &Instr<'a>) -> Result<()> {
@@ -609,7 +651,7 @@ impl<'a> SpirvMetadata<'a> {
             ty: ty,
             value: value,
         };
-        if self.const_map.insert(id, constant).is_some() { return Err(Error::CorruptedSpirv); }
+        self.insert_obj(id, SpirvObject::Constant(constant))?;
         Ok(())
     }
     fn populate_defs(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
@@ -640,7 +682,7 @@ impl<'a> SpirvMetadata<'a> {
                     let mut operands = instr.operands();
                     let _rty = operands.read_u32()?;
                     let id = operands.read_u32()?;
-                    func = self.func_map.entry(id).or_default();
+                    func = self.get_fn_or_default_mut(id)?;
                     break;
                 }
             }
@@ -672,27 +714,27 @@ impl<'a> SpirvMetadata<'a> {
         }
         Ok(())
     }
-    fn collect_fn_vars_impl(&self, func: FunctionId, vars: &mut HashSet<VariableId>) {
-        if let Some(func) = &self.func_map.get(&func) {
+    fn collect_fn_vars_impl(&self, func: ObjectId, vars: &mut HashSet<ObjectId>) {
+        if let Ok(func) = self.get_fn(func) {
             let it = func.accessed_vars.iter()
-                .filter(|x| self.var_map.contains_key(x));
+                .filter(|x| self.obj_map.contains_key(x));
             vars.extend(it);
             for call in func.calls.iter() {
                 self.collect_fn_vars_impl(*call, vars);
             }
         }
     }
-    pub fn collect_fn_vars(&self, func: FunctionId) -> impl Iterator<Item=VariableId> {
+    pub fn collect_fn_vars(&self, func: ObjectId) -> impl Iterator<Item=ObjectId> {
         let mut accessed_vars = HashSet::new();
         self.collect_fn_vars_impl(func, &mut accessed_vars);
         accessed_vars.into_iter()
     }
     /// Resolve recurring layers of pointers to the pointer that refer to the
     /// data directly.
-    fn resolve_ref(&self, ty: TypeId) -> Result<&Type<'a>> {
-        let ty = &self.ty_map.get(&ty)
+    fn resolve_ref(&self, ty: ObjectId) -> Result<&SpirvObject<'a>> {
+        let ty = &self.obj_map.get(&ty)
             .ok_or(Error::CorruptedSpirv)?;
-        if let Type::Pointer(ref_ty) = ty {
+        if let SpirvObject::PointerType(ref_ty) = ty {
             self.resolve_ref(*ref_ty)
         } else { Ok(ty) }
     }
@@ -732,8 +774,7 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
     let empty_decos = HashMap::default();
 
     for var_id in meta.collect_fn_vars(entry_point.func) {
-        let var = &meta.var_map.get(&var_id)
-            .ok_or(Error::CorruptedSpirv)?;
+        let var = &meta.get_var(var_id)?;
         let ty = meta.resolve_ref(var.ty)?;
         let decos = meta.deco_map.get(&(var_id, None))
             .unwrap_or(&empty_decos);
@@ -747,7 +788,7 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
                     .and_then(|x| x.get(0))
                     .map(|x| *x)
                     .unwrap_or(0);
-                if let Type::Numeric(num_ty) = ty {
+                if let SpirvObject::NumericType(num_ty) = ty {
                     let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
                     for i in 0..num_ty.ncol() {
                         let template = VertexAttributeContractTemplate {
@@ -767,7 +808,7 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
                     .and_then(|x| x.get(0))
                     .map(|x| *x)
                     .unwrap_or(0);
-                if let Type::Numeric(num_ty) = ty {
+                if let SpirvObject::NumericType(num_ty) = ty {
                     // Matrix is not valid attachment type.
                     if num_ty.is_mat() { return Err(Error::CorruptedSpirv); }
                     let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
