@@ -13,6 +13,108 @@ use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 use log::{debug, info, warn, error};
 
+const OP_ENTRY_POINT: u32 = 15;
+
+const OP_NAME: u32 = 5;
+const OP_MEMBER_NAME: u32 = 6;
+const NAME_RANGE: RangeInclusive<u32> = OP_NAME..=OP_MEMBER_NAME;
+
+const OP_DECORATE: u32 = 71;
+const OP_MEMBER_DECORATE: u32 = 72;
+const DECO_RANGE: RangeInclusive<u32> = OP_DECORATE..=OP_MEMBER_DECORATE;
+
+// Don't need this: Not a resource type. But kept for the range.
+const OP_TYPE_VOID: u32 = 19;
+const OP_TYPE_BOOL: u32 = 20;
+const OP_TYPE_INT: u32 = 21;
+const OP_TYPE_FLOAT: u32 = 22;
+const OP_TYPE_VECTOR: u32 = 23;
+const OP_TYPE_MATRIX: u32 = 24;
+const OP_TYPE_IMAGE: u32 = 25;
+// Not in GLSL.
+// const OP_TYPE_SAMPLER: u32 = 26;
+const OP_TYPE_SAMPLED_IMAGE: u32 = 27;
+const OP_TYPE_ARRAY: u32 = 28;
+const OP_TYPE_RUNTIME_ARRAY: u32 = 29;
+const OP_TYPE_STRUCT: u32 = 30;
+const OP_TYPE_POINTER: u32 = 32;
+// Don't need this: Not a resource type. But kept for the range.
+const OP_TYPE_FUNCTION: u32 = 33;
+const TYPE_RANGE: RangeInclusive<u32> = OP_TYPE_VOID..=OP_TYPE_FUNCTION;
+
+const OP_CONSTANT_TRUE: u32 = 41;
+const OP_CONSTANT_FALSE: u32 = 42;
+const OP_CONSTANT: u32 = 43;
+const OP_CONSTANT_COMPOSITE: u32 = 44;
+const OP_CONSTANT_SAMPLER: u32 = 45;
+const OP_CONSTANT_NULL: u32 = 46;
+const CONST_RANGE: RangeInclusive<u32> = OP_CONSTANT_TRUE..=OP_CONSTANT_NULL;
+
+const OP_SPEC_CONSTANT_TRUE: u32 = 48;
+const OP_SPEC_CONSTANT_FALSE: u32 = 49;
+const OP_SPEC_CONSTANT: u32 = 50;
+const OP_SPEC_CONSTANT_COMPOSITE: u32 = 51;
+const OP_SPEC_CONSTANT_OP: u32 = 52;
+const SPEC_CONST_RANGE: RangeInclusive<u32> = OP_SPEC_CONSTANT_TRUE..=OP_SPEC_CONSTANT_OP;
+
+const OP_VARIABLE: u32 = 59;
+
+const OP_FUNCTION: u32 = 54;
+const OP_FUNCTION_END: u32 = 56;
+const OP_FUNCTION_CALL: u32 = 57;
+const OP_ACCESS_CHAIN: u32 = 65;
+const OP_LOAD: u32 = 61;
+const OP_STORE: u32 = 62;
+const OP_IN_BOUNDS_ACCESS_CHAIN: u32 = 66;
+
+
+const EXEC_MODEL_VERTEX: u32 = 0;
+const EXEC_MODEL_FRAGMENT: u32 = 4;
+
+
+const DECO_SPEC_ID: u32 = 1;
+const DECO_BLOCK: u32 = 2;
+const DECO_BUFFER_BLOCK: u32 = 3;
+const DECO_ROW_MAJOR: u32 = 4;
+// Don't need this: Column-major matrices are the default.
+// const DECO_COL_MAJOR: u32 = 5;
+const DECO_ARRAY_STRIDE: u32 = 6;
+const DECO_MATRIX_STRIDE: u32 = 7;
+// Don't need this: Built-in variables will not be attribute nor attachment.
+// const DECO_BUILT_IN: u32 = 11;
+const DECO_LOCATION: u32 = 30;
+const DECO_BINDING: u32 = 33;
+const DECO_DESCRIPTOR_SET: u32 = 34;
+const DECO_OFFSET: u32 = 35;
+const DECO_INPUT_ATTACHMENT_INDEX: u32 = 43;
+
+
+const STORE_CLS_UNIFORM_CONSTANT: u32 = 0;
+const STORE_CLS_INPUT: u32 = 1;
+const STORE_CLS_UNIFORM: u32 = 2;
+const STORE_CLS_OUTPUT: u32 = 3;
+// Texture calls to sampler object will translate to function class.
+const STORE_CLS_FUNCTION: u32 = 7;
+const STORE_CLS_PUSH_CONSTANT: u32 = 9;
+const STORE_CLS_STORAGE_BUFFER: u32 = 12;
+
+
+const DIM_IMAGE_1D: u32 = 0;
+const DIM_IMAGE_2D: u32 = 1;
+const DIM_IMAGE_3D: u32 = 2;
+const DIM_IMAGE_CUBE: u32 = 3;
+const DIM_IMAGE_SUBPASS_DATA: u32 = 6;
+
+
+const IMG_UNIT_FMT_UNKNOWN: u32 = 0;
+const IMG_UNIT_FMT_RGBA32F: u32 = 1;
+const IMG_UNIT_FMT_R32F: u32 = 3;
+const IMG_UNIT_FMT_RGBA8: u32 = 4;
+
+
+
+
+
 pub struct SpirvBinary(Vec<u32>);
 impl From<Vec<u32>> for SpirvBinary {
     fn from(x: Vec<u32>) -> Self { SpirvBinary(x) }
@@ -100,29 +202,15 @@ impl<'a> Operands<'a> {
 
 
 
-#[derive(PartialEq, Eq, Debug, FromPrimitive)]
-enum ExecutionModel {
-    Vertex = 0,
-    Fragment = 4,
-}
 #[derive(Debug)]
 struct EntryPoint<'a> {
-    exec_model: ExecutionModel,
+    exec_model: u32,
     func: u32,
     name: &'a str,
 }
 
-type TypeId = u32;
-#[derive(Debug, Clone)]
-enum Type<'a> {
-    Numeric(NumericType),
-    Image(ImageType),
-    Array(TypeId, Option<u32>),
-    Struct(&'a [TypeId]),
-    Pointer(TypeId),
-}
 #[derive(Debug, Clone, Default)]
-struct NumericType {
+pub struct NumericType {
     /// Bit-width of this type.
     nbyte: u32,
     /// For integral types the field indicate it's signed ness, true for signed
@@ -191,70 +279,111 @@ pub enum ColorFormat {
     R32f = 3,
     Rgba8 = 4,
 }
+impl ColorFormat {
+    fn from_spv_def(color_fmt: u32) -> Result<ColorFormat> {
+        let color_fmt = match color_fmt {
+            IMG_UNIT_FMT_RGBA32F => ColorFormat::Rgba32f,
+            IMG_UNIT_FMT_R32F => ColorFormat::R32f,
+            IMG_UNIT_FMT_RGBA8 => ColorFormat::Rgba8,
+            _ => return Err(Error::UnsupportedSpirv),
+        };
+        Ok(color_fmt)
+    }
+}
 #[derive(Debug, Clone, Copy)]
 pub enum ImageUnitFormat {
     Color(ColorFormat),
     Sampled,
     Depth,
 }
+impl ImageUnitFormat {
+    pub fn from_spv_def(is_sampled: bool, is_depth: bool, color_fmt: u32) -> Result<ImageUnitFormat> {
+        let img_unit_fmt = match (is_sampled, is_depth, color_fmt) {
+            (true, false, IMG_UNIT_FMT_UNKNOWN) => ImageUnitFormat::Sampled,
+            (true, true, IMG_UNIT_FMT_UNKNOWN) => ImageUnitFormat::Depth,
+            (false, false, color_fmt) => ImageUnitFormat::Color(ColorFormat::from_spv_def(color_fmt)?),
+            _ => return Err(Error::UnsupportedSpirv),
+        };
+        Ok(img_unit_fmt)
+    }
+}
+#[derive(Debug, Clone, Copy)]
+pub enum ImageArrangement {
+    Image1D,
+    Image2D,
+    Image2DMS,
+    Image3D,
+    CubeMap,
+    Image1DArray,
+    Image2DArray,
+    Image2DMSArray,
+    CubeMapArray,
+}
+impl ImageArrangement {
+    /// Do note this dim is not the number of dimensions but a enumeration of
+    /// values specified in SPIR-V specification.
+    pub fn from_spv_def(dim: u32, is_array: bool, is_multisampled: bool) -> Result<ImageArrangement> {
+        let arng = match (dim, is_array, is_multisampled) {
+            (DIM_IMAGE_1D, false, false) => ImageArrangement::Image1D,
+            (DIM_IMAGE_1D, true, false) => ImageArrangement::Image1DArray,
+            (DIM_IMAGE_2D, false, false) => ImageArrangement::Image2D,
+            (DIM_IMAGE_2D, false, true) => ImageArrangement::Image2DMS,
+            (DIM_IMAGE_2D, true, false) => ImageArrangement::Image2DArray,
+            (DIM_IMAGE_3D, false, false) => ImageArrangement::Image3D,
+            (DIM_IMAGE_3D, true, false) => ImageArrangement::Image3D,
+            (DIM_IMAGE_CUBE, false, false) => ImageArrangement::CubeMap,
+            (DIM_IMAGE_CUBE, true, false) => ImageArrangement::CubeMapArray,
+            _ => return Err(Error::UnsupportedSpirv),
+        };
+        Ok(arng)
+    }
+}
+#[derive(Debug, Clone, Copy)]
+pub struct ImageType {
+    fmt: ImageUnitFormat,
+    arng: ImageArrangement,
+}
+#[derive(Debug, Clone, Copy)]
+pub struct ArrayType {
+    elem_ty: TypeId,
+    nelem: Option<ConstantId>,
+}
+#[derive(Debug, Clone, Copy)]
+pub struct StructMember<'a> {
+    ty: TypeId,
+    name: Option<&'a str>,
+    offset: Option<usize>,
+}
+pub type TypeId = u32;
 #[derive(Debug, Clone)]
-pub enum ImageType {
-    Image1D {
-        /// Format is `None` if the image is a sampled image. Otherwise the
-        /// storage image color format is given. This is the only type trait we
-        /// should care about at the host, because the SPIR-V might consume
-        /// another type converted by the sampler internally.
-        fmt: ImageUnitFormat,
-        is_array: bool,
-    },
-    Image2D {
-        fmt: ImageUnitFormat,
-        is_array: bool,
-        is_multisampled: bool,
-    },
-    Image3D {
-        fmt: ImageUnitFormat,
-    },
-    CubeMap {
-        fmt: ImageUnitFormat,
-        is_array: bool,
-    },
-    SubpassData,
+pub enum Type<'a> {
+    Numeric(NumericType),
+    Image(ImageType),
+    Array(ArrayType),
+    Struct(Vec<StructMember<'a>>),
+    Pointer(TypeId),
 }
-
-#[derive(Debug)]
-enum Decoration {
-    SpecId(u32),
-    Block,
-    BufferBlock,
-    RowMajor,
-    ColMajor,
-    ArrayStride(usize),
-    MatrixStride(usize),
-    BuiltIn,
-    Location(u32),
-    Binding(u32),
-    DescriptorSet(u32),
-    Offset(usize),
-    InputAttachmentIndex(u32),
-}
-#[derive(Debug, Clone, Copy, FromPrimitive)]
-enum StorageClass {
-    UniformConstant = 0,
-    Input = 1,
-    Uniform = 2,
-    Output = 3,
-    Function = 7, // Texture calls to sampler object will translate to this.
-    PushConstant = 9,
-    StorageBuffer = 12,
-}
-
 type VariableId = u32;
-#[derive(Debug)]
-struct Variable {
+#[derive(Debug, Clone)]
+pub struct Variable {
     ty: TypeId,
     store_cls: StorageClass,
 }
+type ConstantId = u32;
+#[derive(Debug, Clone)]
+pub struct Constant<'a> {
+    ty: TypeId,
+    value: &'a [u32],
+}
+
+type Decoration = u32;
+type StorageClass = u32;
+#[derive(Debug, Default, Clone)]
+pub struct ElementMetadata<'a> {
+    name: Option<&'a str>,
+    decos: HashMap<Decoration, &'a [u32]>,
+}
+pub struct ElementMetadataMap<'a>(HashMap<(u32, Option<u32>), ElementMetadata<'a>>);
 
 type FunctionId = u32;
 #[derive(Default, Debug)]
@@ -263,384 +392,17 @@ struct Function {
     calls: HashSet<FunctionId>,
 }
 
-
-fn extract_entry_points<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<Vec<EntryPoint<'a>>> {
-    const OP_ENTRY_POINT: u32 = 15;
-
-    let mut entry_points = Vec::with_capacity(1);
-    while let Some(instr) = instrs.peek() {
-        if instr.opcode() != OP_ENTRY_POINT { instrs.next(); } else { break; }
-    }
-    while let Some(instr) = instrs.peek() {
-        if instr.opcode() == OP_ENTRY_POINT {
-            let mut operands = instr.operands();
-            let entry_point = EntryPoint {
-                exec_model: operands.read_u32()
-                    .map(FromPrimitive::from_u32)?
-                    .ok_or(Error::UnsupportedSpirv)?,
-                func: operands.read_u32()?,
-                name: operands.read_str()?,
-            };
-            entry_points.push(entry_point);
-            instrs.next();
-        } else { break; }
-    }
-    Ok(entry_points)
-}
-fn extract_names<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u32, Option<u32>), &'a str>> {
-    const OP_NAME: u32 = 5;
-    const OP_MEMBER_NAME: u32 = 6;
-    const RANGE: RangeInclusive<u32> = OP_NAME..=OP_MEMBER_NAME;
-
-    let mut name_map = HashMap::<(u32, Option<u32>), &'a str>::new();
-    while let Some(instr) = instrs.peek() {
-        if !RANGE.contains(&instr.opcode()) { instrs.next(); } else { break; }
-    }
-    while let Some(instr) = instrs.peek() {
-        let opcode = instr.opcode();
-        if RANGE.contains(&opcode) {
-            let mut operands = instr.operands();
-            let target_id = operands.read_u32()?;
-            let member_id = if opcode == OP_MEMBER_NAME { Some(operands.read_u32()?) } else { None};
-            let name = operands.read_str()?;
-            name_map.insert((target_id, member_id), name);
-        } else { break; }
-        instrs.next();
-    }
-    Ok(name_map)
-}
-fn extract_decos<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<(u32, Option<u32>), Vec<Decoration>>> {
-    const OP_DECORATE: u32 = 71;
-    const OP_MEMBER_DECORATE: u32 = 72;
-    const RANGE: RangeInclusive<u32> = OP_DECORATE..=OP_MEMBER_DECORATE;
-    const DECO_SPEC_ID: u32 = 1;
-    const DECO_BLOCK: u32 = 2;
-    const DECO_BUFFER_BLOCK: u32 = 3;
-    const DECO_ROW_MAJOR: u32 = 4;
-    const DECO_COL_MAJOR: u32 = 5;
-    const DECO_ARRAY_STRIDE: u32 = 6;
-    const DECO_MATRIX_STRIDE: u32 = 7;
-    const DECO_BUILT_IN: u32 = 11;
-    const DECO_LOCATION: u32 = 30;
-    const DECO_BINDING: u32 = 33;
-    const DECO_DESCRIPTOR_SET: u32 = 34;
-    const DECO_OFFSET: u32 = 35;
-    const DECO_INPUT_ATTACHMENT_INDEX: u32 = 43;
-
-    let mut deco_map = HashMap::<(u32, Option<u32>), Vec<Decoration>>::new();
-    while let Some(instr) = instrs.peek() {
-        if !RANGE.contains(&instr.opcode()) { instrs.next(); } else { break; }
-    }
-    while let Some(instr) = instrs.peek() {
-        let opcode = instr.opcode();
-        if RANGE.contains(&opcode) {
-            let mut operands = instr.operands();
-            let target_id = operands.read_u32()?;
-            let member_id = if opcode == OP_MEMBER_DECORATE { Some(operands.read_u32()?) } else { None };
-            let deco = operands.read_u32()?;
-            let params = operands.read_list()?;
-            fn get_first<'a>(params: &'a [u32]) -> Result<u32> { params.first().map(u32::to_owned).ok_or(Error::CorruptedSpirv) }
-            let deco = match deco {
-                DECO_SPEC_ID => Decoration::SpecId(get_first(params)?),
-                DECO_BLOCK => Decoration::Block,
-                DECO_BUFFER_BLOCK => Decoration::BufferBlock,
-                DECO_ROW_MAJOR => Decoration::RowMajor,
-                DECO_COL_MAJOR => Decoration::ColMajor,
-                DECO_ARRAY_STRIDE => Decoration::ArrayStride(get_first(params)? as usize),
-                DECO_MATRIX_STRIDE => Decoration::MatrixStride(get_first(params)? as usize),
-                DECO_BUILT_IN => Decoration::BuiltIn,
-                DECO_LOCATION => Decoration::Location(get_first(params)?),
-                DECO_BINDING => Decoration::Binding(get_first(params)?),
-                DECO_OFFSET => Decoration::Offset(get_first(params)? as usize),
-                DECO_INPUT_ATTACHMENT_INDEX => Decoration::InputAttachmentIndex(get_first(params)?),
-                _ => { instrs.next(); continue; }, // Ignore unsupported decos.
-            };
-            deco_map.entry((target_id, member_id)).or_default().push(deco);
-        } else { break; }
-        instrs.next();
-    }
-
-    Ok(deco_map)
-}
-fn extract_types<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<(HashMap<TypeId, Type<'a>>, HashMap<VariableId, Variable>)> {
-    const OP_TYPE_VOID: u32 = 19;
-    const OP_TYPE_BOOL: u32 = 20;
-    const OP_TYPE_INT: u32 = 21;
-    const OP_TYPE_FLOAT: u32 = 22;
-    const OP_TYPE_VECTOR: u32 = 23;
-    const OP_TYPE_MATRIX: u32 = 24;
-    const OP_TYPE_IMAGE: u32 = 25;
-    const OP_TYPE_SAMPLER: u32 = 26;
-    const OP_TYPE_SAMPLED_IMAGE: u32 = 27;
-    const OP_TYPE_ARRAY: u32 = 28;
-    const OP_TYPE_RUNTIME_ARRAY: u32 = 29;
-    const OP_TYPE_STRUCT: u32 = 30;
-    const OP_TYPE_POINTER: u32 = 32;
-    const OP_TYPE_FUNCTION: u32 = 33;
-    const OP_CONSTANT_TRUE: u32 = 41;
-    const OP_CONSTANT_FALSE: u32 = 42;
-    const OP_CONSTANT: u32 = 43;
-    const OP_CONSTANT_COMPOSITE: u32 = 44;
-    const OP_CONSTANT_SAMPLER: u32 = 45;
-    const OP_CONSTANT_NULL: u32 = 46;
-    const OP_SPEC_CONSTANT_TRUE: u32 = 48;
-    const OP_SPEC_CONSTANT_FALSE: u32 = 49;
-    const OP_SPEC_CONSTANT: u32 = 50;
-    const OP_SPEC_CONSTANT_COMPOSITE: u32 = 51;
-    const OP_SPEC_CONSTANT_OP: u32 = 52;
-    const OP_VARIABLE: u32 = 59;
-    const TYPE_RANGE: RangeInclusive<u32> = OP_TYPE_VOID..=OP_TYPE_FUNCTION;
-    const CONST_RANGE: RangeInclusive<u32> = OP_CONSTANT_TRUE..=OP_SPEC_CONSTANT_OP;
-
-    let mut ty_map: HashMap<TypeId, Type<'a>> = HashMap::new();
-    let mut var_map: HashMap<VariableId, Variable> = HashMap::new();
-    while let Some(instr) = instrs.peek() {
-        let opcode = instr.opcode();
-        if !TYPE_RANGE.contains(&opcode) &&
-            !CONST_RANGE.contains(&opcode) &&
-            opcode != OP_VARIABLE { instrs.next(); } else { break; }
-    }
-    while let Some(instr) = instrs.peek() {
-        match instr.opcode() {
-            OP_TYPE_VOID => { /* Never a resource type. */ },
-            OP_TYPE_BOOL => { return Err(Error::UnsupportedSpirv) },
-            OP_TYPE_INT => {
-                let mut operands = instr.operands();
-                let id = operands.read_u32()?;
-                let nbyte = operands.read_u32()? >> 3;
-                if nbyte != 4 { return Err(Error::UnsupportedSpirv) }
-                let is_signed = operands.read_bool()?;
-                let int_ty = if is_signed { NumericType::i32() } else { NumericType::u32() };
-                let ty = Type::Numeric(int_ty);
-                if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
-            },
-            OP_TYPE_FLOAT => {
-                let mut operands = instr.operands();
-                let id = operands.read_u32()?;
-                let nbyte = operands.read_u32()? >> 3;
-                if nbyte != 4 { return Err(Error::UnsupportedSpirv) }
-                let ty = Type::Numeric(NumericType::f32());
-                if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
-            },
-            OP_TYPE_VECTOR | OP_TYPE_MATRIX => {
-                let mut operands = instr.operands();
-                let id = operands.read_u32()?;
-                let elem_ty = operands.read_u32()?;
-                let elem_ty = ty_map.get(&elem_ty)
-                    .ok_or(Error::CorruptedSpirv)?;
-                let elem_ty = if let Type::Numeric(num_ty) = elem_ty {
-                    num_ty
-                } else { return Err(Error::CorruptedSpirv); };
-                let nelem = operands.read_u32()?;
-                let ty = if instr.opcode() == OP_TYPE_VECTOR {
-                    if !elem_ty.is_primitive() { return Err(Error::CorruptedSpirv); }
-                    Type::Numeric(NumericType::vec(elem_ty, nelem))
-                } else {
-                    if !elem_ty.is_vec() { return Err(Error::CorruptedSpirv); }
-                    Type::Numeric(NumericType::mat(elem_ty, nelem))
-                };
-                if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
-            },
-            OP_TYPE_IMAGE => {
-                const DIM_IMAGE_1D: u32 = 0;
-                const DIM_IMAGE_2D: u32 = 1;
-                const DIM_IMAGE_3D: u32 = 2;
-                const DIM_IMAGE_CUBE: u32 = 3;
-                const DIM_IMAGE_SUBPASS_DATA: u32 = 6;
-
-                let mut operands = instr.operands();
-                let id = operands.read_u32()?;
-                let unit_ty = operands.read_u32()?;
-                let dim = operands.read_u32()?;
-                let is_depth = match operands.read_u32()? {
-                    0 => false, 1 => true,
-                    _ => return Err(Error::UnsupportedSpirv),
-                };
-                let is_array = operands.read_bool()?;
-                let is_multisampled = operands.read_bool()?;
-                let is_sampled = match operands.read_u32()? {
-                    1 => true, 2 => false,
-                    _ => return Err(Error::UnsupportedSpirv),
-                };
-                // Only unit types allowed to be stored in storage images can
-                // have given format.
-                let fmt = if is_sampled {
-                    ImageUnitFormat::Sampled
-                } else if is_depth {
-                    ImageUnitFormat::Depth
-                } else {
-                    let color_fmt = match operands.read_u32()? {
-                        1 => ColorFormat::Rgba32f,
-                        3 => ColorFormat::R32f,
-                        4 => ColorFormat::Rgba8,
-                        _ => return Err(Error::UnsupportedSpirv),
-                    };
-                    ImageUnitFormat::Color(color_fmt)
-                };
-
-                let img_ty = match dim {
-                    DIM_IMAGE_1D => ImageType::Image1D {
-                        fmt: fmt,
-                        is_array: is_array,
-                    },
-                    DIM_IMAGE_2D => ImageType::Image2D {
-                        fmt: fmt,
-                        is_array: is_array,
-                        is_multisampled: is_multisampled,
-                    },
-                    DIM_IMAGE_3D => ImageType::Image3D {
-                        fmt: fmt,
-                    },
-                    DIM_IMAGE_CUBE => ImageType::CubeMap {
-                        fmt: fmt,
-                        is_array: is_array,
-                    },
-                    DIM_IMAGE_SUBPASS_DATA => ImageType::SubpassData,
-                    _ => return Err(Error::UnsupportedSpirv),
-                };
-                let ty = Type::Image(img_ty);
-                if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
-            },
-            OP_TYPE_SAMPLED_IMAGE => {
-                let mut operands = instr.operands();
-                let id = operands.read_u32()?;
-                let img_ty_id = operands.read_u32()?;
-                let ty = ty_map.get(&img_ty_id)
-                    .ok_or(Error::CorruptedSpirv)?;
-                if let Type::Image(_) = ty {
-                    if ty_map.insert(id, ty.clone()).is_some() { return Err(Error::CorruptedSpirv); }
-                } else { return Err(Error::CorruptedSpirv); }
-            }
-            OP_TYPE_SAMPLER => { /* Not in GLSL. */ },
-            OP_TYPE_ARRAY | OP_TYPE_RUNTIME_ARRAY => {
-                let mut operands = instr.operands();
-                let id = operands.read_u32()?;
-                let elem_ty_id = operands.read_u32()?;
-                let elem_ty = ty_map.get(&elem_ty_id)
-                    .ok_or(Error::CorruptedSpirv)?;
-                let ty = if let Type::Array(sub_elem_ty_id, sub_nelem) = elem_ty {
-                    // Variant-length array can only be the outermost type.
-                    let sub_nelem = sub_nelem.ok_or(Error::CorruptedSpirv)?;
-                    // Fold nesting sized arrays, sharing the same subtype.
-                    let nelem = if instr.opcode() == OP_TYPE_ARRAY {
-                        Some(sub_nelem * operands.read_u32()?)
-                    } else { None };
-                    Type::Array(*sub_elem_ty_id, nelem)
-                } else {
-                    // Non-nesting sized arrays. Just wrap another layer.
-                    let nelem = if instr.opcode() == OP_TYPE_ARRAY {
-                        Some(operands.read_u32()?)
-                    } else { None };
-                    Type::Array(elem_ty_id, nelem)
-                };
-                if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
-            },
-            OP_TYPE_STRUCT => {
-                // spv_ty!(ty_map, instr, Struct, { member_tys <- read_list })
-                let mut operands = instr.operands();
-                let id = operands.read_u32()?;
-                let ty = Type::Struct(operands.read_list()?);
-                if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
-            },
-            OP_TYPE_POINTER => {
-                let mut operands = instr.operands();
-                let id = operands.read_u32()?;
-                let _store_cls = operands.read_u32()?;
-                let target_ty = operands.read_u32()?;
-                let ty = Type::Pointer(target_ty);
-                if ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
-            },
-            OP_TYPE_FUNCTION => { /* Don't need this. */ },
-            OP_VARIABLE => {
-                let mut operands = instr.operands();
-                let ty = operands.read_u32()?;
-                let id = operands.read_u32()?;
-                let store_cls = operands.read_u32()
-                    .map(FromPrimitive::from_u32)?
-                    .ok_or(Error::UnsupportedSpirv)?;
-                let var = Variable {
-                    ty: ty,
-                    store_cls: store_cls,
-                };
-                if var_map.insert(id, var).is_some() { return Err(Error::CorruptedSpirv); }
-            },
-            opcode => {
-                if !CONST_RANGE.contains(&opcode) { break; }
-            },
-        }
-        instrs.next();
-    }
-    // Variables' types are always pointer types, which is not very useful for.
-    // We dereference the pointer and get the underlying actual types instead.
-    for var in var_map.values_mut() {
-        if let Some(Type::Pointer(target_ty)) = ty_map.get(&var.ty) {
-            var.ty = *target_ty;
-        } else {
-            return Err(Error::CorruptedSpirv);
-        }
-    }
-    Ok((ty_map, var_map))
-}
-fn extract_funcs<'a>(instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<HashMap<FunctionId, Function>> {
-    const OP_FUNCTION: u32 = 54;
-    const OP_FUNCTION_END: u32 = 56;
-    const OP_FUNCTION_CALL: u32 = 57;
-    const OP_ACCESS_CHAIN: u32 = 65;
-    const OP_LOAD: u32 = 61;
-    const OP_STORE: u32 = 62;
-    const OP_IN_BOUNDS_ACCESS_CHAIN: u32 = 66;
-
-    let mut func_map: HashMap<FunctionId, Function> = HashMap::new();
-    while instrs.peek().is_some() {
-        let mut func: &mut Function = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-        while let Some(instr) = instrs.next() {
-            if instr.opcode() == OP_FUNCTION {
-                let mut operands = instr.operands();
-                let _rty = operands.read_u32()?;
-                let id = operands.read_u32()?;
-                func = func_map.entry(id).or_default();
-                break;
-            }
-        }
-        while let Some(instr) = instrs.next() {
-            match instr.opcode() {
-                OP_FUNCTION_CALL => {
-                    let mut operands = instr.operands();
-                    let _rty = operands.read_u32()?;
-                    let _id = operands.read_u32()?;
-                    let callee = operands.read_u32()?;
-                    func.calls.insert(callee);
-                },
-                OP_ACCESS_CHAIN | OP_LOAD => {
-                    let mut operands = instr.operands();
-                    let _rty = operands.read_u32()?;
-                    let _id = operands.read_u32()?;
-                    let target = operands.read_u32()?;
-                    func.accessed_vars.insert(target);
-                },
-                OP_STORE => {
-                    let mut operands = instr.operands();
-                    let target = operands.read_u32()?;
-                    func.accessed_vars.insert(target);
-                },
-                OP_FUNCTION_END => break,
-                _ => { },
-            }
-        }
-    }
-    Ok(func_map)
-}
-
 use crate::gfx::contract::{VertexAttributeContract, AttachmentContract, PipelineStageContract, DescriptorContract};
 
-#[derive(Debug)]
+#[derive(Default, Debug)]
 struct SpirvMetadata<'a> {
     pub entry_points: Vec<EntryPoint<'a>>,
     pub name_map: HashMap<(u32, Option<u32>), &'a str>,
-    pub deco_map: HashMap<(u32, Option<u32>), Vec<Decoration>>,
-    pub ty_map: HashMap<TypeId, Type<'a>>,
-    pub var_map: HashMap<VariableId, Variable>,
-    pub func_map: HashMap<FunctionId, Function>,
+    pub deco_map: HashMap<(u32, Option<u32>), HashMap<Decoration, &'a [u32]>>,
+    pub ty_map: HashMap<u32, Type<'a>>,
+    pub var_map: HashMap<u32, Variable>,
+    pub const_map: HashMap<u32, Constant<'a>>,
+    pub func_map: HashMap<u32, Function>,
 }
 impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
     type Error = Error;
@@ -648,24 +410,268 @@ impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
         // Don't change the order. See _2.4 Logical Layout of a Module_ of the
         // SPIR-V specification for more information.
         let mut instrs = module.instrs().peekable();
-        let entry_points = extract_entry_points(&mut instrs)?;
-        let name_map = extract_names(&mut instrs)?;
-        let deco_map = extract_decos(&mut instrs)?;
-        let (ty_map, var_map) = extract_types(&mut instrs)?;
-        let func_map = extract_funcs(&mut instrs)?;
-
-        let meta = SpirvMetadata {
-            entry_points: entry_points,
-            name_map: name_map,
-            deco_map: deco_map,
-            ty_map: ty_map,
-            var_map: var_map,
-            func_map: func_map,
-        };
+        let mut meta = SpirvMetadata::default();
+        debug!("0");
+        meta.populate_entry_points(&mut instrs)?;
+        debug!("1");
+        meta.populate_names(&mut instrs)?;
+        debug!("2");
+        meta.populate_decos(&mut instrs)?;
+        debug!("3");
+        meta.populate_defs(&mut instrs)?;
+        debug!("4");
+        meta.populate_access(&mut instrs)?;
+        debug!("5");
         Ok(meta)
     }
 }
 impl<'a> SpirvMetadata<'a> {
+    fn populate_entry_points(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()>{
+        // Extract entry points.
+        while let Some(instr) = instrs.peek() {
+            if instr.opcode() != OP_ENTRY_POINT { instrs.next(); } else { break; }
+        }
+        while let Some(instr) = instrs.peek() {
+            if instr.opcode() != OP_ENTRY_POINT { break; }
+            let mut operands = instr.operands();
+            let entry_point = EntryPoint {
+                exec_model: operands.read_u32()?,
+                func: operands.read_u32()?,
+                name: operands.read_str()?,
+            };
+            self.entry_points.push(entry_point);
+            instrs.next();
+        }
+        Ok(())
+    }
+    fn populate_names(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
+        // Extract naming. Names are generally produced as debug information by
+        // `glslValidator` but it might be in absence.
+        while let Some(instr) = instrs.peek() {
+            if !NAME_RANGE.contains(&instr.opcode()) { instrs.next(); } else { break; }
+        }
+        while let Some(instr) = instrs.peek() {
+            let opcode = instr.opcode();
+            if !NAME_RANGE.contains(&opcode) { break; }
+            let mut operands = instr.operands();
+            let target_id = operands.read_u32()?;
+            let member_id = if opcode == OP_MEMBER_NAME { Some(operands.read_u32()?) } else { None };
+            let name = operands.read_str()?;
+            self.name_map.insert((target_id, member_id), name);
+            instrs.next();
+        }
+        Ok(())
+    }
+    fn populate_decos(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
+        while let Some(instr) = instrs.peek() {
+            if !DECO_RANGE.contains(&instr.opcode()) { instrs.next(); } else { break; }
+        }
+        while let Some(instr) = instrs.peek() {
+            let opcode = instr.opcode();
+            if !DECO_RANGE.contains(&opcode) { break; }
+            let mut operands = instr.operands();
+            let target_id = operands.read_u32()?;
+            let member_id = if opcode == OP_MEMBER_DECORATE { Some(operands.read_u32()?) } else { None };
+            let deco = operands.read_u32()?;
+            let params = operands.read_list()?;
+            self.deco_map.entry((target_id, member_id)).or_default().insert(deco, params);
+            instrs.next();
+        }
+        Ok(())
+    }
+    fn populate_one_ty(&mut self, instr: &Instr<'a>) -> Result<()> {
+        let mut operands = instr.operands();
+        let id = operands.read_u32()?;
+        let opcode = instr.opcode();
+        let ty = match opcode {
+            OP_TYPE_VOID | OP_TYPE_FUNCTION => { return Ok(()) },
+            OP_TYPE_BOOL => return Err(Error::UnsupportedSpirv),
+            OP_TYPE_INT | OP_TYPE_FLOAT => {
+                let nbyte = operands.read_u32()? >> 3;
+                if nbyte != 4 { return Err(Error::UnsupportedSpirv) }
+                let is_signed = if opcode == OP_TYPE_INT { Some(operands.read_bool()?) } else { None };
+                let num_ty = match is_signed {
+                    Some(true) => NumericType::i32(),
+                    Some(false) => NumericType::u32(),
+                    None => NumericType::f32(),
+                };
+                Type::Numeric(num_ty)
+            },
+            OP_TYPE_VECTOR | OP_TYPE_MATRIX => {
+                let elem_ty = self.ty_map.get(&operands.read_u32()?)
+                    .ok_or(Error::CorruptedSpirv)?;
+                let nelem = operands.read_u32()?;
+                let num_ty = if let Type::Numeric(num_ty) = elem_ty {
+                    if opcode == OP_TYPE_VECTOR && num_ty.is_primitive() {
+                        NumericType::vec(&num_ty, nelem)
+                    } else if opcode == OP_TYPE_MATRIX && num_ty.is_vec() {
+                        NumericType::mat(&num_ty, nelem)
+                    } else { return Err(Error::CorruptedSpirv); }
+                } else { return Err(Error::CorruptedSpirv); };
+                Type::Numeric(num_ty)
+            },
+            OP_TYPE_IMAGE => {
+                let _unit_ty = operands.read_u32()?;
+                let dim = operands.read_u32()?;
+                let is_depth = match operands.read_u32()? {
+                    0 => false, 1 => true, _ => return Err(Error::UnsupportedSpirv),
+                };
+                let is_array = operands.read_bool()?;
+                let is_multisampled = operands.read_bool()?;
+                let is_sampled = match operands.read_u32()? {
+                    1 => true, 2 => false, _ => return Err(Error::UnsupportedSpirv),
+                };
+                let color_fmt = operands.read_u32()?;
+
+                // Only unit types allowed to be stored in storage images can
+                // have given format.
+                let fmt = ImageUnitFormat::from_spv_def(is_sampled, is_depth, color_fmt)?;
+                let img_ty = ImageType {
+                    fmt: ImageUnitFormat::from_spv_def(is_sampled, is_depth, color_fmt)?,
+                    arng: ImageArrangement::from_spv_def(dim, is_array, is_multisampled)?,
+                };
+                Type::Image(img_ty)
+            },
+            OP_TYPE_SAMPLED_IMAGE => {
+                let img_ty_id = operands.read_u32()?;
+                let ty = self.ty_map.get(&img_ty_id)
+                    .ok_or(Error::CorruptedSpirv)?;
+                if let Type::Image(_) = ty { ty.clone() } else { return Err(Error::CorruptedSpirv); }
+            }
+            OP_TYPE_ARRAY | OP_TYPE_RUNTIME_ARRAY => {
+                let arr_ty = ArrayType {
+                    elem_ty: operands.read_u32()?,
+                    nelem: if instr.opcode() == OP_TYPE_ARRAY {
+                        let nelem_const = operands.read_u32()?;
+                        let nelem = self.const_map.get(&nelem_const)
+                            .filter(|constant| {
+                                if let Some(Type::Numeric(num_ty)) = self.ty_map.get(&constant.ty) {
+                                    num_ty.nbyte == 4 && num_ty.is_uint() && num_ty.is_primitive()
+                                } else { false }
+                            })
+                            .and_then(|x| x.value.get(0))
+                            .ok_or(Error::CorruptedSpirv)?;
+                        Some(*nelem)
+                    } else { None },
+                };
+                Type::Array(arr_ty)
+            },
+            OP_TYPE_STRUCT => {
+                let ls = operands.read_list()?;
+                let mut members = Vec::with_capacity(ls.len());
+                for (i, member) in ls.iter().enumerate() {
+                    let locator = &(id, Some(i as u32));
+                    let name = self.name_map.get(locator)
+                        .map(|x| *x);
+                    let offset = self.deco_map.get(locator)
+                        .and_then(|x| x.get(&DECO_OFFSET))
+                        .and_then(|x| x.get(i))
+                        .map(|x| *x as usize);
+                    let member = StructMember {
+                        ty: *member,
+                        name: name,
+                        offset: offset,
+                    };
+                    members.push(member);
+                }
+                Type::Struct(members)
+            },
+            OP_TYPE_POINTER => {
+                let _store_cls = operands.read_u32()?;
+                let target_ty = operands.read_u32()?;
+                Type::Pointer(target_ty)
+            },
+            _ => return Err(Error::CorruptedSpirv),
+        };
+        if self.ty_map.insert(id, ty).is_some() { return Err(Error::CorruptedSpirv); }
+        Ok(())
+    }
+    fn populate_one_var(&mut self, instr: &Instr<'a>) -> Result<()> {
+        let mut operands = instr.operands();
+        let ty = operands.read_u32()?;
+        let id = operands.read_u32()?;
+        let store_cls = operands.read_u32()
+            .map(FromPrimitive::from_u32)?
+            .ok_or(Error::UnsupportedSpirv)?;
+        let var = Variable {
+            ty: ty,
+            store_cls: store_cls,
+        };
+        if self.var_map.insert(id, var).is_some() { return Err(Error::CorruptedSpirv); }
+        Ok(())
+    }
+    fn populate_one_const(&mut self, instr: &Instr<'a>) -> Result<()> {
+        let mut operands = instr.operands();
+        let ty = operands.read_u32()?;
+        let id = operands.read_u32()?;
+        let value = operands.read_list()?;
+        let constant = Constant {
+            ty: ty,
+            value: value,
+        };
+        if self.const_map.insert(id, constant).is_some() { return Err(Error::CorruptedSpirv); }
+        Ok(())
+    }
+    fn populate_defs(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
+        // type definitions always follow decorations, so we don't skip
+        // instructions here.
+        while let Some(instr) = instrs.peek() {
+            let mut operands = instr.operands();
+            let opcode = instr.opcode();
+            if (TYPE_RANGE.contains(&opcode)) {
+                debug!("11");
+                self.populate_one_ty(instr)?;
+            } else if opcode == OP_VARIABLE {
+                debug!("22");
+                self.populate_one_var(instr)?;
+            } else if CONST_RANGE.contains(&opcode) {
+                debug!("33");
+                self.populate_one_const(instr)?;
+            } else { break; }
+            instrs.next();
+        }
+        Ok(())
+    }
+    fn populate_access(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
+        while instrs.peek().is_some() {
+            let mut func: &mut Function = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+            while let Some(instr) = instrs.next() {
+                if instr.opcode() == OP_FUNCTION {
+                    let mut operands = instr.operands();
+                    let _rty = operands.read_u32()?;
+                    let id = operands.read_u32()?;
+                    func = self.func_map.entry(id).or_default();
+                    break;
+                }
+            }
+            while let Some(instr) = instrs.next() {
+                match instr.opcode() {
+                    OP_FUNCTION_CALL => {
+                        let mut operands = instr.operands();
+                        let _rty = operands.read_u32()?;
+                        let _id = operands.read_u32()?;
+                        let callee = operands.read_u32()?;
+                        func.calls.insert(callee);
+                    },
+                    OP_LOAD | OP_ACCESS_CHAIN => {
+                        let mut operands = instr.operands();
+                        let _rty = operands.read_u32()?;
+                        let _id = operands.read_u32()?;
+                        let target = operands.read_u32()?;
+                        func.accessed_vars.insert(target);
+                    },
+                    OP_STORE => {
+                        let mut operands = instr.operands();
+                        let target = operands.read_u32()?;
+                        func.accessed_vars.insert(target);
+                    },
+                    OP_FUNCTION_END => break,
+                    _ => { },
+                }
+            }
+        }
+        Ok(())
+    }/*
     fn collect_fn_vars_impl(&self, func: FunctionId, vars: &mut HashSet<VariableId>) {
         let func = &self.func_map[&func];
         let it = func.accessed_vars.iter()
@@ -679,7 +685,7 @@ impl<'a> SpirvMetadata<'a> {
         let mut accessed_vars = HashSet::new();
         self.collect_fn_vars_impl(func, &mut accessed_vars);
         accessed_vars.into_iter()
-    }
+    }*/
 }
 
 #[derive(Debug)]
@@ -707,7 +713,7 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
     let entry_point = &meta.entry_points[0];
     info!("{}", entry_point.name);
     let exec_model = &entry_point.exec_model;
-
+/*
     let mut desc_contracts = Vec::<DescriptorContract>::new();
     let mut attr_offset: usize = 0;
     let mut attr_templates = Vec::<VertexAttributeContractTemplate>::new();
@@ -771,6 +777,7 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
     }
     info!("{:?}", attr_templates);
     info!("{:?}", attm_templates);
+    */
 
     Ok(())
 }

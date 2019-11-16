@@ -8,6 +8,7 @@ use ash::vk;
 
 fn main() {
     env_logger::init();
+    /*
     let render_cfg = InterfaceConfig::new("render")
         .require_transfer()
         .require_graphics();
@@ -19,6 +20,7 @@ fn main() {
         .with_interface(render_cfg)
         .build()
         .unwrap();
+    */
     let spvs = collect_spirv_binaries("assets/effects/uniform-pbr");
     info!("collected spirvs: {:?}", spvs.iter().map(|x| x.0.as_ref()).collect::<Vec<&str>>());
     let module = &spvs["uniform-pbr.frag"];
