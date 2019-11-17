@@ -768,14 +768,23 @@ impl<'a> SpirvMetadata<'a> {
             SpirvObject::NumericType(num_ty) => {
                 debug!("1a1");
                 if num_ty.is_mat() {
+                    let col_nbyte = (num_ty.nrow() * num_ty.nbyte()) as usize;
+                    let vec = SymbolNode::Leaf {
+                        offset: base_offset,
+                        nbyte: col_nbyte,
+                    };
                     SymbolNode::Repeat {
+                        is_mat: true,
                         offset: base_offset,
                         stride: mat_stride,
-                        proto: Box::new(SymbolNode::Leaf { offset: base_offset }),
+                        proto: Box::new(vec),
                         nrepeat: num_ty.ncol.map(|x| x as usize),
                     }
                 } else {
-                    SymbolNode::Leaf { offset: base_offset }
+                    SymbolNode::Leaf {
+                        offset: base_offset,
+                        nbyte: num_ty.nbyte() as usize,
+                    }
                 }
             },
             SpirvObject::StructType(members) => {
@@ -804,6 +813,7 @@ impl<'a> SpirvMetadata<'a> {
             SpirvObject::ArrayType(arr_ty) => {
                 debug!("3c3");
                 SymbolNode::Repeat {
+                    is_mat: false,
                     offset: base_offset,
                     stride: mat_stride,
                     proto: Box::new(self.ty2node(arr_ty.elem_ty, mat_stride, 0)?),
@@ -847,6 +857,7 @@ pub enum SymbolNode {
         name_map: HashMap<String, usize>,
     },
     Repeat {
+        is_mat: bool,
         offset: usize,
         stride: usize,
         proto: Box<SymbolNode>,
@@ -854,6 +865,7 @@ pub enum SymbolNode {
     },
     Leaf {
         offset: usize,
+        nbyte: usize,
     },
 }
 
