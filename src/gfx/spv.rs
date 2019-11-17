@@ -402,19 +402,12 @@ impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
         // SPIR-V specification for more information.
         let mut instrs = module.instrs().peekable();
         let mut meta = SpirvMetadata::default();
-        debug!("0");
         meta.populate_entry_points(&mut instrs)?;
-        debug!("1");
         meta.populate_names(&mut instrs)?;
-        debug!("2");
         meta.populate_decos(&mut instrs)?;
-        debug!("3");
         meta.populate_defs(&mut instrs)?;
-        debug!("4");
         meta.populate_access(&mut instrs)?;
-        debug!("5");
         for i in 0..meta.entry_points.len() { meta.inflate_entry_point(i)?; }
-        debug!("6");
         Ok(meta)
     }
 }
@@ -760,10 +753,8 @@ impl<'a> SpirvMetadata<'a> {
             .map(|x| *x)
     }
     fn ty2node(&self, ty_id: u32, mat_stride: usize, base_offset: usize) -> Result<SymbolNode> {
-        debug!("-- {}", ty_id);
         let node = match &self.obj_map[&ty_id] {
             SpirvObject::NumericType(num_ty) => {
-                debug!("1a1");
                 if num_ty.is_mat() {
                     let col_nbyte = (num_ty.nrow() * num_ty.nbyte()) as usize;
                     let vec = SymbolNode::Leaf {
@@ -785,7 +776,6 @@ impl<'a> SpirvMetadata<'a> {
                 }
             },
             SpirvObject::StructType(members) => {
-                debug!("2b2");
                 let mut children = Vec::with_capacity(members.len());
                 let mut name_map = HashMap::new();
                 for (i, member_ty) in members.iter().enumerate() {
@@ -808,7 +798,6 @@ impl<'a> SpirvMetadata<'a> {
                 }
             },
             SpirvObject::ArrayType(arr_ty) => {
-                debug!("3c3");
                 SymbolNode::Repeat {
                     is_mat: false,
                     offset: base_offset,
@@ -819,7 +808,6 @@ impl<'a> SpirvMetadata<'a> {
             },
             _ => return Err(Error::CorruptedSpirv),
         };
-        debug!("--+ {}", ty_id);
         Ok(node)
     }
     fn inflate_entry_point(&mut self, i: usize) -> Result<()> {
@@ -852,8 +840,7 @@ impl<'a> SpirvMetadata<'a> {
                             attr_templates.push(template);
                             attr_offset += col_nbyte;
                         }
-                    } else { debug!("456"); }
-                    // Leak out all inputs that are not attributes.
+                    } else { return Err(Error::CorruptedSpirv); }
                 },
                 STORE_CLS_OUTPUT if exec_model == EXEC_MODEL_FRAGMENT => {
                     let mut location = self.get_deco_u32(var_id, None, DECO_LOCATION)
@@ -867,8 +854,7 @@ impl<'a> SpirvMetadata<'a> {
                             nbyte: col_nbyte,
                         };
                         attm_templates.push(template);
-                    } else { debug!("123"); }
-                    // Leak out all outputs that are not attachments.
+                    } else { return Err(Error::CorruptedSpirv); }
                 },
                 STORE_CLS_UNIFORM | STORE_CLS_STORAGE_BUFFER => {
                     let desc_set = self.get_deco_u32(var_id, None, DECO_DESCRIPTOR_SET)
@@ -891,7 +877,6 @@ impl<'a> SpirvMetadata<'a> {
                 _ => {},
             }
         }
-        debug!("{:?}", desc_binds);
         let mut entry_point = &mut self.entry_points[i];
         entry_point.attr_templates = attr_templates;
         entry_point.attm_templates = attm_templates;
