@@ -765,7 +765,7 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
 
     let entry_point = &meta.entry_points[0];
     info!("{}", entry_point.name);
-    let exec_model = &entry_point.exec_model;
+    let exec_model = entry_point.exec_model;
 
     let mut desc_contracts = Vec::<DescriptorContract>::new();
     let mut attr_offset: usize = 0;
@@ -776,14 +776,14 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
         let var = &meta.get_var(var_id)?;
         let ty = meta.resolve_ref(var.ty)?;
         match var.store_cls {
-            STORE_CLS_INPUT if *exec_model == EXEC_MODEL_VERTEX => {
+            STORE_CLS_INPUT if exec_model == EXEC_MODEL_VERTEX => {
                 let bind_point = meta.deco_map.get(&(var_id, None, DECO_BINDING))
                     .and_then(|x| x.get(0))
-                    .map(|x| *x)
+                    .cloned()
                     .unwrap_or(0);
                 let location = meta.deco_map.get(&(var_id, None, DECO_LOCATION))
                     .and_then(|x| x.get(0))
-                    .map(|x| *x)
+                    .cloned()
                     .unwrap_or(0);
                 if let SpirvObject::NumericType(num_ty) = ty {
                     let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
@@ -800,10 +800,10 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
                 } else { debug!("456"); }
                 // Leak out all inputs that are not attributes.
             },
-            STORE_CLS_OUTPUT if *exec_model == EXEC_MODEL_FRAGMENT => {
+            STORE_CLS_OUTPUT if exec_model == EXEC_MODEL_FRAGMENT => {
                 let mut location = meta.deco_map.get(&(var_id, None, DECO_LOCATION))
                     .and_then(|x| x.get(0))
-                    .map(|x| *x)
+                    .cloned()
                     .unwrap_or(0);
                 if let SpirvObject::NumericType(num_ty) = ty {
                     // Matrix is not valid attachment type.
