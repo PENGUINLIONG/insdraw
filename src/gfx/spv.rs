@@ -814,8 +814,7 @@ impl<'a> SpirvMetadata<'a> {
         let entry_point = &self.entry_points[i];
         let exec_model = entry_point.exec_model;
 
-        let mut attr_offset: usize = 0;
-        let mut attr_templates = Vec::new();
+        let mut attr_templates = HashMap::<u32, Vec<VertexAttributeContractTemplate>>::new();
         let mut attm_templates = Vec::new();
         let mut desc_binds = HashMap::new();
 
@@ -830,15 +829,19 @@ impl<'a> SpirvMetadata<'a> {
                         .unwrap_or(0);
                     if let SpirvObject::NumericType(num_ty) = ty {
                         let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
+                        let mut vec = &mut attr_templates.entry(bind_point)
+                            .or_default();
+                        let base_offset = vec.last()
+                            .map(|x| x.offset)
+                            .unwrap_or(0);
                         for i in 0..num_ty.ncol() {
                             let template = VertexAttributeContractTemplate {
                                 bind_point: bind_point,
                                 location: location,
-                                offset: attr_offset,
+                                offset: base_offset + col_nbyte,
                                 nbyte: col_nbyte,
                             };
-                            attr_templates.push(template);
-                            attr_offset += col_nbyte;
+                            vec.push(template);
                         }
                     } else { return Err(Error::CorruptedSpirv); }
                 },
@@ -944,7 +947,7 @@ struct EntryPoint {
     func: u32,
     name: String,
     exec_model: u32,
-    attr_templates: Vec<VertexAttributeContractTemplate>,
+    attr_templates: HashMap<u32, Vec<VertexAttributeContractTemplate>>,
     attm_templates: Vec<AttachmentContractTemplate>,
     desc_binds: HashMap<DescriptorBinding, SymbolNode>,
 }
