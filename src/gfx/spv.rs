@@ -7,6 +7,7 @@ use std::marker::PhantomData;
 use std::collections::{HashMap, HashSet};
 use std::iter::{FromIterator, Peekable};
 use std::ffi::CStr;
+use std::fmt;
 use std::ops::{Range, RangeInclusive};
 use std::convert::{TryFrom, TryInto};
 use num_derive::FromPrimitive;
@@ -293,8 +294,8 @@ pub enum ImageUnitFormat {
 impl ImageUnitFormat {
     pub fn from_spv_def(is_sampled: bool, is_depth: bool, color_fmt: u32) -> Result<ImageUnitFormat> {
         let img_unit_fmt = match (is_sampled, is_depth, color_fmt) {
-            (true, false, IMG_UNIT_FMT_UNKNOWN) => ImageUnitFormat::Sampled,
-            (true, true, IMG_UNIT_FMT_UNKNOWN) => ImageUnitFormat::Depth,
+            (true, false, _) => ImageUnitFormat::Sampled,
+            (true, true, _) => ImageUnitFormat::Depth,
             (false, false, color_fmt) => ImageUnitFormat::Color(ColorFormat::from_spv_def(color_fmt)?),
             _ => return Err(Error::UnsupportedSpirv),
         };
@@ -362,7 +363,7 @@ pub type ObjectId = u32;
 #[derive(Debug, Clone)]
 pub enum SpirvObject<'a> {
     NumericType(NumericType),
-    ImageType(ImageType),
+    ImageType(Option<ImageType>),
     ArrayType(ArrayType),
     StructType(Vec<StructMember<'a>>),
     PointerType(ObjectId), // Struct ID.
@@ -421,7 +422,7 @@ impl<'a> SpirvMetadata<'a> {
             .and_then(|x| match x { SpirvObject::NumericType(ty) => Some(ty), _ => None })
             .ok_or(Error::CorruptedSpirv)
     }
-    fn get_img_ty(&self, id: ObjectId) -> Result<&ImageType> {
+    fn get_img_ty(&self, id: ObjectId) -> Result<&Option<ImageType>> {
         self.obj_map.get(&id)
             .and_then(|x| match x { SpirvObject::ImageType(ty) => Some(ty), _ => None })
             .ok_or(Error::CorruptedSpirv)
@@ -549,24 +550,27 @@ impl<'a> SpirvMetadata<'a> {
             OP_TYPE_IMAGE => {
                 let _unit_ty = operands.read_u32()?;
                 let dim = operands.read_u32()?;
-                let is_depth = match operands.read_u32()? {
-                    0 => false, 1 => true, _ => return Err(Error::UnsupportedSpirv),
-                };
-                let is_array = operands.read_bool()?;
-                let is_multisampled = operands.read_bool()?;
-                let is_sampled = match operands.read_u32()? {
-                    1 => true, 2 => false, _ => return Err(Error::UnsupportedSpirv),
-                };
-                let color_fmt = operands.read_u32()?;
-
-                // Only unit types allowed to be stored in storage images can
-                // have given format.
-                let fmt = ImageUnitFormat::from_spv_def(is_sampled, is_depth, color_fmt)?;
-                let img_ty = ImageType {
-                    fmt: ImageUnitFormat::from_spv_def(is_sampled, is_depth, color_fmt)?,
-                    arng: ImageArrangement::from_spv_def(dim, is_array, is_multisampled)?,
-                };
-                self.insert_obj(id, SpirvObject::ImageType(img_ty))?;
+                if dim == DIM_IMAGE_SUBPASS_DATA {
+                    self.insert_obj(id, SpirvObject::ImageType(None))?;
+                } else {
+                    let is_depth = match operands.read_u32()? {
+                        0 => false, 1 => true, _ => return Err(Error::UnsupportedSpirv),
+                    };
+                    let is_array = operands.read_bool()?;
+                    let is_multisampled = operands.read_bool()?;
+                    let is_sampled = match operands.read_u32()? {
+                        1 => true, 2 => false, _ => return Err(Error::UnsupportedSpirv),
+                    };
+                    let color_fmt = operands.read_u32()?;
+                    
+                    // Only unit types allowed to be stored in storage images can
+                    // have given format.
+                    let img_ty = ImageType {
+                        fmt: ImageUnitFormat::from_spv_def(is_sampled, is_depth, color_fmt)?,
+                        arng: ImageArrangement::from_spv_def(dim, is_array, is_multisampled)?,
+                    };
+                    self.insert_obj(id, SpirvObject::ImageType(Some(img_ty)))?;
+                }
             },
             OP_TYPE_SAMPLED_IMAGE => {
                 let ty = self.get_img_ty(operands.read_u32()?)?;
@@ -743,6 +747,10 @@ impl<'a> SpirvMetadata<'a> {
             self.resolve_ref(*ref_ty)
         } else { Ok((ty_id, ty)) }
     }
+    fn get_deco(&self, id: ObjectId, member_idx: Option<u32>, deco: Decoration) -> Option<&[u32]> {
+        self.deco_map.get(&(id, member_idx, deco))
+            .cloned()
+    }
     fn get_deco_u32(&self, id: ObjectId, member_idx: Option<u32>, deco: Decoration) -> Option<u32> {
         self.deco_map.get(&(id, member_idx, deco))
             .and_then(|x| x.get(0))
@@ -865,15 +873,46 @@ impl<'a> SpirvMetadata<'a> {
                     let bind_point = self.get_deco_u32(var_id, None, DECO_BINDING)
                         .unwrap_or(0);
                     let sym_node = self.ty2node(ty_id, 0, 0)?;
-                    if desc_binds.insert(DescriptorBinding::desc_bind(desc_set, bind_point), sym_node).is_some() {
+                    let desc = if var.store_cls == STORE_CLS_STORAGE_BUFFER ||
+                        self.get_deco(var_id, None, DECO_BUFFER_BLOCK).is_some() {
+                        Descriptor::Storage(sym_node)
+                    } else {
+                        Descriptor::Uniform(sym_node)
+                    };
+                    
+                    let desc_bind = DescriptorBinding::desc_bind(desc_set, bind_point);
+                    if desc_binds.insert(desc_bind, desc).is_some() {
                         return Err(Error::CorruptedSpirv);
                     }
                 },
+                STORE_CLS_UNIFORM_CONSTANT => {
+                    if let SpirvObject::ImageType(img_ty) = ty {
+                        let desc_set = self.get_deco_u32(var_id, None, DECO_DESCRIPTOR_SET)
+                            .unwrap_or(0);
+                        let bind_point = self.get_deco_u32(var_id, None, DECO_BINDING)
+                            .unwrap_or(0);
+                        let desc = if let Some(img_ty) = img_ty {
+                            Descriptor::Image(*img_ty)
+                        } else {
+                            let input_attm_idx = self.get_deco_u32(var_id, None, DECO_INPUT_ATTACHMENT_INDEX)
+                                .ok_or(Error::CorruptedSpirv)?;
+                            Descriptor::InputAtatchment(input_attm_idx)
+                        };
+                        let desc_bind = DescriptorBinding::desc_bind(desc_set, bind_point);
+                        if desc_binds.insert(desc_bind, desc).is_some() {
+                            return Err(Error::CorruptedSpirv);
+                        }
+                    }
+                    // Leak out unknown types of uniform constants.
+                }
                 STORE_CLS_PUSH_CONSTANT => {
                     // Push constants have no global offset. Offsets are applied to
                     // members.
                     let sym_node = self.ty2node(ty_id, 0, 0)?;
-                    if desc_binds.insert(DescriptorBinding::push_const(), sym_node).is_some() {
+                    let desc = Descriptor::Uniform(sym_node);
+
+                    let desc_bind = DescriptorBinding::push_const();
+                    if desc_binds.insert(desc_bind, desc).is_some() {
                         return Err(Error::CorruptedSpirv);
                     }
                 },
@@ -904,12 +943,6 @@ struct AttachmentContractTemplate {
     /// Total byte count at this location.
     nbyte: usize,
 }
-#[derive(Debug, Clone)]
-struct DescriptorContractTemplate {
-    desc_set: u32,
-    bind_point: u32,
-    offset: u32,
-}
 
 #[derive(Debug, Clone)]
 pub enum SymbolNode {
@@ -931,7 +964,7 @@ pub enum SymbolNode {
     },
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Default, Clone, Copy)]
+#[derive(PartialEq, Eq, Hash, Default, Clone, Copy)]
 pub struct DescriptorBinding(Option<(u32, u32)>);
 impl DescriptorBinding {
     pub fn push_const() -> Self { DescriptorBinding(None) }
@@ -941,6 +974,24 @@ impl DescriptorBinding {
     pub fn is_desc_bind(&self) -> bool { self.0.is_some() }
     pub fn into_inner(self) -> Option<(u32, u32)> { self.0 }
 }
+impl fmt::Debug for DescriptorBinding {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if let Some((set, bind)) = self.0 {
+            write!(f, "(Set = {}, Bind = {})", set, bind)
+        } else {
+            write!(f, "(PushConstant)")
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Descriptor {
+    Storage(SymbolNode),
+    Uniform(SymbolNode),
+    Image(ImageType),
+    Sampler,
+    InputAtatchment(u32),
+}
 
 #[derive(Debug, Default, Clone)]
 struct EntryPoint {
@@ -949,10 +1000,9 @@ struct EntryPoint {
     exec_model: u32,
     attr_templates: HashMap<u32, Vec<VertexAttributeContractTemplate>>,
     attm_templates: Vec<AttachmentContractTemplate>,
-    desc_binds: HashMap<DescriptorBinding, SymbolNode>,
+    desc_binds: HashMap<DescriptorBinding, Descriptor>,
 }
 
-/// Resolve the minimum contract for all entry points in the module.
 pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
     use std::ops::Deref;
     use log::debug;
