@@ -787,7 +787,7 @@ impl<'a> SpirvMetadata<'a> {
                     SymbolNode::Repeat {
                         major: Some(num_ty.major),
                         offset: base_offset,
-                        stride: mat_stride,
+                        stride: Some(mat_stride),
                         proto: Box::new(vec),
                         nrepeat: num_ty.ncol.map(|x| x as usize),
                     }
@@ -821,10 +821,12 @@ impl<'a> SpirvMetadata<'a> {
                 }
             },
             SpirvObject::ArrayType(arr_ty) => {
+                let stride = self.get_deco_u32(ty_id, None, DECO_ARRAY_STRIDE)
+                    .map(|x| x as usize);
                 SymbolNode::Repeat {
                     major: None,
                     offset: base_offset,
-                    stride: mat_stride,
+                    stride: stride,
                     proto: Box::new(self.ty2node(arr_ty.elem_ty, mat_stride, 0)?),
                     nrepeat: arr_ty.nelem.map(|x| x as usize),
                 }
@@ -971,7 +973,9 @@ pub enum SymbolNode {
         /// represents an array.
         major: Option<MatrixAxisOrder>,
         offset: usize,
-        stride: usize,
+        /// This field can be `None` when it represents the number of bindings
+        /// at a binding point.
+        stride: Option<usize>,
         proto: Box<SymbolNode>,
         nrepeat: Option<usize>,
     },
