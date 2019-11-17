@@ -202,12 +202,6 @@ impl<'a> Operands<'a> {
 
 
 
-#[derive(Debug)]
-struct EntryPoint<'a> {
-    exec_model: u32,
-    func: u32,
-    name: &'a str,
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct NumericType {
@@ -396,7 +390,7 @@ use crate::gfx::contract::{VertexAttributeContract, AttachmentContract, Pipeline
 
 #[derive(Default, Debug)]
 struct SpirvMetadata<'a> {
-    pub entry_points: Vec<EntryPoint<'a>>,
+    pub entry_points: Vec<EntryPoint>,
     pub name_map: HashMap<(ObjectId, Option<u32>), &'a str>,
     pub deco_map: HashMap<(ObjectId, Option<u32>, Decoration), &'a [u32]>,
     pub obj_map: HashMap<ObjectId, SpirvObject<'a>>,
@@ -419,6 +413,8 @@ impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
         debug!("4");
         meta.populate_access(&mut instrs)?;
         debug!("5");
+        for i in 0..meta.entry_points.len() { meta.inflate_entry_point(i)?; }
+        debug!("6");
         Ok(meta)
     }
 }
@@ -484,7 +480,8 @@ impl<'a> SpirvMetadata<'a> {
             let entry_point = EntryPoint {
                 exec_model: operands.read_u32()?,
                 func: operands.read_u32()?,
-                name: operands.read_str()?,
+                name: operands.read_str()?.to_owned(),
+                ..Default::default()
             };
             self.entry_points.push(entry_point);
             instrs.next();
@@ -825,9 +822,86 @@ impl<'a> SpirvMetadata<'a> {
         debug!("--+ {}", ty_id);
         Ok(node)
     }
+    fn inflate_entry_point(&mut self, i: usize) -> Result<()> {
+        let entry_point = &self.entry_points[i];
+        let exec_model = entry_point.exec_model;
+
+        let mut attr_offset: usize = 0;
+        let mut attr_templates = Vec::new();
+        let mut attm_templates = Vec::new();
+        let mut desc_binds = HashMap::new();
+
+        for var_id in self.collect_fn_vars(entry_point.func) {
+            let var = &self.get_var(var_id)?;
+            let (ty_id, ty) = self.resolve_ref(var.ty)?;
+            match var.store_cls {
+                STORE_CLS_INPUT if exec_model == EXEC_MODEL_VERTEX => {
+                    let bind_point = self.get_deco_u32(var_id, None, DECO_BINDING)
+                        .unwrap_or(0);
+                    let location = self.get_deco_u32(var_id, None, DECO_LOCATION)
+                        .unwrap_or(0);
+                    if let SpirvObject::NumericType(num_ty) = ty {
+                        let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
+                        for i in 0..num_ty.ncol() {
+                            let template = VertexAttributeContractTemplate {
+                                bind_point: bind_point,
+                                location: location,
+                                offset: attr_offset,
+                                nbyte: col_nbyte,
+                            };
+                            attr_templates.push(template);
+                            attr_offset += col_nbyte;
+                        }
+                    } else { debug!("456"); }
+                    // Leak out all inputs that are not attributes.
+                },
+                STORE_CLS_OUTPUT if exec_model == EXEC_MODEL_FRAGMENT => {
+                    let mut location = self.get_deco_u32(var_id, None, DECO_LOCATION)
+                        .unwrap_or(0);
+                    if let SpirvObject::NumericType(num_ty) = ty {
+                        // Matrix is not valid attachment type.
+                        if num_ty.is_mat() { return Err(Error::CorruptedSpirv); }
+                        let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
+                        let template = AttachmentContractTemplate {
+                            location: location,
+                            nbyte: col_nbyte,
+                        };
+                        attm_templates.push(template);
+                    } else { debug!("123"); }
+                    // Leak out all outputs that are not attachments.
+                },
+                STORE_CLS_UNIFORM | STORE_CLS_STORAGE_BUFFER => {
+                    let desc_set = self.get_deco_u32(var_id, None, DECO_DESCRIPTOR_SET)
+                        .unwrap_or(0);
+                    let bind_point = self.get_deco_u32(var_id, None, DECO_BINDING)
+                        .unwrap_or(0);
+                    let sym_node = self.ty2node(ty_id, 0, 0)?;
+                    if desc_binds.insert(DescriptorBinding::desc_bind(desc_set, bind_point), sym_node).is_some() {
+                        return Err(Error::CorruptedSpirv);
+                    }
+                },
+                STORE_CLS_PUSH_CONSTANT => {
+                    // Push constants have no global offset. Offsets are applied to
+                    // members.
+                    let sym_node = self.ty2node(ty_id, 0, 0)?;
+                    if desc_binds.insert(DescriptorBinding::push_const(), sym_node).is_some() {
+                        return Err(Error::CorruptedSpirv);
+                    }
+                },
+                _ => {},
+            }
+        }
+        debug!("{:?}", desc_binds);
+        let mut entry_point = &mut self.entry_points[i];
+        entry_point.attr_templates = attr_templates;
+        entry_point.attm_templates = attm_templates;
+        entry_point.desc_binds = desc_binds;
+        Ok(())
+    }
+    pub fn entry_points(&self) -> &[EntryPoint] { &self.entry_points }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct VertexAttributeContractTemplate {
     bind_point: u32,
     location: u32,
@@ -836,13 +910,13 @@ struct VertexAttributeContractTemplate {
     /// Total byte count at this location.
     nbyte: usize,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AttachmentContractTemplate {
     location: u32,
     /// Total byte count at this location.
     nbyte: usize,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DescriptorContractTemplate {
     desc_set: u32,
     bind_point: u32,
@@ -869,87 +943,33 @@ pub enum SymbolNode {
     },
 }
 
+#[derive(Debug, PartialEq, Eq, Hash, Default, Clone, Copy)]
+pub struct DescriptorBinding(Option<(u32, u32)>);
+impl DescriptorBinding {
+    pub fn push_const() -> Self { DescriptorBinding(None) }
+    pub fn desc_bind(desc_set: u32, bind_point: u32) -> Self { DescriptorBinding(Some((desc_set, bind_point))) }
+
+    pub fn is_push_const(&self) -> bool { self.0.is_none() }
+    pub fn is_desc_bind(&self) -> bool { self.0.is_some() }
+    pub fn into_inner(self) -> Option<(u32, u32)> { self.0 }
+}
+
+#[derive(Debug, Default, Clone)]
+struct EntryPoint {
+    func: u32,
+    name: String,
+    exec_model: u32,
+    attr_templates: Vec<VertexAttributeContractTemplate>,
+    attm_templates: Vec<AttachmentContractTemplate>,
+    desc_binds: HashMap<DescriptorBinding, SymbolNode>,
+}
+
 /// Resolve the minimum contract for all entry points in the module.
 pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
     use std::ops::Deref;
     use log::debug;
     let meta: SpirvMetadata = module.try_into()?;
-    debug!("{:?}", meta);
-
-    let entry_point = &meta.entry_points[0];
-    info!("{}", entry_point.name);
-    let exec_model = entry_point.exec_model;
-
-    let mut desc_contracts = Vec::<DescriptorContract>::new();
-    let mut attr_offset: usize = 0;
-    let mut attr_templates = Vec::<VertexAttributeContractTemplate>::new();
-    let mut attm_templates = Vec::<AttachmentContractTemplate>::new();
-
-    let mut desc_set_roots = HashMap::<Option<(u32, u32)>, SymbolNode>::new();
-
-    for var_id in meta.collect_fn_vars(entry_point.func) {
-        let var = &meta.get_var(var_id)?;
-        let (ty_id, ty) = meta.resolve_ref(var.ty)?;
-        match var.store_cls {
-            STORE_CLS_INPUT if exec_model == EXEC_MODEL_VERTEX => {
-                let bind_point = meta.get_deco_u32(var_id, None, DECO_BINDING)
-                    .unwrap_or(0);
-                let location = meta.get_deco_u32(var_id, None, DECO_LOCATION)
-                    .unwrap_or(0);
-                if let SpirvObject::NumericType(num_ty) = ty {
-                    let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
-                    for i in 0..num_ty.ncol() {
-                        let template = VertexAttributeContractTemplate {
-                            bind_point: bind_point,
-                            location: location,
-                            offset: attr_offset,
-                            nbyte: col_nbyte,
-                        };
-                        attr_templates.push(template);
-                        attr_offset += col_nbyte;
-                    }
-                } else { debug!("456"); }
-                // Leak out all inputs that are not attributes.
-            },
-            STORE_CLS_OUTPUT if exec_model == EXEC_MODEL_FRAGMENT => {
-                let mut location = meta.get_deco_u32(var_id, None, DECO_LOCATION)
-                    .unwrap_or(0);
-                if let SpirvObject::NumericType(num_ty) = ty {
-                    // Matrix is not valid attachment type.
-                    if num_ty.is_mat() { return Err(Error::CorruptedSpirv); }
-                    let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
-                    let template = AttachmentContractTemplate {
-                        location: location,
-                        nbyte: col_nbyte,
-                    };
-                    attm_templates.push(template);
-                } else { debug!("123"); }
-                // Leak out all outputs that are not attachments.
-            },
-            STORE_CLS_UNIFORM | STORE_CLS_STORAGE_BUFFER => {
-                let desc_set = meta.get_deco_u32(var_id, None, DECO_DESCRIPTOR_SET)
-                    .unwrap_or(0);
-                let bind_point = meta.get_deco_u32(var_id, None, DECO_BINDING)
-                    .unwrap_or(0);
-                let sym_node = meta.ty2node(ty_id, 0, 0)?;
-                desc_set_roots.insert(Some((desc_set, bind_point)), sym_node)
-                    .ok_or(Error::CorruptedSpirv)?;
-            },
-            STORE_CLS_PUSH_CONSTANT => {
-                // Push constants have no global offset. Offsets are applied to
-                // members.
-                let sym_node = meta.ty2node(ty_id, 0, 0)?;
-                debug!("{:?}", desc_set_roots);
-                if desc_set_roots.insert(None, sym_node).is_some() {
-                    return Err(Error::CorruptedSpirv);
-                }
-            },
-            _ => {},
-        }
-    }
-    info!("{:#?}", attr_templates);
-    info!("{:#?}", attm_templates);
-    info!("{:#?}", desc_set_roots);
+    debug!("{:#?}", meta.entry_points());
 
     Ok(())
 }
