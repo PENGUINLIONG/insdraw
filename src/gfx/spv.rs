@@ -346,7 +346,7 @@ pub struct ImageType {
 #[derive(Debug, Clone, Copy)]
 pub struct ArrayType {
     elem_ty: ObjectId,
-    nelem: Option<ObjectId>,
+    nelem: Option<u32>,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct StructMember<'a> {
@@ -371,7 +371,7 @@ pub enum SpirvObject<'a> {
     ImageType(ImageType),
     ArrayType(ArrayType),
     StructType(Vec<StructMember<'a>>),
-    PointerType(ObjectId),
+    PointerType(ObjectId), // Struct ID.
     Variable(Variable),
     Constant(Constant<'a>),
     Function(Function),
@@ -661,13 +661,10 @@ impl<'a> SpirvMetadata<'a> {
             let mut operands = instr.operands();
             let opcode = instr.opcode();
             if (TYPE_RANGE.contains(&opcode)) {
-                debug!("11");
                 self.populate_one_ty(instr)?;
             } else if opcode == OP_VARIABLE {
-                debug!("22");
                 self.populate_one_var(instr)?;
             } else if CONST_RANGE.contains(&opcode) {
-                debug!("33");
                 self.populate_one_const(instr)?;
             } else { break; }
             instrs.next();
@@ -676,6 +673,7 @@ impl<'a> SpirvMetadata<'a> {
     }
     fn populate_access(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
         while instrs.peek().is_some() {
+            let mut access_chain_map = HashMap::new();
             let mut func: &mut Function = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
             while let Some(instr) = instrs.next() {
                 if instr.opcode() == OP_FUNCTION {
@@ -693,19 +691,36 @@ impl<'a> SpirvMetadata<'a> {
                         let _rty = operands.read_u32()?;
                         let _id = operands.read_u32()?;
                         let callee = operands.read_u32()?;
-                        func.calls.insert(callee);
+                        if !func.calls.insert(callee) {
+                            return Err(Error::CorruptedSpirv);
+                        }
                     },
-                    OP_LOAD | OP_ACCESS_CHAIN => {
+                    OP_LOAD => {
                         let mut operands = instr.operands();
                         let _rty = operands.read_u32()?;
                         let _id = operands.read_u32()?;
-                        let target = operands.read_u32()?;
+                        let mut target = operands.read_u32()?;
+                        if let Some(&x) = access_chain_map.get(&target) {
+                            target = x;
+                        }
                         func.accessed_vars.insert(target);
                     },
                     OP_STORE => {
                         let mut operands = instr.operands();
-                        let target = operands.read_u32()?;
+                        let mut target = operands.read_u32()?;
+                        if let Some(&x) = access_chain_map.get(&target) {
+                            target = x;
+                        }
                         func.accessed_vars.insert(target);
+                    },
+                    OP_ACCESS_CHAIN => {
+                        let mut operands = instr.operands();
+                        let _rty = operands.read_u32()?;
+                        let id = operands.read_u32()?;
+                        let target = operands.read_u32()?;
+                        if access_chain_map.insert(id, target).is_some() {
+                            return Err(Error::CorruptedSpirv);
+                        }
                     },
                     OP_FUNCTION_END => break,
                     _ => { },
@@ -731,12 +746,74 @@ impl<'a> SpirvMetadata<'a> {
     }
     /// Resolve recurring layers of pointers to the pointer that refer to the
     /// data directly.
-    fn resolve_ref(&self, ty: ObjectId) -> Result<&SpirvObject<'a>> {
-        let ty = &self.obj_map.get(&ty)
+    fn resolve_ref(&self, ty_id: ObjectId) -> Result<(ObjectId, &SpirvObject<'a>)> {
+        let ty = &self.obj_map.get(&ty_id)
             .ok_or(Error::CorruptedSpirv)?;
         if let SpirvObject::PointerType(ref_ty) = ty {
             self.resolve_ref(*ref_ty)
-        } else { Ok(ty) }
+        } else { Ok((ty_id, ty)) }
+    }
+    fn get_deco_u32(&self, id: ObjectId, member_idx: Option<u32>, deco: Decoration) -> Option<u32> {
+        self.deco_map.get(&(id, member_idx, deco))
+            .and_then(|x| x.get(0))
+            .cloned()
+    }
+    fn get_name(&self, id: ObjectId, member_idx: Option<u32>) -> Option<&'a str> {
+        self.name_map.get(&(id, member_idx))
+            .map(|x| *x)
+    }
+    fn ty2node(&self, ty_id: u32, mat_stride: usize, base_offset: usize) -> Result<SymbolNode> {
+        debug!("-- {}", ty_id);
+        let node = match &self.obj_map[&ty_id] {
+            SpirvObject::NumericType(num_ty) => {
+                debug!("1a1");
+                if num_ty.is_mat() {
+                    SymbolNode::Repeat {
+                        offset: base_offset,
+                        stride: mat_stride,
+                        proto: Box::new(SymbolNode::Leaf { offset: base_offset }),
+                        nrepeat: num_ty.ncol.map(|x| x as usize),
+                    }
+                } else {
+                    SymbolNode::Leaf { offset: base_offset }
+                }
+            },
+            SpirvObject::StructType(members) => {
+                debug!("2b2");
+                let mut children = Vec::with_capacity(members.len());
+                let mut name_map = HashMap::new();
+                for (i, member_ty) in members.iter().enumerate() {
+                    let offset = self.get_deco_u32(ty_id, Some(i as u32), DECO_OFFSET)
+                        .ok_or(Error::UnsupportedSpirv)? as usize;
+                    let stride = self.get_deco_u32(ty_id, Some(i as u32), DECO_MATRIX_STRIDE)
+                        .map(|x| x as usize)
+                        .unwrap_or(mat_stride);
+                    children.push(self.ty2node(member_ty.ty, stride, base_offset + offset)?);
+                    if let Some(name) = self.get_name(ty_id, Some(i as u32)) {
+                        if name_map.insert(name.to_owned(), i).is_some() {
+                            return Err(Error::CorruptedSpirv);
+                        }
+                    }
+                }
+                SymbolNode::Node {
+                    offset: base_offset,
+                    children: children,
+                    name_map: name_map,
+                }
+            },
+            SpirvObject::ArrayType(arr_ty) => {
+                debug!("3c3");
+                SymbolNode::Repeat {
+                    offset: base_offset,
+                    stride: mat_stride,
+                    proto: Box::new(self.ty2node(arr_ty.elem_ty, mat_stride, 0)?),
+                    nrepeat: arr_ty.nelem.map(|x| x as usize),
+                }
+            },
+            _ => return Err(Error::CorruptedSpirv),
+        };
+        debug!("--+ {}", ty_id);
+        Ok(node)
     }
 }
 
@@ -755,6 +832,30 @@ struct AttachmentContractTemplate {
     /// Total byte count at this location.
     nbyte: usize,
 }
+#[derive(Debug)]
+struct DescriptorContractTemplate {
+    desc_set: u32,
+    bind_point: u32,
+    offset: u32,
+}
+
+#[derive(Debug, Clone)]
+pub enum SymbolNode {
+    Node {
+        offset: usize,
+        children: Vec<SymbolNode>,
+        name_map: HashMap<String, usize>,
+    },
+    Repeat {
+        offset: usize,
+        stride: usize,
+        proto: Box<SymbolNode>,
+        nrepeat: Option<usize>,
+    },
+    Leaf {
+        offset: usize,
+    },
+}
 
 /// Resolve the minimum contract for all entry points in the module.
 pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
@@ -772,18 +873,16 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
     let mut attr_templates = Vec::<VertexAttributeContractTemplate>::new();
     let mut attm_templates = Vec::<AttachmentContractTemplate>::new();
 
+    let mut desc_set_roots = HashMap::<Option<(u32, u32)>, SymbolNode>::new();
+
     for var_id in meta.collect_fn_vars(entry_point.func) {
         let var = &meta.get_var(var_id)?;
-        let ty = meta.resolve_ref(var.ty)?;
+        let (ty_id, ty) = meta.resolve_ref(var.ty)?;
         match var.store_cls {
             STORE_CLS_INPUT if exec_model == EXEC_MODEL_VERTEX => {
-                let bind_point = meta.deco_map.get(&(var_id, None, DECO_BINDING))
-                    .and_then(|x| x.get(0))
-                    .cloned()
+                let bind_point = meta.get_deco_u32(var_id, None, DECO_BINDING)
                     .unwrap_or(0);
-                let location = meta.deco_map.get(&(var_id, None, DECO_LOCATION))
-                    .and_then(|x| x.get(0))
-                    .cloned()
+                let location = meta.get_deco_u32(var_id, None, DECO_LOCATION)
                     .unwrap_or(0);
                 if let SpirvObject::NumericType(num_ty) = ty {
                     let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
@@ -801,9 +900,7 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
                 // Leak out all inputs that are not attributes.
             },
             STORE_CLS_OUTPUT if exec_model == EXEC_MODEL_FRAGMENT => {
-                let mut location = meta.deco_map.get(&(var_id, None, DECO_LOCATION))
-                    .and_then(|x| x.get(0))
-                    .cloned()
+                let mut location = meta.get_deco_u32(var_id, None, DECO_LOCATION)
                     .unwrap_or(0);
                 if let SpirvObject::NumericType(num_ty) = ty {
                     // Matrix is not valid attachment type.
@@ -817,11 +914,30 @@ pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
                 } else { debug!("123"); }
                 // Leak out all outputs that are not attachments.
             },
+            STORE_CLS_UNIFORM | STORE_CLS_STORAGE_BUFFER => {
+                let desc_set = meta.get_deco_u32(var_id, None, DECO_DESCRIPTOR_SET)
+                    .unwrap_or(0);
+                let bind_point = meta.get_deco_u32(var_id, None, DECO_BINDING)
+                    .unwrap_or(0);
+                let sym_node = meta.ty2node(ty_id, 0, 0)?;
+                desc_set_roots.insert(Some((desc_set, bind_point)), sym_node)
+                    .ok_or(Error::CorruptedSpirv)?;
+            },
+            STORE_CLS_PUSH_CONSTANT => {
+                // Push constants have no global offset. Offsets are applied to
+                // members.
+                let sym_node = meta.ty2node(ty_id, 0, 0)?;
+                debug!("{:?}", desc_set_roots);
+                if desc_set_roots.insert(None, sym_node).is_some() {
+                    return Err(Error::CorruptedSpirv);
+                }
+            },
             _ => {},
         }
     }
-    info!("{:?}", attr_templates);
-    info!("{:?}", attm_templates);
+    info!("{:#?}", attr_templates);
+    info!("{:#?}", attm_templates);
+    info!("{:#?}", desc_set_roots);
 
     Ok(())
 }

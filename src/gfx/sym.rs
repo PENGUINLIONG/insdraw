@@ -1,6 +1,7 @@
 //! Sym used to identify shader module resources.
 use std::borrow::Borrow;
 use std::ops::Deref;
+use std::str::FromStr;
 
 pub struct Sym(str);
 impl Sym {
@@ -45,22 +46,35 @@ impl Deref for Symbol {
     fn deref(&self) -> &Sym { &self.0 }
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Segment<'a> {
+    Index(usize),
+    Name(&'a str),
+}
+
 pub struct Segments<'a>(&'a str);
 impl<'a> Iterator for Segments<'a> {
-    type Item = &'a str;
+    type Item = Segment<'a>;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.0.is_empty() {
-            return None;
-        }
-        if let Some(pos) = self.0.char_indices()
-            .find_map(|(i, c)| if c == '.' { Some(i) } else { None }) {
-            let seg = &self.0[..pos];
-            self.0 = &self.0[(pos + 1)..];
-            Some(seg)
-        } else {
-            let seg = &self.0[..];
-            self.0 = &self.0[self.0.len()..];
-            Some(seg)
+        loop {
+            if self.0.is_empty() { return None; }
+            let txt = if let Some(pos) = self.0.char_indices()
+                .find_map(|(i, c)| if c == '.' { Some(i) } else { None }) {
+                let txt = &self.0[..pos];
+                self.0 = &self.0[(pos + 1)..];
+                txt
+            } else {
+                let txt = &self.0[..];
+                self.0 = &self.0[self.0.len()..];
+                txt
+            };
+            if txt.is_empty() { continue; }
+            let seg = if let Ok(idx) = usize::from_str(txt) {
+                Segment::Index(idx)
+            } else {
+                Segment::Name(txt)
+            };
+            return Some(seg);
         }
     }
 }
