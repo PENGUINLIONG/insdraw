@@ -77,8 +77,7 @@ const DECO_SPEC_ID: u32 = 1;
 const DECO_BLOCK: u32 = 2;
 const DECO_BUFFER_BLOCK: u32 = 3;
 const DECO_ROW_MAJOR: u32 = 4;
-// Don't need this: Column-major matrices are the default.
-// const DECO_COL_MAJOR: u32 = 5;
+const DECO_COL_MAJOR: u32 = 5;
 const DECO_ARRAY_STRIDE: u32 = 6;
 const DECO_MATRIX_STRIDE: u32 = 7;
 // Don't need this: Built-in variables will not be attribute nor attachment.
@@ -107,7 +106,6 @@ const DIM_IMAGE_CUBE: u32 = 3;
 const DIM_IMAGE_SUBPASS_DATA: u32 = 6;
 
 
-const IMG_UNIT_FMT_UNKNOWN: u32 = 0;
 const IMG_UNIT_FMT_RGBA32F: u32 = 1;
 const IMG_UNIT_FMT_R32F: u32 = 3;
 const IMG_UNIT_FMT_RGBA8: u32 = 4;
@@ -204,6 +202,14 @@ impl<'a> Operands<'a> {
 
 
 
+#[derive(Debug, Clone, Copy)]
+pub enum MatrixAxisOrder {
+    ColumnMajor,
+    RowMajor,
+}
+impl Default for MatrixAxisOrder {
+    fn default() -> MatrixAxisOrder { MatrixAxisOrder::ColumnMajor }
+}
 #[derive(Debug, Clone, Default)]
 pub struct NumericType {
     /// Bit-width of this type.
@@ -216,6 +222,7 @@ pub struct NumericType {
     nrow: Option<u32>,
     /// Column number for matrix types.
     ncol: Option<u32>,
+    major: MatrixAxisOrder,
 }
 impl NumericType {
     pub fn i32() -> NumericType {
@@ -247,8 +254,9 @@ impl NumericType {
             ..Default::default()
         }
     }
-    pub fn mat(col_ty: &NumericType, ncol: u32) -> NumericType {
+    pub fn mat(col_ty: &NumericType, ncol: u32, major: MatrixAxisOrder) -> NumericType {
         NumericType {
+            major: major,
             nbyte: col_ty.nbyte,
             is_signed: col_ty.is_signed,
             nrow: col_ty.nrow,
@@ -259,6 +267,7 @@ impl NumericType {
     pub fn nbyte(&self) -> u32 { self.nbyte }
     pub fn nrow(&self) -> u32 { self.nrow.unwrap_or(1) }
     pub fn ncol(&self) -> u32 { self.ncol.unwrap_or(1) }
+    pub fn major(&self) -> MatrixAxisOrder { self.major }
 
     pub fn is_primitive(&self) -> bool { self.nrow.is_none() && self.ncol.is_none() }
     pub fn is_vec(&self) -> bool { self.nrow.is_some() && self.ncol.is_none() }
@@ -543,7 +552,13 @@ impl<'a> SpirvMetadata<'a> {
                 let num_ty = if opcode == OP_TYPE_VECTOR && elem_ty.is_primitive() {
                     NumericType::vec(&elem_ty, nelem)
                 } else if opcode == OP_TYPE_MATRIX && elem_ty.is_vec() {
-                    NumericType::mat(&elem_ty, nelem)
+                    // Column-major by default.
+                    let major = if self.get_deco(id, None, DECO_ROW_MAJOR).is_some() {
+                        MatrixAxisOrder::RowMajor
+                    } else if self.get_deco(id, None, DECO_COL_MAJOR).is_some() {
+                        MatrixAxisOrder::ColumnMajor
+                    } else { return Err(Error::CorruptedSpirv); };
+                    NumericType::mat(&elem_ty, nelem, major)
                 } else { return Err(Error::CorruptedSpirv); };
                 self.insert_obj(id, SpirvObject::NumericType(num_ty))?;
             },
@@ -574,7 +589,7 @@ impl<'a> SpirvMetadata<'a> {
             },
             OP_TYPE_SAMPLED_IMAGE => {
                 let ty = self.get_img_ty(operands.read_u32()?)?;
-                self.insert_obj(id, SpirvObject::ImageType(*ty));
+                self.insert_obj(id, SpirvObject::ImageType(*ty))?;
             },
             OP_TYPE_ARRAY | OP_TYPE_RUNTIME_ARRAY => {
                 let arr_ty = ArrayType {
@@ -770,7 +785,7 @@ impl<'a> SpirvMetadata<'a> {
                         nbyte: col_nbyte,
                     };
                     SymbolNode::Repeat {
-                        is_mat: true,
+                        major: Some(num_ty.major),
                         offset: base_offset,
                         stride: mat_stride,
                         proto: Box::new(vec),
@@ -807,7 +822,7 @@ impl<'a> SpirvMetadata<'a> {
             },
             SpirvObject::ArrayType(arr_ty) => {
                 SymbolNode::Repeat {
-                    is_mat: false,
+                    major: None,
                     offset: base_offset,
                     stride: mat_stride,
                     proto: Box::new(self.ty2node(arr_ty.elem_ty, mat_stride, 0)?),
@@ -952,7 +967,9 @@ pub enum SymbolNode {
         name_map: HashMap<String, usize>,
     },
     Repeat {
-        is_mat: bool,
+        /// The axis order of a matrix. If the field is kept `None`, the repeat
+        /// represents an array.
+        major: Option<MatrixAxisOrder>,
         offset: usize,
         stride: usize,
         proto: Box<SymbolNode>,
