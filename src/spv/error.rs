@@ -5,6 +5,7 @@ use std::error;
 pub enum Error {
     CorruptedSpirv,
     UnsupportedSpirv,
+    MalformedPipeline,
 }
 
 impl fmt::Display for Error {
@@ -13,6 +14,7 @@ impl fmt::Display for Error {
         match self {
             CorruptedSpirv => write!(f, "spirv binary is corrupted"),
             UnsupportedSpirv => write!(f, "spirv binary used unsupported feature"),
+            MalformedPipeline => write!(f, "pipeline is invalid"),
         }
     }
 }

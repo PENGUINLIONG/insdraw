@@ -6,9 +6,10 @@ pub mod spv;
 use std::collections::HashMap;
 use ash::vk;
 use crate::gfx::{Context, InterfaceConfig};
-use crate::spv::{module_lab, SpirvBinary};
+use crate::spv::SpirvBinary;
 
 fn main() {
+    use log::debug;
     env_logger::init();
     /*
     let render_cfg = InterfaceConfig::new("render")
@@ -25,10 +26,11 @@ fn main() {
     */
     let spvs = collect_spirv_binaries("assets/effects/uniform-pbr");
     info!("collected spirvs: {:?}", spvs.iter().map(|x| x.0.as_ref()).collect::<Vec<&str>>());
-    let module = &spvs["uniform-pbr.frag"];
-
-
-    module_lab(module).unwrap();
+    let spvs = spvs.into_iter()
+        .map(|(_, bin)| bin)
+        .collect::<Vec<_>>();
+    let pipe = spv::PipelineMetadata::new(&spvs);
+    debug!("{:#?}", pipe);
 }
 
 

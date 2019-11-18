@@ -5,19 +5,12 @@ use std::fmt;
 use super::consts::*;
 use super::parse::{SpirvBinary, Instrs, Instr};
 use super::{Error, Result};
+use log::debug;
 
 type ObjectId = u32;
 type Decoration = u32;
 type StorageClass = u32;
 
-#[derive(Debug, Clone, Copy)]
-pub enum MatrixAxisOrder {
-    ColumnMajor,
-    RowMajor,
-}
-impl Default for MatrixAxisOrder {
-    fn default() -> MatrixAxisOrder { MatrixAxisOrder::ColumnMajor }
-}
 #[derive(Debug, Clone, Default)]
 struct NumericType {
     /// Bit-width of this type.
@@ -30,7 +23,6 @@ struct NumericType {
     nrow: Option<u32>,
     /// Column number for matrix types.
     ncol: Option<u32>,
-    major: MatrixAxisOrder,
 }
 impl NumericType {
     pub fn i32() -> NumericType {
@@ -62,9 +54,8 @@ impl NumericType {
             ..Default::default()
         }
     }
-    pub fn mat(col_ty: &NumericType, ncol: u32, major: MatrixAxisOrder) -> NumericType {
+    pub fn mat(col_ty: &NumericType, ncol: u32) -> NumericType {
         NumericType {
-            major: major,
             nbyte: col_ty.nbyte,
             is_signed: col_ty.is_signed,
             nrow: col_ty.nrow,
@@ -75,7 +66,6 @@ impl NumericType {
     pub fn nbyte(&self) -> u32 { self.nbyte }
     pub fn nrow(&self) -> u32 { self.nrow.unwrap_or(1) }
     pub fn ncol(&self) -> u32 { self.ncol.unwrap_or(1) }
-    pub fn major(&self) -> MatrixAxisOrder { self.major }
 
     pub fn is_primitive(&self) -> bool { self.nrow.is_none() && self.ncol.is_none() }
     pub fn is_vec(&self) -> bool { self.nrow.is_some() && self.ncol.is_none() }
@@ -85,7 +75,7 @@ impl NumericType {
     pub fn is_uint(&self) -> bool { Some(false) == self.is_signed }
     pub fn is_float(&self) -> bool { None == self.is_signed }
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Hash, Clone, Copy)]
 pub enum ColorFormat {
     Rgba32f = 1,
     R32f = 3,
@@ -102,7 +92,7 @@ impl ColorFormat {
         Ok(color_fmt)
     }
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Hash, Clone, Copy)]
 pub enum ImageUnitFormat {
     Color(ColorFormat),
     Sampled,
@@ -119,7 +109,7 @@ impl ImageUnitFormat {
         Ok(img_unit_fmt)
     }
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Hash, Clone, Copy)]
 pub enum ImageArrangement {
     Image1D,
     Image2D,
@@ -150,7 +140,7 @@ impl ImageArrangement {
         Ok(arng)
     }
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Hash, Clone, Copy)]
 pub struct ImageType {
     fmt: ImageUnitFormat,
     arng: ImageArrangement,
@@ -205,6 +195,7 @@ pub struct SpirvMetadata<'a> {
 impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
     type Error = Error;
     fn try_from(module: &'a SpirvBinary) -> Result<SpirvMetadata<'a>> {
+        use log::debug;
         // Don't change the order. See _2.4 Logical Layout of a Module_ of the
         // SPIR-V specification for more information.
         let mut instrs = module.instrs().peekable();
@@ -214,7 +205,7 @@ impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
         meta.populate_decos(&mut instrs)?;
         meta.populate_defs(&mut instrs)?;
         meta.populate_access(&mut instrs)?;
-        for i in 0..meta.entry_points.len() { meta.inflate_entry_point(i)?; }
+        for i in 0..meta.entry_points.len() {meta.inflate_entry_point(i)?; }
         Ok(meta)
     }
 }
@@ -349,13 +340,7 @@ impl<'a> SpirvMetadata<'a> {
                 let num_ty = if opcode == OP_TYPE_VECTOR && elem_ty.is_primitive() {
                     NumericType::vec(&elem_ty, nelem)
                 } else if opcode == OP_TYPE_MATRIX && elem_ty.is_vec() {
-                    // Column-major by default.
-                    let major = if self.get_deco(id, None, DECO_ROW_MAJOR).is_some() {
-                        MatrixAxisOrder::RowMajor
-                    } else if self.get_deco(id, None, DECO_COL_MAJOR).is_some() {
-                        MatrixAxisOrder::ColumnMajor
-                    } else { return Err(Error::CorruptedSpirv); };
-                    NumericType::mat(&elem_ty, nelem, major)
+                    NumericType::mat(&elem_ty, nelem)
                 } else { return Err(Error::CorruptedSpirv); };
                 self.insert_obj(id, SpirvObject::NumericType(num_ty))?;
             },
@@ -580,7 +565,7 @@ impl<'a> SpirvMetadata<'a> {
                         nbyte: col_nbyte,
                     };
                     SymbolNode::Repeat {
-                        major: Some(num_ty.major),
+                        major: Some(MatrixAxisOrder::ColumnMajor),
                         offset: base_offset,
                         stride: Some(mat_stride),
                         proto: Box::new(vec),
@@ -723,7 +708,8 @@ impl<'a> SpirvMetadata<'a> {
             }
             if let Some(name) = self.get_name(var_id, None) {
                 let desc_bind = DescriptorBinding::desc_bind(desc_set, bind_point);
-                if desc_name_map.insert(name.to_owned(), desc_bind).is_some() {
+                if !name.is_empty() &&
+                    desc_name_map.insert(name.to_owned(), desc_bind).is_some() {
                     return Err(Error::CorruptedSpirv);
                 }
             }
@@ -735,7 +721,6 @@ impl<'a> SpirvMetadata<'a> {
         entry_point.desc_name_map = desc_name_map;
         Ok(())
     }
-    pub fn entry_points(&self) -> &[EntryPoint] { &self.entry_points }
 }
 
 #[derive(Debug, Clone)]
@@ -754,6 +739,14 @@ pub struct AttachmentContractTemplate {
     nbyte: usize,
 }
 
+#[derive(Debug, Hash, Clone, Copy)]
+pub enum MatrixAxisOrder {
+    ColumnMajor,
+    RowMajor,
+}
+impl Default for MatrixAxisOrder {
+    fn default() -> MatrixAxisOrder { MatrixAxisOrder::ColumnMajor }
+}
 #[derive(Debug, Clone)]
 pub enum SymbolNode {
     Node {
@@ -808,7 +801,7 @@ pub enum Descriptor {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct EntryPoint {
+struct EntryPoint {
     func: u32,
     name: String,
     exec_model: u32,
@@ -817,11 +810,47 @@ pub struct EntryPoint {
     desc_binds: HashMap<DescriptorBinding, Descriptor>,
     desc_name_map: HashMap<String, DescriptorBinding>,
 }
-impl EntryPoint {
-    pub fn attr_templates(&self, bind_point: u32) -> &[VertexAttributeContractTemplate] {
-        &self.attr_templates
-    }
-    pub fn attm_templates(&self) -> &[AttachmentContractTemplate] {
-        &self.attm_templates
+
+#[derive(Debug, Default)]
+pub struct PipelineMetadata {
+    attr_templates: Vec<VertexAttributeContractTemplate>,
+    attm_templates: Vec<AttachmentContractTemplate>,
+    desc_binds: HashMap<DescriptorBinding, Descriptor>,
+    desc_name_map: HashMap<String, DescriptorBinding>,
+}
+impl PipelineMetadata {
+    pub fn new(spvs: &[SpirvBinary]) -> Result<PipelineMetadata> {
+        use std::convert::TryInto;
+        use log::debug;
+        let mut found_stages = HashSet::new();
+        let mut meta = PipelineMetadata::default();
+        for spv in spvs {
+            let spv_meta: SpirvMetadata = spv.try_into()?;
+            for entry_point in spv_meta.entry_points {
+                let EntryPoint {
+                    func, name, exec_model,
+                    attr_templates, attm_templates,
+                    desc_binds, desc_name_map
+                } = entry_point;
+                if !found_stages.insert(entry_point.exec_model) {
+                    // Stage collision.
+                    return Err(Error::MalformedPipeline);
+                }
+
+                match entry_point.exec_model {
+                    EXEC_MODEL_VERTEX => meta.attr_templates = attr_templates,
+                    EXEC_MODEL_FRAGMENT => meta.attm_templates = attm_templates,
+                    _ => {},
+                }
+                // TODO: (pengunliong) Resolve structural and naming conflicts.
+                for (desc_bind, desc) in desc_binds.into_iter() {
+                    meta.desc_binds.entry(desc_bind).or_insert(desc);
+                }
+                for (name, desc_bind) in desc_name_map.into_iter() {
+                    meta.desc_name_map.entry(name).or_insert(desc_bind);
+                }
+            }
+        }
+        Ok(meta)
     }
 }
