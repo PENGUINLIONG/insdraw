@@ -634,7 +634,7 @@ impl<'a> SpirvMetadata<'a> {
         let entry_point = &self.entry_points[i];
         let exec_model = entry_point.exec_model;
 
-        let mut attr_templates = HashMap::<u32, Vec<VertexAttributeContractTemplate>>::new();
+        let mut attr_templates = Vec::new();
         let mut attm_templates = Vec::new();
         let mut desc_binds = HashMap::new();
         let mut desc_name_map = HashMap::new();
@@ -652,10 +652,8 @@ impl<'a> SpirvMetadata<'a> {
                 STORE_CLS_INPUT if exec_model == EXEC_MODEL_VERTEX => {
                     if let SpirvObject::NumericType(num_ty) = ty {
                         let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
-                        let mut vec = &mut attr_templates.entry(bind_point)
-                            .or_default();
-                        let base_offset = vec.last()
-                            .map(|x| x.offset)
+                        let base_offset = attr_templates.last()
+                            .map(|x: &VertexAttributeContractTemplate| x.offset)
                             .unwrap_or(0);
                         for i in 0..num_ty.ncol() {
                             let template = VertexAttributeContractTemplate {
@@ -664,7 +662,7 @@ impl<'a> SpirvMetadata<'a> {
                                 offset: base_offset + col_nbyte,
                                 nbyte: col_nbyte,
                             };
-                            vec.push(template);
+                            attr_templates.push(template);
                         }
                     } else { return Err(Error::CorruptedSpirv); }
                 },
@@ -814,8 +812,16 @@ pub struct EntryPoint {
     func: u32,
     name: String,
     exec_model: u32,
-    attr_templates: HashMap<u32, Vec<VertexAttributeContractTemplate>>,
+    attr_templates: Vec<VertexAttributeContractTemplate>,
     attm_templates: Vec<AttachmentContractTemplate>,
     desc_binds: HashMap<DescriptorBinding, Descriptor>,
     desc_name_map: HashMap<String, DescriptorBinding>,
+}
+impl EntryPoint {
+    pub fn attr_templates(&self, bind_point: u32) -> &[VertexAttributeContractTemplate] {
+        &self.attr_templates
+    }
+    pub fn attm_templates(&self) -> &[AttachmentContractTemplate] {
+        &self.attm_templates
+    }
 }
