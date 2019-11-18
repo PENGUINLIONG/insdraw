@@ -1,206 +1,14 @@
-//! SPIR-V Reflection
-//!
-//! Reflect and extract SPIR-V declared materials.
-use crate::gfx::{Result, Error, Symbol};
-use std::mem::size_of;
-use std::marker::PhantomData;
+use std::convert::TryFrom;
 use std::collections::{HashMap, HashSet};
-use std::iter::{FromIterator, Peekable};
-use std::ffi::CStr;
+use std::iter::Peekable;
 use std::fmt;
-use std::ops::{Range, RangeInclusive};
-use std::convert::{TryFrom, TryInto};
-use num_derive::FromPrimitive;
-use num_traits::FromPrimitive;
-use log::{debug, info, warn, error};
+use super::consts::*;
+use super::parse::{SpirvBinary, Instrs, Instr};
+use super::{Error, Result};
 
-const OP_ENTRY_POINT: u32 = 15;
-
-const OP_NAME: u32 = 5;
-const OP_MEMBER_NAME: u32 = 6;
-const NAME_RANGE: RangeInclusive<u32> = OP_NAME..=OP_MEMBER_NAME;
-
-const OP_DECORATE: u32 = 71;
-const OP_MEMBER_DECORATE: u32 = 72;
-const DECO_RANGE: RangeInclusive<u32> = OP_DECORATE..=OP_MEMBER_DECORATE;
-
-// Don't need this: Not a resource type. But kept for the range.
-const OP_TYPE_VOID: u32 = 19;
-const OP_TYPE_BOOL: u32 = 20;
-const OP_TYPE_INT: u32 = 21;
-const OP_TYPE_FLOAT: u32 = 22;
-const OP_TYPE_VECTOR: u32 = 23;
-const OP_TYPE_MATRIX: u32 = 24;
-const OP_TYPE_IMAGE: u32 = 25;
-// Not in GLSL.
-// const OP_TYPE_SAMPLER: u32 = 26;
-const OP_TYPE_SAMPLED_IMAGE: u32 = 27;
-const OP_TYPE_ARRAY: u32 = 28;
-const OP_TYPE_RUNTIME_ARRAY: u32 = 29;
-const OP_TYPE_STRUCT: u32 = 30;
-const OP_TYPE_POINTER: u32 = 32;
-// Don't need this: Not a resource type. But kept for the range.
-const OP_TYPE_FUNCTION: u32 = 33;
-const TYPE_RANGE: RangeInclusive<u32> = OP_TYPE_VOID..=OP_TYPE_FUNCTION;
-
-const OP_CONSTANT_TRUE: u32 = 41;
-const OP_CONSTANT_FALSE: u32 = 42;
-const OP_CONSTANT: u32 = 43;
-const OP_CONSTANT_COMPOSITE: u32 = 44;
-const OP_CONSTANT_SAMPLER: u32 = 45;
-const OP_CONSTANT_NULL: u32 = 46;
-const CONST_RANGE: RangeInclusive<u32> = OP_CONSTANT_TRUE..=OP_CONSTANT_NULL;
-
-const OP_SPEC_CONSTANT_TRUE: u32 = 48;
-const OP_SPEC_CONSTANT_FALSE: u32 = 49;
-const OP_SPEC_CONSTANT: u32 = 50;
-const OP_SPEC_CONSTANT_COMPOSITE: u32 = 51;
-const OP_SPEC_CONSTANT_OP: u32 = 52;
-const SPEC_CONST_RANGE: RangeInclusive<u32> = OP_SPEC_CONSTANT_TRUE..=OP_SPEC_CONSTANT_OP;
-
-const OP_VARIABLE: u32 = 59;
-
-const OP_FUNCTION: u32 = 54;
-const OP_FUNCTION_END: u32 = 56;
-const OP_FUNCTION_CALL: u32 = 57;
-const OP_ACCESS_CHAIN: u32 = 65;
-const OP_LOAD: u32 = 61;
-const OP_STORE: u32 = 62;
-const OP_IN_BOUNDS_ACCESS_CHAIN: u32 = 66;
-
-
-const EXEC_MODEL_VERTEX: u32 = 0;
-const EXEC_MODEL_FRAGMENT: u32 = 4;
-
-
-const DECO_SPEC_ID: u32 = 1;
-const DECO_BLOCK: u32 = 2;
-const DECO_BUFFER_BLOCK: u32 = 3;
-const DECO_ROW_MAJOR: u32 = 4;
-const DECO_COL_MAJOR: u32 = 5;
-const DECO_ARRAY_STRIDE: u32 = 6;
-const DECO_MATRIX_STRIDE: u32 = 7;
-// Don't need this: Built-in variables will not be attribute nor attachment.
-// const DECO_BUILT_IN: u32 = 11;
-const DECO_LOCATION: u32 = 30;
-const DECO_BINDING: u32 = 33;
-const DECO_DESCRIPTOR_SET: u32 = 34;
-const DECO_OFFSET: u32 = 35;
-const DECO_INPUT_ATTACHMENT_INDEX: u32 = 43;
-
-
-const STORE_CLS_UNIFORM_CONSTANT: u32 = 0;
-const STORE_CLS_INPUT: u32 = 1;
-const STORE_CLS_UNIFORM: u32 = 2;
-const STORE_CLS_OUTPUT: u32 = 3;
-// Texture calls to sampler object will translate to function class.
-const STORE_CLS_FUNCTION: u32 = 7;
-const STORE_CLS_PUSH_CONSTANT: u32 = 9;
-const STORE_CLS_STORAGE_BUFFER: u32 = 12;
-
-
-const DIM_IMAGE_1D: u32 = 0;
-const DIM_IMAGE_2D: u32 = 1;
-const DIM_IMAGE_3D: u32 = 2;
-const DIM_IMAGE_CUBE: u32 = 3;
-const DIM_IMAGE_SUBPASS_DATA: u32 = 6;
-
-
-const IMG_UNIT_FMT_RGBA32F: u32 = 1;
-const IMG_UNIT_FMT_R32F: u32 = 3;
-const IMG_UNIT_FMT_RGBA8: u32 = 4;
-
-
-
-
-
-pub struct SpirvBinary(Vec<u32>);
-impl From<Vec<u32>> for SpirvBinary {
-    fn from(x: Vec<u32>) -> Self { SpirvBinary(x) }
-}
-impl FromIterator<u32> for SpirvBinary {
-    fn from_iter<I: IntoIterator<Item=u32>>(iter: I) -> Self { SpirvBinary(iter.into_iter().collect::<Vec<u32>>()) }
-}
-
-impl SpirvBinary {
-    pub fn instrs<'a>(&'a self) -> Instrs<'a> {
-        const HEADER_LEN: usize = 5;
-        Instrs(&self.0[HEADER_LEN..])
-    }
-}
-
-
-pub struct Instrs<'a>(&'a [u32]);
-impl<'a> Iterator for Instrs<'a> {
-    type Item = Instr<'a>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(head) = self.0.first() {
-            let len = ((*head as u32) >> 16) as usize;
-            if len <= self.0.len() {
-                let opcode = head & 0xFFFF;
-                let instr = Instr {
-                    opcode: opcode,
-                    operands: &self.0[1..len],
-                };
-                self.0 = &self.0[len..];
-                return Some(instr);
-            }
-        }
-        None
-    }
-}
-
-
-#[derive(Debug)]
-pub struct Instr<'a> {
-    opcode: u32,
-    operands: &'a [u32],
-}
-impl<'a> Instr<'a> {
-    /// Get the opcode of the instruction.
-    pub fn opcode(&self) -> u32 { self.opcode }
-    /// Get the word count of the instruction, including the first word
-    /// containing the word count and opcode.
-    pub fn word_count(&self) -> usize { self.operands.len() + 1 }
-    /// Get an instruction operand reader. The reader does NO boundary checking
-    /// so the user code MUST make sure the implementation follows the
-    /// specification.
-    pub fn operands(&self) -> Operands<'a> {
-        Operands(self.operands)
-    }
-}
-
-pub struct Operands<'a>(&'a [u32]);
-impl<'a> Operands<'a> {
-    pub fn read_bool(&mut self) -> Result<bool> { self.read_u32().map(|x| x != 0) }
-    pub fn read_u32(&mut self) -> Result<u32> {
-        if let Some(x) = self.0.first() {
-            self.0 = &self.0[1..];
-            Ok(*x)
-        } else { Err(Error::CorruptedSpirv) }
-    }
-    pub fn read_str(&mut self) -> Result<&'a str> {
-        use std::os::raw::c_char;
-        let ptr = self.0.as_ptr() as *const c_char;
-        let char_slice = unsafe { std::slice::from_raw_parts(ptr, self.0.len() * 4) };
-        if let Some(nul_pos) = char_slice.into_iter().position(|x| *x == 0) {
-            let nword = nul_pos / 4 + 1;
-            self.0 = &self.0[nword..];
-            if let Ok(string) = unsafe { CStr::from_ptr(ptr) }.to_str() {
-                return Ok(string);
-            }
-        }
-        Err(Error::CorruptedSpirv)
-    }
-    pub fn read_list(&mut self) -> Result<&'a [u32]> {
-        let rv = self.0;
-        self.0 = &[];
-        Ok(rv)
-    }
-}
-
-
-
+type ObjectId = u32;
+type Decoration = u32;
+type StorageClass = u32;
 
 #[derive(Debug, Clone, Copy)]
 pub enum MatrixAxisOrder {
@@ -211,7 +19,7 @@ impl Default for MatrixAxisOrder {
     fn default() -> MatrixAxisOrder { MatrixAxisOrder::ColumnMajor }
 }
 #[derive(Debug, Clone, Default)]
-pub struct NumericType {
+struct NumericType {
     /// Bit-width of this type.
     nbyte: u32,
     /// For integral types the field indicate it's signed ness, true for signed
@@ -348,29 +156,34 @@ pub struct ImageType {
     arng: ImageArrangement,
 }
 #[derive(Debug, Clone, Copy)]
-pub struct ArrayType {
+struct ArrayType {
     elem_ty: ObjectId,
     nelem: Option<u32>,
 }
 #[derive(Debug, Clone, Copy)]
-pub struct StructMember<'a> {
+struct StructMember<'a> {
     ty: ObjectId,
     name: Option<&'a str>,
     offset: Option<usize>,
 }
 #[derive(Debug, Clone)]
-pub struct Variable {
+struct Variable {
     ty: ObjectId,
     store_cls: StorageClass,
 }
 #[derive(Debug, Clone)]
-pub struct Constant<'a> {
+struct Constant<'a> {
     ty: ObjectId,
     value: &'a [u32],
 }
-pub type ObjectId = u32;
+#[derive(Default, Debug, Clone)]
+struct Function {
+    accessed_vars: HashSet<ObjectId>,
+    calls: HashSet<ObjectId>,
+}
+
 #[derive(Debug, Clone)]
-pub enum SpirvObject<'a> {
+enum SpirvObject<'a> {
     NumericType(NumericType),
     ImageType(Option<ImageType>),
     ArrayType(ArrayType),
@@ -381,29 +194,13 @@ pub enum SpirvObject<'a> {
     Function(Function),
 }
 
-type Decoration = u32;
-type StorageClass = u32;
-#[derive(Debug, Default, Clone)]
-pub struct ElementMetadata<'a> {
-    name: Option<&'a str>,
-    decos: HashMap<Decoration, &'a [u32]>,
-}
-pub struct ElementMetadataMap<'a>(HashMap<(u32, Option<u32>), ElementMetadata<'a>>);
-
-#[derive(Default, Debug, Clone)]
-pub struct Function {
-    accessed_vars: HashSet<ObjectId>,
-    calls: HashSet<ObjectId>,
-}
-
-use crate::gfx::contract::{VertexAttributeContract, AttachmentContract, PipelineStageContract, DescriptorContract};
 
 #[derive(Default, Debug)]
-struct SpirvMetadata<'a> {
-    pub entry_points: Vec<EntryPoint>,
-    pub name_map: HashMap<(ObjectId, Option<u32>), &'a str>,
-    pub deco_map: HashMap<(ObjectId, Option<u32>, Decoration), &'a [u32]>,
-    pub obj_map: HashMap<ObjectId, SpirvObject<'a>>,
+pub struct SpirvMetadata<'a> {
+    entry_points: Vec<EntryPoint>,
+    name_map: HashMap<(ObjectId, Option<u32>), &'a str>,
+    deco_map: HashMap<(ObjectId, Option<u32>, Decoration), &'a [u32]>,
+    obj_map: HashMap<ObjectId, SpirvObject<'a>>,
 }
 impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
     type Error = Error;
@@ -436,12 +233,12 @@ impl<'a> SpirvMetadata<'a> {
             .and_then(|x| match x { SpirvObject::ImageType(ty) => Some(ty), _ => None })
             .ok_or(Error::CorruptedSpirv)
     }
-    fn get_arr_ty(&self, id: ObjectId) -> Result<&ArrayType> {
+    fn _get_arr_ty(&self, id: ObjectId) -> Result<&ArrayType> {
         self.obj_map.get(&id)
             .and_then(|x| match x { SpirvObject::ArrayType(ty) => Some(ty), _ => None })
             .ok_or(Error::CorruptedSpirv)
     }
-    fn get_struct_ty(&self, id: ObjectId) -> Result<&Vec<StructMember<'a>>> {
+    fn _get_struct_ty(&self, id: ObjectId) -> Result<&Vec<StructMember<'a>>> {
         self.obj_map.get(&id)
             .and_then(|x| match x { SpirvObject::StructType(ty) => Some(ty), _ => None })
             .ok_or(Error::CorruptedSpirv)
@@ -641,9 +438,7 @@ impl<'a> SpirvMetadata<'a> {
         let mut operands = instr.operands();
         let ty = operands.read_u32()?;
         let id = operands.read_u32()?;
-        let store_cls = operands.read_u32()
-            .map(FromPrimitive::from_u32)?
-            .ok_or(Error::UnsupportedSpirv)?;
+        let store_cls = operands.read_u32()?;
         let var = Variable {
             ty: ty,
             store_cls: store_cls,
@@ -842,16 +637,19 @@ impl<'a> SpirvMetadata<'a> {
         let mut attr_templates = HashMap::<u32, Vec<VertexAttributeContractTemplate>>::new();
         let mut attm_templates = Vec::new();
         let mut desc_binds = HashMap::new();
+        let mut desc_name_map = HashMap::new();
 
         for var_id in self.collect_fn_vars(entry_point.func) {
             let var = &self.get_var(var_id)?;
             let (ty_id, ty) = self.resolve_ref(var.ty)?;
+            let desc_set = self.get_deco_u32(var_id, None, DECO_DESCRIPTOR_SET)
+                .unwrap_or(0);
+            let bind_point = self.get_deco_u32(var_id, None, DECO_BINDING)
+                .unwrap_or(0);
+            let location = self.get_deco_u32(var_id, None, DECO_LOCATION)
+                .unwrap_or(0);
             match var.store_cls {
                 STORE_CLS_INPUT if exec_model == EXEC_MODEL_VERTEX => {
-                    let bind_point = self.get_deco_u32(var_id, None, DECO_BINDING)
-                        .unwrap_or(0);
-                    let location = self.get_deco_u32(var_id, None, DECO_LOCATION)
-                        .unwrap_or(0);
                     if let SpirvObject::NumericType(num_ty) = ty {
                         let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
                         let mut vec = &mut attr_templates.entry(bind_point)
@@ -871,8 +669,6 @@ impl<'a> SpirvMetadata<'a> {
                     } else { return Err(Error::CorruptedSpirv); }
                 },
                 STORE_CLS_OUTPUT if exec_model == EXEC_MODEL_FRAGMENT => {
-                    let mut location = self.get_deco_u32(var_id, None, DECO_LOCATION)
-                        .unwrap_or(0);
                     if let SpirvObject::NumericType(num_ty) = ty {
                         // Matrix is not valid attachment type.
                         if num_ty.is_mat() { return Err(Error::CorruptedSpirv); }
@@ -885,10 +681,6 @@ impl<'a> SpirvMetadata<'a> {
                     } else { return Err(Error::CorruptedSpirv); }
                 },
                 STORE_CLS_UNIFORM | STORE_CLS_STORAGE_BUFFER => {
-                    let desc_set = self.get_deco_u32(var_id, None, DECO_DESCRIPTOR_SET)
-                        .unwrap_or(0);
-                    let bind_point = self.get_deco_u32(var_id, None, DECO_BINDING)
-                        .unwrap_or(0);
                     let sym_node = self.ty2node(ty_id, 0, 0)?;
                     let desc = if var.store_cls == STORE_CLS_STORAGE_BUFFER ||
                         self.get_deco(var_id, None, DECO_BUFFER_BLOCK).is_some() {
@@ -904,10 +696,6 @@ impl<'a> SpirvMetadata<'a> {
                 },
                 STORE_CLS_UNIFORM_CONSTANT => {
                     if let SpirvObject::ImageType(img_ty) = ty {
-                        let desc_set = self.get_deco_u32(var_id, None, DECO_DESCRIPTOR_SET)
-                            .unwrap_or(0);
-                        let bind_point = self.get_deco_u32(var_id, None, DECO_BINDING)
-                            .unwrap_or(0);
                         let desc = if let Some(img_ty) = img_ty {
                             Descriptor::Image(*img_ty)
                         } else {
@@ -935,18 +723,25 @@ impl<'a> SpirvMetadata<'a> {
                 },
                 _ => {},
             }
+            if let Some(name) = self.get_name(var_id, None) {
+                let desc_bind = DescriptorBinding::desc_bind(desc_set, bind_point);
+                if desc_name_map.insert(name.to_owned(), desc_bind).is_some() {
+                    return Err(Error::CorruptedSpirv);
+                }
+            }
         }
         let mut entry_point = &mut self.entry_points[i];
         entry_point.attr_templates = attr_templates;
         entry_point.attm_templates = attm_templates;
         entry_point.desc_binds = desc_binds;
+        entry_point.desc_name_map = desc_name_map;
         Ok(())
     }
     pub fn entry_points(&self) -> &[EntryPoint] { &self.entry_points }
 }
 
 #[derive(Debug, Clone)]
-struct VertexAttributeContractTemplate {
+pub struct VertexAttributeContractTemplate {
     bind_point: u32,
     location: u32,
     /// Offset in each set of vertex data.
@@ -955,7 +750,7 @@ struct VertexAttributeContractTemplate {
     nbyte: usize,
 }
 #[derive(Debug, Clone)]
-struct AttachmentContractTemplate {
+pub struct AttachmentContractTemplate {
     location: u32,
     /// Total byte count at this location.
     nbyte: usize,
@@ -998,9 +793,9 @@ impl DescriptorBinding {
 impl fmt::Debug for DescriptorBinding {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if let Some((set, bind)) = self.0 {
-            write!(f, "(Set = {}, Bind = {})", set, bind)
+            write!(f, "(set={}, bind={})", set, bind)
         } else {
-            write!(f, "(PushConstant)")
+            write!(f, "(push_constant)")
         }
     }
 }
@@ -1015,20 +810,12 @@ pub enum Descriptor {
 }
 
 #[derive(Debug, Default, Clone)]
-struct EntryPoint {
+pub struct EntryPoint {
     func: u32,
     name: String,
     exec_model: u32,
     attr_templates: HashMap<u32, Vec<VertexAttributeContractTemplate>>,
     attm_templates: Vec<AttachmentContractTemplate>,
     desc_binds: HashMap<DescriptorBinding, Descriptor>,
-}
-
-pub fn module_lab(module: &SpirvBinary) -> crate::gfx::Result<()> {
-    use std::ops::Deref;
-    use log::debug;
-    let meta: SpirvMetadata = module.try_into()?;
-    debug!("{:#?}", meta.entry_points());
-
-    Ok(())
+    desc_name_map: HashMap<String, DescriptorBinding>,
 }

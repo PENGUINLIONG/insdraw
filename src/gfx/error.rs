@@ -9,8 +9,6 @@ pub enum Error {
     RuntimeError(InstanceError),
     VulkanError(VkResultCode),
     NoCapablePhysicalDevice,
-    CorruptedSpirv,
-    UnsupportedSpirv,
     InflexibleMemory,
     InvalidOperation,
 }
@@ -22,8 +20,6 @@ impl fmt::Display for Error {
             RuntimeError(err) => write!(f, "{}", err),
             VulkanError(errcode) => write!(f, "{}", errcode.as_raw()),
             NoCapablePhysicalDevice => write!(f, "no capable device available"),
-            CorruptedSpirv => write!(f, "spirv binary is corrupted"),
-            UnsupportedSpirv => write!(f, "spirv binary used unsupported feature"),
             InflexibleMemory => write!(f, "memory cannot be resized"),
             InvalidOperation => write!(f, "an invalid operation was invoked internally"),
         }
