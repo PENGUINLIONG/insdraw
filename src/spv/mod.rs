@@ -3,6 +3,7 @@
 //! Reflect and extract SPIR-V declared materials.
 mod consts;
 mod parse;
+mod instr;
 mod reflect;
 mod error;
 mod sym;

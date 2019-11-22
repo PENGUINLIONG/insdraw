@@ -1,15 +1,12 @@
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::collections::{HashMap, HashSet};
 use std::iter::Peekable;
 use std::fmt;
 use super::consts::*;
+use super::instr::*;
 use super::parse::{SpirvBinary, Instrs, Instr};
 use super::{Error, Result};
 use log::debug;
-
-type ObjectId = u32;
-type Decoration = u32;
-type StorageClass = u32;
 
 #[derive(Debug, Clone, Default)]
 struct NumericType {
@@ -25,24 +22,16 @@ struct NumericType {
     ncol: Option<u32>,
 }
 impl NumericType {
-    pub fn i32() -> NumericType {
+    pub fn int(nbyte: u32, is_signed: bool) -> NumericType {
         NumericType {
             nbyte: 4,
-            is_signed: Some(true),
+            is_signed: Some(is_signed),
             ..Default::default()
         }
     }
-    pub fn u32() -> NumericType {
+    pub fn float(nbyte: u32) -> NumericType {
         NumericType {
             nbyte: 4,
-            is_signed: Some(false),
-            ..Default::default()
-        }
-    }
-    pub fn f32() -> NumericType {
-        NumericType {
-            nbyte: 4,
-            is_signed: None,
             ..Default::default()
         }
     }
@@ -99,11 +88,11 @@ pub enum ImageUnitFormat {
     Depth,
 }
 impl ImageUnitFormat {
-    pub fn from_spv_def(is_sampled: bool, is_depth: bool, color_fmt: u32) -> Result<ImageUnitFormat> {
+    pub fn from_spv_def(is_sampled: u32, is_depth: u32, color_fmt: u32) -> Result<ImageUnitFormat> {
         let img_unit_fmt = match (is_sampled, is_depth, color_fmt) {
-            (true, false, _) => ImageUnitFormat::Sampled,
-            (true, true, _) => ImageUnitFormat::Depth,
-            (false, false, color_fmt) => ImageUnitFormat::Color(ColorFormat::from_spv_def(color_fmt)?),
+            (1, 0, _) => ImageUnitFormat::Sampled,
+            (1, 1, _) => ImageUnitFormat::Depth,
+            (2, 0, color_fmt) => ImageUnitFormat::Color(ColorFormat::from_spv_def(color_fmt)?),
             _ => return Err(Error::UnsupportedSpirv),
         };
         Ok(img_unit_fmt)
@@ -147,29 +136,29 @@ pub struct ImageType {
 }
 #[derive(Debug, Clone, Copy)]
 struct ArrayType {
-    elem_ty: ObjectId,
+    elem_ty: InstrId,
     nelem: Option<u32>,
 }
 #[derive(Debug, Clone, Copy)]
 struct StructMember<'a> {
-    ty: ObjectId,
+    ty: InstrId,
     name: Option<&'a str>,
     offset: Option<usize>,
 }
 #[derive(Debug, Clone)]
 struct Variable {
-    ty: ObjectId,
+    ty: InstrId,
     store_cls: StorageClass,
 }
 #[derive(Debug, Clone)]
 struct Constant<'a> {
-    ty: ObjectId,
+    ty: InstrId,
     value: &'a [u32],
 }
 #[derive(Default, Debug, Clone)]
 struct Function {
-    accessed_vars: HashSet<ObjectId>,
-    calls: HashSet<ObjectId>,
+    accessed_vars: HashSet<InstrId>,
+    calls: HashSet<InstrId>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,7 +167,7 @@ enum SpirvObject<'a> {
     ImageType(Option<ImageType>),
     ArrayType(ArrayType),
     StructType(Vec<StructMember<'a>>),
-    PointerType(ObjectId), // Struct ID.
+    PointerType(InstrId), // Struct ID.
     Variable(Variable),
     Constant(Constant<'a>),
     Function(Function),
@@ -188,9 +177,9 @@ enum SpirvObject<'a> {
 #[derive(Default, Debug)]
 pub struct SpirvMetadata<'a> {
     entry_points: Vec<EntryPoint>,
-    name_map: HashMap<(ObjectId, Option<u32>), &'a str>,
-    deco_map: HashMap<(ObjectId, Option<u32>, Decoration), &'a [u32]>,
-    obj_map: HashMap<ObjectId, SpirvObject<'a>>,
+    name_map: HashMap<(InstrId, Option<u32>), &'a str>,
+    deco_map: HashMap<(InstrId, Option<u32>, Decoration), &'a [u32]>,
+    obj_map: HashMap<InstrId, SpirvObject<'a>>,
 }
 impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
     type Error = Error;
@@ -210,51 +199,51 @@ impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
     }
 }
 impl<'a> SpirvMetadata<'a> {
-    fn insert_obj(&mut self, id: ObjectId, obj: SpirvObject<'a>) -> Result<()> {
+    fn insert_obj(&mut self, id: InstrId, obj: SpirvObject<'a>) -> Result<()> {
         if self.obj_map.insert(id, obj).is_some() { return Err(Error::CorruptedSpirv); }
         Ok(())
     }
-    fn get_num_ty(&self, id: ObjectId) -> Result<&NumericType> {
+    fn get_num_ty(&self, id: InstrId) -> Result<&NumericType> {
         self.obj_map.get(&id)
             .and_then(|x| match x { SpirvObject::NumericType(ty) => Some(ty), _ => None })
             .ok_or(Error::CorruptedSpirv)
     }
-    fn get_img_ty(&self, id: ObjectId) -> Result<&Option<ImageType>> {
+    fn get_img_ty(&self, id: InstrId) -> Result<&Option<ImageType>> {
         self.obj_map.get(&id)
             .and_then(|x| match x { SpirvObject::ImageType(ty) => Some(ty), _ => None })
             .ok_or(Error::CorruptedSpirv)
     }
-    fn _get_arr_ty(&self, id: ObjectId) -> Result<&ArrayType> {
+    fn _get_arr_ty(&self, id: InstrId) -> Result<&ArrayType> {
         self.obj_map.get(&id)
             .and_then(|x| match x { SpirvObject::ArrayType(ty) => Some(ty), _ => None })
             .ok_or(Error::CorruptedSpirv)
     }
-    fn _get_struct_ty(&self, id: ObjectId) -> Result<&Vec<StructMember<'a>>> {
+    fn _get_struct_ty(&self, id: InstrId) -> Result<&Vec<StructMember<'a>>> {
         self.obj_map.get(&id)
             .and_then(|x| match x { SpirvObject::StructType(ty) => Some(ty), _ => None })
             .ok_or(Error::CorruptedSpirv)
     }
-    fn get_ptr_ty(&self, id: ObjectId) -> Result<&ObjectId> {
+    fn get_ptr_ty(&self, id: InstrId) -> Result<&InstrId> {
         self.obj_map.get(&id)
             .and_then(|x| match x { SpirvObject::PointerType(id) => Some(id), _ => None })
             .ok_or(Error::CorruptedSpirv)
     }
-    fn get_var(&self, id: ObjectId) -> Result<&Variable> {
+    fn get_var(&self, id: InstrId) -> Result<&Variable> {
         self.obj_map.get(&id)
             .and_then(|x| match x { SpirvObject::Variable(ty) => Some(ty), _ => None })
             .ok_or(Error::CorruptedSpirv)
     }
-    fn get_const(&self, id: ObjectId) -> Result<&Constant<'a>> {
+    fn get_const(&self, id: InstrId) -> Result<&Constant<'a>> {
         self.obj_map.get(&id)
             .and_then(|x| match x { SpirvObject::Constant(ty) => Some(ty), _ => None })
             .ok_or(Error::CorruptedSpirv)
     }
-    fn get_fn(&self, id: ObjectId) -> Result<&Function> {
+    fn get_fn(&self, id: InstrId) -> Result<&Function> {
         self.obj_map.get(&id)
             .and_then(|x| match x { SpirvObject::Function(ty) => Some(ty), _ => None })
             .ok_or(Error::CorruptedSpirv)
     }
-    fn get_fn_or_default_mut(&mut self, id: ObjectId) -> Result<&mut Function> {
+    fn get_fn_or_default_mut(&mut self, id: InstrId) -> Result<&mut Function> {
         let obj = self.obj_map.entry(id)
             .or_insert_with(|| SpirvObject::Function(Function::default()));
         match obj { SpirvObject::Function(ty) => Ok(ty), _ => Err(Error::CorruptedSpirv) }
@@ -267,11 +256,11 @@ impl<'a> SpirvMetadata<'a> {
         }
         while let Some(instr) = instrs.peek() {
             if instr.opcode() != OP_ENTRY_POINT { break; }
-            let mut operands = instr.operands();
+            let op = OpEntryPoint::try_from(instr)?;
             let entry_point = EntryPoint {
-                exec_model: operands.read_u32()?,
-                func: operands.read_u32()?,
-                name: operands.read_str()?.to_owned(),
+                exec_model: op.exec_model,
+                func: op.func_id,
+                name: op.name.to_string(),
                 ..Default::default()
             };
             self.entry_points.push(entry_point);
@@ -286,13 +275,19 @@ impl<'a> SpirvMetadata<'a> {
             if !NAME_RANGE.contains(&instr.opcode()) { instrs.next(); } else { break; }
         }
         while let Some(instr) = instrs.peek() {
-            let opcode = instr.opcode();
-            if !NAME_RANGE.contains(&opcode) { break; }
-            let mut operands = instr.operands();
-            let target_id = operands.read_u32()?;
-            let member_id = if opcode == OP_MEMBER_NAME { Some(operands.read_u32()?) } else { None };
-            let name = operands.read_str()?;
-            self.name_map.insert((target_id, member_id), name);
+            let (key, value) = match instr.opcode() {
+                OP_NAME => {
+                    let op = OpName::try_from(instr)?;
+                    ((op.target_id, None), op.name)
+                },
+                OP_MEMBER_NAME => {
+                    let op = OpMemberName::try_from(instr)?;
+                    ((op.target_id, Some(op.member_idx)), op.name)
+                },
+                _ => break,
+            };
+            let collision = self.name_map.insert(key, value);
+            if collision.is_some() { return Err(Error::CorruptedSpirv); }
             instrs.next();
         }
         Ok(())
@@ -302,146 +297,123 @@ impl<'a> SpirvMetadata<'a> {
             if !DECO_RANGE.contains(&instr.opcode()) { instrs.next(); } else { break; }
         }
         while let Some(instr) = instrs.peek() {
-            let opcode = instr.opcode();
-            if !DECO_RANGE.contains(&opcode) { break; }
-            let mut operands = instr.operands();
-            let target_id = operands.read_u32()?;
-            let member_id = if opcode == OP_MEMBER_DECORATE { Some(operands.read_u32()?) } else { None };
-            let deco = operands.read_u32()?;
-            let params = operands.read_list()?;
-            if self.deco_map.insert((target_id, member_id, deco), params).is_some() {
-                return Err(Error::CorruptedSpirv);
-            }
+            let (key, value) = match instr.opcode() {
+                OP_DECORATE => {
+                    let op = OpDecorate::try_from(instr)?;
+                    ((op.target_id, None, op.deco), op.params)
+                }
+                OP_MEMBER_DECORATE => {
+                    let op = OpMemberDecorate::try_from(instr)?;
+                    ((op.target_id, Some(op.member_idx), op.deco), op.params)
+                },
+                _ => break,
+            };
+            let collision = self.deco_map.insert(key, value);
+            if collision.is_some() { return Err(Error::CorruptedSpirv); }
             instrs.next();
         }
         Ok(())
     }
     fn populate_one_ty(&mut self, instr: &Instr<'a>) -> Result<()> {
-        let mut operands = instr.operands();
-        let id = operands.read_u32()?;
-        let opcode = instr.opcode();
-        let ty = match opcode {
+        let (key, value) = match instr.opcode() {
             OP_TYPE_VOID | OP_TYPE_FUNCTION => { return Ok(()) },
             OP_TYPE_BOOL => return Err(Error::UnsupportedSpirv),
-            OP_TYPE_INT | OP_TYPE_FLOAT => {
-                let nbyte = operands.read_u32()? >> 3;
-                if nbyte != 4 { return Err(Error::UnsupportedSpirv) }
-                let is_signed = if opcode == OP_TYPE_INT { Some(operands.read_bool()?) } else { None };
-                let num_ty = match is_signed {
-                    Some(true) => NumericType::i32(),
-                    Some(false) => NumericType::u32(),
-                    None => NumericType::f32(),
-                };
-                self.insert_obj(id, SpirvObject::NumericType(num_ty))?;
+            OP_TYPE_INT => {
+                let op = OpTypeInt::try_from(instr)?;
+                let num_ty = NumericType::int(op.nbyte >> 3, op.is_signed);
+                (op.ty_id, SpirvObject::NumericType(num_ty))
+            }
+            OP_TYPE_FLOAT => {
+                let op = OpTypeFloat::try_from(instr)?;
+                let num_ty = NumericType::float(op.nbyte >> 3);
+                (op.ty_id, SpirvObject::NumericType(num_ty))
             },
-            OP_TYPE_VECTOR | OP_TYPE_MATRIX => {
-                let elem_ty = self.get_num_ty(operands.read_u32()?)?;
-                let nelem = operands.read_u32()?;
-                let num_ty = if opcode == OP_TYPE_VECTOR && elem_ty.is_primitive() {
-                    NumericType::vec(&elem_ty, nelem)
-                } else if opcode == OP_TYPE_MATRIX && elem_ty.is_vec() {
-                    NumericType::mat(&elem_ty, nelem)
-                } else { return Err(Error::CorruptedSpirv); };
-                self.insert_obj(id, SpirvObject::NumericType(num_ty))?;
+            OP_TYPE_VECTOR => {
+                let op = OpTypeVector::try_from(instr)?;
+                let num_ty = self.get_num_ty(op.num_ty_id)?;
+                let vec_ty = NumericType::vec(&num_ty, op.nnum);
+                (op.ty_id, SpirvObject::NumericType(vec_ty))
+            },
+            OP_TYPE_MATRIX => {
+                let op = OpTypeMatrix::try_from(instr)?;
+                let vec_ty = self.get_num_ty(op.vec_ty_id)?;
+                let mat_ty = NumericType::mat(&vec_ty, op.nvec);
+                (op.ty_id, SpirvObject::NumericType(mat_ty))
             },
             OP_TYPE_IMAGE => {
-                let _unit_ty = operands.read_u32()?;
-                let dim = operands.read_u32()?;
-                if dim == DIM_IMAGE_SUBPASS_DATA {
-                    self.insert_obj(id, SpirvObject::ImageType(None))?;
+                let op = OpTypeImage::try_from(instr)?;
+                let img_ty = if op.dim == DIM_IMAGE_SUBPASS_DATA {
+                    SpirvObject::ImageType(None)
                 } else {
-                    let is_depth = match operands.read_u32()? {
-                        0 => false, 1 => true, _ => return Err(Error::UnsupportedSpirv),
-                    };
-                    let is_array = operands.read_bool()?;
-                    let is_multisampled = operands.read_bool()?;
-                    let is_sampled = match operands.read_u32()? {
-                        1 => true, 2 => false, _ => return Err(Error::UnsupportedSpirv),
-                    };
-                    let color_fmt = operands.read_u32()?;
-                    
                     // Only unit types allowed to be stored in storage images can
                     // have given format.
-                    let img_ty = ImageType {
-                        fmt: ImageUnitFormat::from_spv_def(is_sampled, is_depth, color_fmt)?,
-                        arng: ImageArrangement::from_spv_def(dim, is_array, is_multisampled)?,
-                    };
-                    self.insert_obj(id, SpirvObject::ImageType(Some(img_ty)))?;
-                }
+                    let fmt = ImageUnitFormat::from_spv_def(op.is_sampled, op.is_depth, op.color_fmt)?;
+                    let arng = ImageArrangement::from_spv_def(op.dim, op.is_array, op.is_multisampled)?;
+                    let img_ty = ImageType { fmt: fmt, arng: arng };
+                    SpirvObject::ImageType(Some(img_ty))
+                };
+                (op.ty_id, img_ty)
             },
             OP_TYPE_SAMPLED_IMAGE => {
-                let ty = self.get_img_ty(operands.read_u32()?)?;
-                self.insert_obj(id, SpirvObject::ImageType(*ty))?;
+                let op = OpTypeSampledImage::try_from(instr)?;
+                let img_ty = self.get_img_ty(op.img_ty_id)?;
+                (op.ty_id, SpirvObject::ImageType(*img_ty))
             },
-            OP_TYPE_ARRAY | OP_TYPE_RUNTIME_ARRAY => {
-                let arr_ty = ArrayType {
-                    elem_ty: operands.read_u32()?,
-                    nelem: if instr.opcode() == OP_TYPE_ARRAY {
-                        let nelem = self.get_const(operands.read_u32()?)
-                            .and_then(|constant| {
-                                let num_ty = self.get_num_ty(constant.ty)?;
-                                if num_ty.nbyte == 4 && num_ty.is_uint() && num_ty.is_primitive() {
-                                    if let Some(nelem) = constant.value.get(0) {
-                                        return Ok(nelem);
-                                    }
-                                }
-                                return Err(Error::CorruptedSpirv);
-                            })?;
-                        Some(*nelem)
-                    } else { None },
-                };
-                self.insert_obj(id, SpirvObject::ArrayType(arr_ty))?;
+            OP_TYPE_ARRAY => {
+                let op = OpTypeArray::try_from(instr)?;
+                let nrepeat = self.get_const(op.nrepeat_const_id)
+                    .and_then(|constant| {
+                        let num_ty = self.get_num_ty(constant.ty)?;
+                        if num_ty.nbyte == 4 && num_ty.is_uint() && num_ty.is_primitive() {
+                            if let Some(nelem) = constant.value.get(0) {
+                                return Ok(nelem);
+                            }
+                        }
+                        Err(Error::CorruptedSpirv)
+                    })?;
+                let arr_ty = ArrayType { elem_ty: op.proto_ty_id, nelem: Some(*nrepeat) };
+                (op.ty_id, SpirvObject::ArrayType(arr_ty))
             },
+            OP_TYPE_RUNTIME_ARRAY => {
+                let op = OpTypeRuntimeArray::try_from(instr)?;
+                let arr_ty = ArrayType { elem_ty: op.proto_ty_id, nelem: None };
+                (op.ty_id, SpirvObject::ArrayType(arr_ty))
+            }
             OP_TYPE_STRUCT => {
-                let ls = operands.read_list()?;
-                let mut members = Vec::with_capacity(ls.len());
-                for (i, member) in ls.iter().enumerate() {
-                    let name = self.name_map.get(&(id, Some(i as u32)))
+                let op = OpTypeStruct::try_from(instr)?;
+                let mut members = Vec::with_capacity(op.member_ty_ids.len());
+                for (i, &member_ty_id) in op.member_ty_ids.iter().enumerate() {
+                    let name = self.name_map.get(&(op.ty_id, Some(i as u32)))
                         .map(|x| *x);
-                    let offset = self.deco_map.get(&(id, Some(i as u32), DECO_OFFSET))
+                    let offset = self.deco_map.get(&(op.ty_id, Some(i as u32), DECO_OFFSET))
                         .and_then(|x| x.get(i))
                         .map(|x| *x as usize);
                     let member = StructMember {
-                        ty: *member,
+                        ty: member_ty_id,
                         name: name,
                         offset: offset,
                     };
                     members.push(member);
                 }
-                self.insert_obj(id, SpirvObject::StructType(members))?;
+                (op.ty_id, SpirvObject::StructType(members))
             },
             OP_TYPE_POINTER => {
-                let _store_cls = operands.read_u32()?;
-                let target_ty = operands.read_u32()?;
-                self.insert_obj(id, SpirvObject::PointerType(target_ty))?;
+                let op = OpTypePointer::try_from(instr)?;
+                (op.ty_id, SpirvObject::PointerType(op.target_ty_id))
             },
             _ => return Err(Error::CorruptedSpirv),
         };
-        Ok(())
+        self.insert_obj(key, value)
     }
     fn populate_one_var(&mut self, instr: &Instr<'a>) -> Result<()> {
-        let mut operands = instr.operands();
-        let ty = operands.read_u32()?;
-        let id = operands.read_u32()?;
-        let store_cls = operands.read_u32()?;
-        let var = Variable {
-            ty: ty,
-            store_cls: store_cls,
-        };
-        self.insert_obj(id, SpirvObject::Variable(var))?;
-        Ok(())
+        let op = OpVariable::try_from(instr)?;
+        let var = Variable { ty: op.ty_id, store_cls: op.store_cls };
+        self.insert_obj(op.alloc_id, SpirvObject::Variable(var))
     }
     fn populate_one_const(&mut self, instr: &Instr<'a>) -> Result<()> {
-        let mut operands = instr.operands();
-        let ty = operands.read_u32()?;
-        let id = operands.read_u32()?;
-        let value = operands.read_list()?;
-        let constant = Constant {
-            ty: ty,
-            value: value,
-        };
-        self.insert_obj(id, SpirvObject::Constant(constant))?;
-        Ok(())
+        let op = OpConstant::try_from(instr)?;
+        let constant = Constant { ty: op.ty_id, value: op.value };
+        self.insert_obj(op.const_id, SpirvObject::Constant(constant))
     }
     fn populate_defs(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
         // type definitions always follow decorations, so we don't skip
@@ -464,61 +436,49 @@ impl<'a> SpirvMetadata<'a> {
         while instrs.peek().is_some() {
             let mut access_chain_map = HashMap::new();
             let mut func: &mut Function = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-            while let Some(instr) = instrs.next() {
+            while let Some(instr) = instrs.peek() {
                 if instr.opcode() == OP_FUNCTION {
-                    let mut operands = instr.operands();
-                    let _rty = operands.read_u32()?;
-                    let id = operands.read_u32()?;
-                    func = self.get_fn_or_default_mut(id)?;
+                    let op = OpFunction::try_from(instr)?;
+                    func = self.get_fn_or_default_mut(op.func_id)?;
                     break;
                 }
+                instrs.next();
             }
-            while let Some(instr) = instrs.next() {
+            while let Some(instr) = instrs.peek() {
                 match instr.opcode() {
                     OP_FUNCTION_CALL => {
-                        let mut operands = instr.operands();
-                        let _rty = operands.read_u32()?;
-                        let _id = operands.read_u32()?;
-                        let callee = operands.read_u32()?;
-                        if !func.calls.insert(callee) {
+                        let op = OpFunctionCall::try_from(instr)?;
+                        if !func.calls.insert(op.func_id) {
                             return Err(Error::CorruptedSpirv);
                         }
                     },
                     OP_LOAD => {
-                        let mut operands = instr.operands();
-                        let _rty = operands.read_u32()?;
-                        let _id = operands.read_u32()?;
-                        let mut target = operands.read_u32()?;
-                        if let Some(&x) = access_chain_map.get(&target) {
-                            target = x;
-                        }
-                        func.accessed_vars.insert(target);
+                        let op = OpLoad::try_from(instr)?;
+                        let mut rsc_id = op.rsc_id;
+                        if let Some(&x) = access_chain_map.get(&rsc_id) { rsc_id = x }
+                        func.accessed_vars.insert(rsc_id);
                     },
                     OP_STORE => {
-                        let mut operands = instr.operands();
-                        let mut target = operands.read_u32()?;
-                        if let Some(&x) = access_chain_map.get(&target) {
-                            target = x;
-                        }
-                        func.accessed_vars.insert(target);
+                        let op = OpStore::try_from(instr)?;
+                        let mut rsc_id = op.rsc_id;
+                        if let Some(&x) = access_chain_map.get(&rsc_id) { rsc_id = x }
+                        func.accessed_vars.insert(rsc_id);
                     },
                     OP_ACCESS_CHAIN => {
-                        let mut operands = instr.operands();
-                        let _rty = operands.read_u32()?;
-                        let id = operands.read_u32()?;
-                        let target = operands.read_u32()?;
-                        if access_chain_map.insert(id, target).is_some() {
+                        let op = OpAccessChain::try_from(instr)?;
+                        if access_chain_map.insert(op.rsc_id, op.accessed_rsc_id).is_some() {
                             return Err(Error::CorruptedSpirv);
                         }
                     },
                     OP_FUNCTION_END => break,
                     _ => { },
                 }
+                instrs.next();
             }
         }
         Ok(())
     }
-    fn collect_fn_vars_impl(&self, func: ObjectId, vars: &mut HashSet<ObjectId>) {
+    fn collect_fn_vars_impl(&self, func: InstrId, vars: &mut HashSet<InstrId>) {
         if let Ok(func) = self.get_fn(func) {
             let it = func.accessed_vars.iter()
                 .filter(|x| self.obj_map.contains_key(x));
@@ -528,30 +488,30 @@ impl<'a> SpirvMetadata<'a> {
             }
         }
     }
-    pub fn collect_fn_vars(&self, func: ObjectId) -> impl Iterator<Item=ObjectId> {
+    pub fn collect_fn_vars(&self, func: InstrId) -> impl Iterator<Item=InstrId> {
         let mut accessed_vars = HashSet::new();
         self.collect_fn_vars_impl(func, &mut accessed_vars);
         accessed_vars.into_iter()
     }
     /// Resolve recurring layers of pointers to the pointer that refer to the
     /// data directly.
-    fn resolve_ref(&self, ty_id: ObjectId) -> Result<(ObjectId, &SpirvObject<'a>)> {
+    fn resolve_ref(&self, ty_id: InstrId) -> Result<(InstrId, &SpirvObject<'a>)> {
         let ty = &self.obj_map.get(&ty_id)
             .ok_or(Error::CorruptedSpirv)?;
         if let SpirvObject::PointerType(ref_ty) = ty {
             self.resolve_ref(*ref_ty)
         } else { Ok((ty_id, ty)) }
     }
-    fn get_deco(&self, id: ObjectId, member_idx: Option<u32>, deco: Decoration) -> Option<&[u32]> {
+    fn get_deco(&self, id: InstrId, member_idx: Option<u32>, deco: Decoration) -> Option<&[u32]> {
         self.deco_map.get(&(id, member_idx, deco))
             .cloned()
     }
-    fn get_deco_u32(&self, id: ObjectId, member_idx: Option<u32>, deco: Decoration) -> Option<u32> {
+    fn get_deco_u32(&self, id: InstrId, member_idx: Option<u32>, deco: Decoration) -> Option<u32> {
         self.deco_map.get(&(id, member_idx, deco))
             .and_then(|x| x.get(0))
             .cloned()
     }
-    fn get_name(&self, id: ObjectId, member_idx: Option<u32>) -> Option<&'a str> {
+    fn get_name(&self, id: InstrId, member_idx: Option<u32>) -> Option<&'a str> {
         self.name_map.get(&(id, member_idx))
             .map(|x| *x)
     }
