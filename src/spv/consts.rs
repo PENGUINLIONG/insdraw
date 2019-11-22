@@ -32,17 +32,17 @@ pub const OP_TYPE_FUNCTION: OpCode = 33;
 pub const TYPE_RANGE: RangeInclusive<OpCode> = OP_TYPE_VOID..=OP_TYPE_FUNCTION;
 
 pub const OP_CONSTANT_TRUE: OpCode = 41;
-pub const OP_CONSTANT_FALSE: OpCode = 42;
+// pub const OP_CONSTANT_FALSE: OpCode = 42;
 pub const OP_CONSTANT: OpCode = 43;
-pub const OP_CONSTANT_COMPOSITE: OpCode = 44;
-pub const OP_CONSTANT_SAMPLER: OpCode = 45;
+// pub const OP_CONSTANT_COMPOSITE: OpCode = 44;
+// pub const OP_CONSTANT_SAMPLER: OpCode = 45;
 pub const OP_CONSTANT_NULL: OpCode = 46;
 pub const CONST_RANGE: RangeInclusive<OpCode> = OP_CONSTANT_TRUE..=OP_CONSTANT_NULL;
 
 pub const OP_SPEC_CONSTANT_TRUE: OpCode = 48;
-pub const OP_SPEC_CONSTANT_FALSE: OpCode = 49;
-pub const OP_SPEC_CONSTANT: OpCode = 50;
-pub const OP_SPEC_CONSTANT_COMPOSITE: OpCode = 51;
+// pub const OP_SPEC_CONSTANT_FALSE: OpCode = 49;
+// pub const OP_SPEC_CONSTANT: OpCode = 50;
+// pub const OP_SPEC_CONSTANT_COMPOSITE: OpCode = 51;
 pub const OP_SPEC_CONSTANT_OP: OpCode = 52;
 pub const SPEC_CONST_RANGE: RangeInclusive<OpCode> = OP_SPEC_CONSTANT_TRUE..=OP_SPEC_CONSTANT_OP;
 

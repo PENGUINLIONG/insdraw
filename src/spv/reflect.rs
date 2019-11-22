@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::Entry::Vacant;
 use std::iter::Peekable;
 use std::fmt;
+use std::ops::RangeInclusive;
 use super::consts::*;
 use super::instr::*;
 use super::parse::{SpirvBinary, Instrs, Instr};
@@ -190,8 +191,11 @@ impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
         // SPIR-V specification for more information.
         let mut instrs = module.instrs().peekable();
         let mut meta = SpirvMetadata::default();
+        meta.skip_until_range_inclusive(&mut instrs, ENTRY_POINT_RANGE);
         meta.populate_entry_points(&mut instrs)?;
+        meta.skip_until_range_inclusive(&mut instrs, NAME_RANGE);
         meta.populate_names(&mut instrs)?;
+        meta.skip_until_range_inclusive(&mut instrs, DECO_RANGE);
         meta.populate_decos(&mut instrs)?;
         meta.populate_defs(&mut instrs)?;
         meta.populate_access(&mut instrs)?;
@@ -200,11 +204,12 @@ impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
     }
 }
 impl<'a> SpirvMetadata<'a> {
-    fn populate_entry_points(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()>{
-        // Extract entry points.
+    fn skip_until_range_inclusive(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>, rng: RangeInclusive<u32>) {
         while let Some(instr) = instrs.peek() {
-            if instr.opcode() != OP_ENTRY_POINT { instrs.next(); } else { break; }
+            if !rng.contains(&instr.opcode()) { instrs.next(); } else { break; }
         }
+    }
+    fn populate_entry_points(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
         while let Some(instr) = instrs.peek() {
             if instr.opcode() != OP_ENTRY_POINT { break; }
             let op = OpEntryPoint::try_from(instr)?;
@@ -222,9 +227,6 @@ impl<'a> SpirvMetadata<'a> {
     fn populate_names(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
         // Extract naming. Names are generally produced as debug information by
         // `glslValidator` but it might be in absence.
-        while let Some(instr) = instrs.peek() {
-            if !NAME_RANGE.contains(&instr.opcode()) { instrs.next(); } else { break; }
-        }
         while let Some(instr) = instrs.peek() {
             let (key, value) = match instr.opcode() {
                 OP_NAME => {
@@ -244,9 +246,6 @@ impl<'a> SpirvMetadata<'a> {
         Ok(())
     }
     fn populate_decos(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
-        while let Some(instr) = instrs.peek() {
-            if !DECO_RANGE.contains(&instr.opcode()) { instrs.next(); } else { break; }
-        }
         while let Some(instr) = instrs.peek() {
             let (key, value) = match instr.opcode() {
                 OP_DECORATE => {
