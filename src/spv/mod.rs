@@ -11,7 +11,8 @@ mod sym;
 use consts::*;
 pub use parse::SpirvBinary;
 use parse::{Instrs, Instr, Operands};
-pub use reflect::PipelineMetadata;
+//pub use reflect::PipelineMetadata;
+pub use reflect::SpirvMetadata;
 pub use error::Error;
 pub use sym::*;
 

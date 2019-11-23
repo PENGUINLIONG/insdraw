@@ -4,6 +4,7 @@ pub mod topo;
 pub mod spv;
 
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use ash::vk;
 use crate::gfx::{Context, InterfaceConfig};
 use crate::spv::SpirvBinary;
@@ -26,11 +27,16 @@ fn main() {
     */
     let spvs = collect_spirv_binaries("assets/effects/uniform-pbr");
     info!("collected spirvs: {:?}", spvs.iter().map(|x| x.0.as_ref()).collect::<Vec<&str>>());
+    let meta = crate::spv::SpirvMetadata::try_from(&spvs["uniform-pbr.frag"])
+        .unwrap();
+    debug!("{:#?}", meta);
+    /*
     let spvs = spvs.into_iter()
         .map(|(_, bin)| bin)
         .collect::<Vec<_>>();
     let pipe = spv::PipelineMetadata::new(&spvs);
     debug!("{:#?}", pipe);
+    */
 }
 
 

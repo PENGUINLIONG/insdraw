@@ -1,71 +1,103 @@
 use std::convert::{TryFrom, TryInto};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::collections::hash_map::Entry::Vacant;
 use std::iter::Peekable;
 use std::fmt;
 use std::ops::RangeInclusive;
+use std::hash::{Hash, Hasher};
 use super::consts::*;
 use super::instr::*;
 use super::parse::{SpirvBinary, Instrs, Instr};
 use super::{Error, Result};
 use log::debug;
 
-#[derive(Debug, Clone, Default)]
+type ObjectId = u32;
+type TypeId = ObjectId;
+type VariableId = ObjectId;
+type ConstantId = ObjectId;
+type FunctionId = ObjectId;
+type MemberIdx = usize;
+type Decoration = u32;
+type StorageClass = u32;
+
+#[derive(Debug, Hash, Clone)]
 struct NumericType {
-    /// Bit-width of this type.
-    nbyte: u32,
+    /// Byte-width of this type.
+    pub nbyte: usize,
     /// For integral types the field indicate it's signed ness, true for signed
     /// int and false for unsigned. Floating point number will have this field
     /// `None`.
-    is_signed: Option<bool>,
-    /// Row number for matrix types and element number for vector types.
-    nrow: Option<u32>,
-    /// Column number for matrix types.
-    ncol: Option<u32>,
+    pub is_signed: Option<bool>,
 }
 impl NumericType {
+    pub fn new(nbyte: u32, is_signed: Option<bool>) -> NumericType {
+        NumericType { nbyte: nbyte as usize, is_signed: is_signed }
+    }
     pub fn int(nbyte: u32, is_signed: bool) -> NumericType {
-        NumericType {
-            nbyte: 4,
-            is_signed: Some(is_signed),
-            ..Default::default()
-        }
+        NumericType { nbyte: nbyte as usize, is_signed: Some(is_signed) }
     }
     pub fn float(nbyte: u32) -> NumericType {
-        NumericType {
-            nbyte: 4,
-            ..Default::default()
-        }
+        NumericType { nbyte: nbyte as usize, is_signed: None }
     }
-    pub fn vec(elem_ty: &NumericType, nrow: u32) -> NumericType {
-        NumericType {
-            nbyte: elem_ty.nbyte,
-            is_signed: elem_ty.is_signed,
-            nrow: Some(nrow),
-            ..Default::default()
-        }
+    pub fn nbyte(&self) -> usize { self.nbyte }
+
+    pub fn is_int(&self) -> bool {
+        if let Some(true) = self.is_signed { true } else { false }
     }
-    pub fn mat(col_ty: &NumericType, ncol: u32) -> NumericType {
-        NumericType {
-            nbyte: col_ty.nbyte,
-            is_signed: col_ty.is_signed,
-            nrow: col_ty.nrow,
-            ncol: Some(ncol),
-        }
+    pub fn is_uint(&self) -> bool {
+        if let Some(false) = self.is_signed { true } else { false }
     }
-
-    pub fn nbyte(&self) -> u32 { self.nbyte }
-    pub fn nrow(&self) -> u32 { self.nrow.unwrap_or(1) }
-    pub fn ncol(&self) -> u32 { self.ncol.unwrap_or(1) }
-
-    pub fn is_primitive(&self) -> bool { self.nrow.is_none() && self.ncol.is_none() }
-    pub fn is_vec(&self) -> bool { self.nrow.is_some() && self.ncol.is_none() }
-    pub fn is_mat(&self) -> bool { self.nrow.is_some() && self.ncol.is_some() }
-
-    pub fn is_sint(&self) -> bool { Some(true) == self.is_signed }
-    pub fn is_uint(&self) -> bool { Some(false) == self.is_signed }
-    pub fn is_float(&self) -> bool { None == self.is_signed }
+    pub fn is_float(&self) -> bool {
+        if let None = self.is_signed { true } else { false }
+    }
 }
+#[derive(Debug, Hash, Clone)]
+struct NumericVariable {
+    pub nbyte: usize,
+    pub is_signed: Option<bool>,
+}
+#[derive(Debug, Hash, Clone)]
+struct VectorType {
+    pub num_ty: NumericType,
+    pub nnum: u32,
+}
+impl VectorType {
+    pub fn new(num_ty: NumericType, nnum: u32) -> VectorType {
+        VectorType { num_ty: num_ty, nnum: nnum }
+    }
+    pub fn nbyte(&self) -> usize { self.nnum as usize * self.num_ty.nbyte }
+}
+#[derive(Debug, Hash, Clone, Copy)]
+pub enum MatrixAxisOrder {
+    ColumnMajor,
+    RowMajor,
+}
+impl Default for MatrixAxisOrder {
+    fn default() -> MatrixAxisOrder { MatrixAxisOrder::ColumnMajor }
+}
+#[derive(Debug, Hash, Clone)]
+struct MatrixType {
+    pub vec_ty: VectorType,
+    pub nvec: u32,
+    pub stride: usize,
+    pub major: MatrixAxisOrder,
+}
+impl MatrixType {
+    pub fn new(vec_ty: VectorType, nvec: u32) -> MatrixType {
+        MatrixType {
+            stride: vec_ty.nbyte(),
+            vec_ty: vec_ty,
+            nvec: nvec,
+            major: MatrixAxisOrder::default(),
+        }
+    }
+    pub fn decorate(&mut self, stride: usize, major: MatrixAxisOrder) {
+        self.stride = stride;
+        self.major = major;
+    }
+    pub fn nbyte(&self) -> usize { self.nvec as usize * self.stride }
+}
+
 #[derive(Debug, Hash, Clone, Copy)]
 pub enum ColorFormat {
     Rgba32f = 1,
@@ -136,21 +168,54 @@ pub struct ImageType {
     fmt: ImageUnitFormat,
     arng: ImageArrangement,
 }
-#[derive(Debug, Clone)]
-struct ArrayType {
-    elem_ty: InstrId,
-    nelem: Option<u32>,
+#[derive(Debug, Hash, Clone)]
+struct ArrayType<'a> {
+    proto_ty: Box<Type<'a>>,
+    nrepeat: Option<u32>,
+    stride: Option<usize>,
 }
-#[derive(Debug, Clone)]
-struct StructMember<'a> {
-    ty: InstrId,
-    name: Option<&'a str>,
-    offset: Option<usize>,
+impl<'a> ArrayType<'a> {
+    pub fn new_multibind(proto_ty: &Type<'a>, nrepeat: u32) -> ArrayType<'a> {
+        ArrayType {
+            proto_ty: Box::new(proto_ty.clone()),
+            nrepeat: Some(nrepeat),
+            stride: None,
+        }
+    }
+    pub fn new(proto_ty: &Type<'a>, nrepeat: u32, stride: usize) -> ArrayType<'a> {
+        ArrayType {
+            proto_ty: Box::new(proto_ty.clone()),
+            nrepeat: Some(nrepeat),
+            stride: Some(stride),
+        }
+    }
+    pub fn new_unsized(proto_ty: &Type<'a>, stride: usize) -> ArrayType<'a> {
+        ArrayType {
+            proto_ty: Box::new(proto_ty.clone()),
+            nrepeat: None,
+            stride: Some(stride)
+        }
+    }
 }
-#[derive(Debug, Clone)]
-struct Variable {
-    ty: InstrId,
-    store_cls: StorageClass,
+#[derive(Debug, Default, Clone)]
+struct StructType<'a> {
+    members: Vec<(usize, Type<'a>)>, // Offset and type.
+    name_map: BTreeMap<&'a str, MemberIdx>,
+    // We assume a structure decorated by `Block` is uniform in the first place.
+    // On instanciating the structure type into interface block, we check if the
+    // storage class is `StorageClass`. If it is, this field will be canceled in
+    // the end to false.
+    is_iuniform: bool,
+}
+impl<'a> Hash for StructType<'a> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.members.hash(state);
+        // NOTE: This enforces that the names for a same member in each stage
+        // have to be the same to be correctly reflected.
+        for x in self.name_map.iter() {
+            x.hash(state);
+        }
+    }
 }
 #[derive(Debug, Clone)]
 struct Constant<'a> {
@@ -163,13 +228,101 @@ struct Function {
     calls: HashSet<InstrId>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Hash, Clone)]
 enum Type<'a> {
     Numeric(NumericType),
+    Vector(VectorType),
+    Matrix(MatrixType),
     Image(Option<ImageType>),
-    Array(ArrayType),
-    Struct(Vec<StructMember<'a>>),
-    Pointer(InstrId), // Struct ID.
+    Array(ArrayType<'a>),
+    Struct(StructType<'a>),
+}
+
+type Location = u32;
+
+#[derive(PartialEq, Eq, Hash, Default, Clone, Copy)]
+pub struct DescriptorBinding(Option<(u32, u32)>);
+impl DescriptorBinding {
+    pub fn push_const() -> Self { DescriptorBinding(None) }
+    pub fn desc_bind(desc_set: u32, bind_point: u32) -> Self { DescriptorBinding(Some((desc_set, bind_point))) }
+
+    pub fn is_push_const(&self) -> bool { self.0.is_none() }
+    pub fn is_desc_bind(&self) -> bool { self.0.is_some() }
+    pub fn into_inner(self) -> Option<(u32, u32)> { self.0 }
+}
+impl fmt::Debug for DescriptorBinding {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if let Some((set, bind)) = self.0 {
+            write!(f, "(set={}, bind={})", set, bind)
+        } else {
+            write!(f, "(push_constant)")
+        }
+    }
+}
+
+
+#[derive(Debug, Clone)]
+struct EntryPoint {
+    func: u32,
+    name: String,
+    exec_model: u32,
+}
+#[derive(Debug, Clone)]
+enum InterfaceVariableType {
+    Numeric(NumericType),
+    Vector(VectorType),
+    Matrix(MatrixType),
+}
+impl InterfaceVariableType {
+    fn from_ty<'a>(ty: &Type<'a>) -> Option<InterfaceVariableType> {
+        let ivar_ty = match ty.clone() {
+            Type::Numeric(num_ty) => InterfaceVariableType::Numeric(num_ty),
+            Type::Vector(vec_ty) => InterfaceVariableType::Vector(vec_ty),
+            Type::Matrix(mat_ty) => InterfaceVariableType::Matrix(mat_ty),
+            _ => return None,
+        };
+        Some(ivar_ty)
+    }
+}
+#[derive(Debug, Clone)]
+struct InterfaceBlockType<'a> {
+    block_ty: StructType<'a>,
+    nbind: u32,
+}
+impl<'a> InterfaceBlockType<'a> {
+    fn from_store_buf(block_ty: &Type<'a>) -> Option<InterfaceBlockType<'a>> {
+        let (mut block_ty, nbind) = match block_ty {
+            Type::Array(arr_ty) => if let Type::Struct(struct_ty) = &*arr_ty.proto_ty {
+                (struct_ty.clone(), arr_ty.nrepeat?)
+            } else { return None },
+            Type::Struct(struct_ty) => (struct_ty.clone(), 1),
+            _ => return None,
+        };
+        // Force cancel the uniformity of current block type.
+        block_ty.is_iuniform = false;
+        let iblock_ty = InterfaceBlockType { block_ty: block_ty, nbind: nbind };
+        Some(iblock_ty)
+    }
+    fn from_uniform(block_ty: &Type<'a>) -> Option<InterfaceBlockType<'a>> {
+        let (mut block_ty, nbind) = match block_ty {
+            Type::Array(arr_ty) => if let Type::Struct(struct_ty) = &*arr_ty.proto_ty {
+                (struct_ty.clone(), arr_ty.nrepeat?)
+            } else { return None },
+            Type::Struct(struct_ty) => (struct_ty.clone(), 1),
+            _ => return None,
+        };
+        let iblock_ty = InterfaceBlockType { block_ty: block_ty, nbind: nbind };
+        Some(iblock_ty)
+    }
+    fn is_uniform(&self) -> bool { self.block_ty.is_iuniform }
+    fn is_storage(&self) -> bool { !self.block_ty.is_iuniform }
+}
+#[derive(Debug, Clone)]
+pub enum DescriptorType<'a> {
+    PushConstant(StructType<'a>),
+    Block(InterfaceBlockType<'a>),
+    Image(ImageType),
+    InputAtatchment(u32),
 }
 
 
@@ -179,9 +332,12 @@ pub struct SpirvMetadata<'a> {
     name_map: HashMap<(InstrId, Option<u32>), &'a str>,
     deco_map: HashMap<(InstrId, Option<u32>, Decoration), &'a [u32]>,
     ty_map: HashMap<TypeId, Type<'a>>,
-    rsc_map: HashMap<ResourceId, Variable>,
+    attr_map: HashMap<Location, InterfaceVariableType>,
+    attm_map: HashMap<Location, InterfaceVariableType>,
+    desc_map: HashMap<DescriptorBinding, DescriptorType<'a>>,
     const_map: HashMap<ConstantId, Constant<'a>>,
     func_map: HashMap<FunctionId, Function>,
+    ptr_map: HashMap<TypeId, TypeId>,
 }
 impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
     type Error = Error;
@@ -199,7 +355,6 @@ impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
         meta.populate_decos(&mut instrs)?;
         meta.populate_defs(&mut instrs)?;
         meta.populate_access(&mut instrs)?;
-        for i in 0..meta.entry_points.len() {meta.inflate_entry_point(i)?; }
         Ok(meta)
     }
 }
@@ -217,7 +372,6 @@ impl<'a> SpirvMetadata<'a> {
                 exec_model: op.exec_model,
                 func: op.func_id,
                 name: op.name.to_string(),
-                ..Default::default()
             };
             self.entry_points.push(entry_point);
             instrs.next();
@@ -280,16 +434,16 @@ impl<'a> SpirvMetadata<'a> {
             },
             OP_TYPE_VECTOR => {
                 let op = OpTypeVector::try_from(instr)?;
-                if let Some(Type::Numeric(num_ty)) = self.ty_map.get(&op.num_ty_id) {
-                    let vec_ty = NumericType::vec(&num_ty, op.nnum);
-                    (op.ty_id, Type::Numeric(vec_ty))
+                if let Some(Type::Numeric(num_ty)) = self.ty_map.get(&op.num_ty_id).cloned() {
+                    let vec_ty = VectorType::new(num_ty, op.nnum);
+                    (op.ty_id, Type::Vector(vec_ty))
                 } else { return Err(Error::CorruptedSpirv); }
             },
             OP_TYPE_MATRIX => {
                 let op = OpTypeMatrix::try_from(instr)?;
-                if let Some(Type::Numeric(vec_ty)) = self.ty_map.get(&op.vec_ty_id) {
-                    let mat_ty = NumericType::mat(&vec_ty, op.nvec);
-                    (op.ty_id, Type::Numeric(mat_ty))
+                if let Some(Type::Vector(vec_ty)) = self.ty_map.get(&op.vec_ty_id).cloned() {
+                    let mat_ty = MatrixType::new(vec_ty, op.nvec);
+                    (op.ty_id, Type::Matrix(mat_ty))
                 } else { return Err(Error::CorruptedSpirv); }
             },
             OP_TYPE_IMAGE => {
@@ -314,45 +468,83 @@ impl<'a> SpirvMetadata<'a> {
             },
             OP_TYPE_ARRAY => {
                 let op = OpTypeArray::try_from(instr)?;
+                let proto_ty = self.ty_map.get(&op.proto_ty_id)
+                    .ok_or(Error::CorruptedSpirv)?;
                 let nrepeat = self.const_map.get(&op.nrepeat_const_id)
                     .and_then(|constant| {
                         if let Some(Type::Numeric(num_ty)) = self.ty_map.get(&constant.ty) {
-                            if num_ty.nbyte == 4 && num_ty.is_uint() && num_ty.is_primitive() {
+                            if num_ty.nbyte == 4 && num_ty.is_uint() {
                                 return Some(constant.value[0]);
                             }
                         }
                         None
                     })
                     .ok_or(Error::CorruptedSpirv)?;
-                let arr_ty = ArrayType { elem_ty: op.proto_ty_id, nelem: Some(nrepeat) };
+                let stride = self.get_deco_u32(op.ty_id, None, DECO_ARRAY_STRIDE)
+                    .map(|x| x as usize);
+                let arr_ty = if let Some(stride) = stride {
+                    ArrayType::new(proto_ty, nrepeat, stride)
+                } else {
+                    ArrayType::new_multibind(proto_ty, nrepeat)
+                };
                 (op.ty_id, Type::Array(arr_ty))
             },
             OP_TYPE_RUNTIME_ARRAY => {
                 let op = OpTypeRuntimeArray::try_from(instr)?;
-                let arr_ty = ArrayType { elem_ty: op.proto_ty_id, nelem: None };
+                let proto_ty = self.ty_map.get(&op.proto_ty_id)
+                    .ok_or(Error::CorruptedSpirv)?;
+                let stride = self.get_deco_u32(op.ty_id, None, DECO_ARRAY_STRIDE)
+                    .map(|x| x as usize)
+                    .ok_or(Error::CorruptedSpirv)?;
+                let arr_ty = ArrayType::new_unsized(proto_ty, stride);
                 (op.ty_id, Type::Array(arr_ty))
             }
             OP_TYPE_STRUCT => {
                 let op = OpTypeStruct::try_from(instr)?;
-                let mut members = Vec::with_capacity(op.member_ty_ids.len());
+                let mut struct_ty = StructType::default();
+                struct_ty.is_iuniform = self.contains_deco(op.ty_id, None, DECO_BLOCK);
                 for (i, &member_ty_id) in op.member_ty_ids.iter().enumerate() {
-                    let name = self.name_map.get(&(op.ty_id, Some(i as u32)))
-                        .map(|x| *x);
-                    let offset = self.deco_map.get(&(op.ty_id, Some(i as u32), DECO_OFFSET))
-                        .and_then(|x| x.get(i))
-                        .map(|x| *x as usize);
-                    let member = StructMember {
-                        ty: member_ty_id,
-                        name: name,
-                        offset: offset,
-                    };
-                    members.push(member);
+                    let mut member_ty = self.ty_map.get(&member_ty_id)
+                        .cloned()
+                        .ok_or(Error::CorruptedSpirv)?;
+                    let mut proto_ty = &mut member_ty;
+                    while let Type::Array(arr_ty) = proto_ty {
+                        proto_ty = &mut arr_ty.proto_ty;
+                    }
+                    if let &mut Type::Matrix(ref mut mat_ty) = proto_ty {
+                        let i = i as u32;
+                        let mat_stride = self.get_deco_u32(op.ty_id, Some(i), DECO_MATRIX_STRIDE)
+                            .ok_or(Error::CorruptedSpirv)?;
+                        let row_major = self.contains_deco(op.ty_id, Some(i), DECO_ROW_MAJOR);
+                        let col_major = self.contains_deco(op.ty_id, Some(i), DECO_COL_MAJOR);
+                        let major = match (row_major, col_major) {
+                            (true, false) => MatrixAxisOrder::RowMajor,
+                            (false, true) => MatrixAxisOrder::ColumnMajor,
+                            _ => return Err(Error::CorruptedSpirv),
+                        };
+                        mat_ty.decorate(mat_stride as usize, major);
+                    }
+                    if let Some(name) = self.get_name(op.ty_id, Some(i as u32)) {
+                        if !name.is_empty() {
+                            struct_ty.name_map.insert(name, i);
+                        }
+                    }
+                    if let Some(offset) = self.get_deco_u32(op.ty_id, Some(i as u32), DECO_OFFSET) {
+                        struct_ty.members.push((offset as usize, member_ty));
+                    } else {
+                        // For shader input/output blocks there are no offset
+                        // decoration. Since these variables are not externally
+                        // accessible we don't have to worry about them.
+                        return Ok(())
+                    }
                 }
-                (op.ty_id, Type::Struct(members))
+                (op.ty_id, Type::Struct(struct_ty))
             },
             OP_TYPE_POINTER => {
                 let op = OpTypePointer::try_from(instr)?;
-                (op.ty_id, Type::Pointer(op.target_ty_id))
+                if self.ptr_map.insert(op.ty_id, op.target_ty_id).is_some() {
+                    return Err(Error::CorruptedSpirv)
+                } else { return Ok(()) }
             },
             _ => return Err(Error::CorruptedSpirv),
         };
@@ -362,12 +554,81 @@ impl<'a> SpirvMetadata<'a> {
     }
     fn populate_one_var(&mut self, instr: &Instr<'a>) -> Result<()> {
         let op = OpVariable::try_from(instr)?;
-        let var = Variable { ty: op.ty_id, store_cls: op.store_cls };
-        if let Vacant(entry) = self.rsc_map.entry(op.alloc_id) {
-            entry.insert(var); Ok(())
-        } else { Err(Error::CorruptedSpirv) }
+        let (ty_id, ty) = if let Some(x) = self.resolve_ref(op.ty_id) { x } else {
+            // If a variable is declared based on a unregistered type, very
+            // likely it's a input/output block passed between shader stages. We
+            // can safely ignore them.
+            return Ok(());
+        };
+        match op.store_cls {
+            STORE_CLS_INPUT => {
+                if let Some(ivar_ty) = InterfaceVariableType::from_ty(ty) {
+                    let location = self.get_var_location_or_default(op.alloc_id);
+                    self.attr_map.insert(location, ivar_ty);
+                }
+                // There can be interface blocks for input and output but there
+                // won't be any for attribute inputs nor for attachment outputs,
+                // so we just ignore structs and arrays or something else here.
+            },
+            STORE_CLS_OUTPUT => {
+                if let Some(ivar_ty) = InterfaceVariableType::from_ty(ty) {
+                    let location = self.get_var_location_or_default(op.alloc_id);
+                    self.attm_map.insert(location, ivar_ty);
+                }
+            },
+            STORE_CLS_PUSH_CONSTANT => {
+                // Push constants have no global offset. Offsets are applied to
+                // members.
+                if let Type::Struct(struct_ty) = ty.clone() {
+                    let desc_bind = DescriptorBinding::push_const();
+                    let desc_ty = DescriptorType::PushConstant(struct_ty);
+                    if self.desc_map.insert(desc_bind, desc_ty).is_some() {
+                        return Err(Error::CorruptedSpirv);
+                    }
+                } else { return Err(Error::CorruptedSpirv); }
+            },
+            STORE_CLS_UNIFORM => {
+                if let Some(iblock_ty) = InterfaceBlockType::from_uniform(ty) {
+                    let desc_bind = self.get_var_desc_bind_or_default(op.alloc_id);
+                    let desc_ty = DescriptorType::Block(iblock_ty);
+                    if self.desc_map.insert(desc_bind, desc_ty).is_some() {
+                        return Err(Error::CorruptedSpirv);
+                    }
+                } else { return Err(Error::CorruptedSpirv); }
+            },
+            STORE_CLS_STORAGE_BUFFER => {
+                if let Some(iblock_ty) = InterfaceBlockType::from_store_buf(ty) {
+                    let desc_bind = self.get_var_desc_bind_or_default(op.alloc_id);
+                    let desc_ty = DescriptorType::Block(iblock_ty);
+                    if self.desc_map.insert(desc_bind, desc_ty).is_some() {
+                        return Err(Error::CorruptedSpirv);
+                    }
+                } else { return Err(Error::CorruptedSpirv); }
+            },
+            STORE_CLS_UNIFORM_CONSTANT => {
+                if let Type::Image(img_ty) = ty {
+                    let desc_bind = self.get_var_desc_bind_or_default(op.alloc_id);
+                    let desc_ty = if let Some(img_ty) = img_ty {
+                        DescriptorType::Image(img_ty.clone())
+                    } else {
+                        let input_attm_idx = self.get_deco_u32(op.alloc_id, None, DECO_INPUT_ATTACHMENT_INDEX)
+                            .ok_or(Error::CorruptedSpirv)?;
+                        DescriptorType::InputAtatchment(input_attm_idx)
+                    };
+                    if self.desc_map.insert(desc_bind, desc_ty).is_some() {
+                        return Err(Error::CorruptedSpirv);
+                    }
+                }
+                // Leak out unknown types of uniform constants.
+            },
+            _ => {
+                // Leak out unknown storage classes.
+            },
+        }
+        Ok(())
     }
     fn populate_one_const(&mut self, instr: &Instr<'a>) -> Result<()> {
+        if instr.opcode() != OP_CONSTANT { return Ok(()) }
         let op = OpConstant::try_from(instr)?;
         let constant = Constant { ty: op.ty_id, value: op.value };
         if let Vacant(entry) = self.const_map.entry(op.const_id) {
@@ -386,6 +647,8 @@ impl<'a> SpirvMetadata<'a> {
                 self.populate_one_var(instr)?;
             } else if CONST_RANGE.contains(&opcode) {
                 self.populate_one_const(instr)?;
+            } else if SPEC_CONST_RANGE.contains(&opcode) {
+                // TODO: (penguinliong)
             } else { break; }
             instrs.next();
         }
@@ -437,6 +700,7 @@ impl<'a> SpirvMetadata<'a> {
         }
         Ok(())
     }
+    /*
     fn collect_fn_vars_impl(&self, func: FunctionId, vars: &mut HashSet<ResourceId>) {
         if let Some(func) = self.func_map.get(&func) {
             let it = func.accessed_vars.iter()
@@ -452,14 +716,18 @@ impl<'a> SpirvMetadata<'a> {
         self.collect_fn_vars_impl(func, &mut accessed_vars);
         accessed_vars.into_iter()
     }
-    /// Resolve recurring layers of pointers to the pointer that refer to the
+    */
+    /// Resolve one recurring layer of pointers to the pointer that refer to the
     /// data directly.
-    fn resolve_ref(&self, ty_id: TypeId) -> Result<(TypeId, &Type<'a>)> {
-        let ty = &self.ty_map.get(&ty_id)
-            .ok_or(Error::CorruptedSpirv)?;
-        if let Type::Pointer(ref_ty) = ty {
-            self.resolve_ref(*ref_ty)
-        } else { Ok((ty_id, ty)) }
+    fn resolve_ref(&self, ty_id: TypeId) -> Option<(TypeId, &Type<'a>)> {
+        self.ptr_map.get(&ty_id)
+            .and_then(|ty_id| {
+                self.ty_map.get(ty_id)
+                    .map(|ty| (*ty_id, ty))
+            })
+    }
+    fn contains_deco(&self, id: ObjectId, member_idx: Option<u32>, deco: Decoration) -> bool {
+        self.deco_map.contains_key(&(id, member_idx, deco))
     }
     fn get_deco(&self, id: InstrId, member_idx: Option<u32>, deco: Decoration) -> Option<&[u32]> {
         self.deco_map.get(&(id, member_idx, deco))
@@ -470,269 +738,23 @@ impl<'a> SpirvMetadata<'a> {
             .and_then(|x| x.get(0))
             .cloned()
     }
+    fn get_var_location_or_default(&self, var_id: VariableId) -> u32 {
+        self.get_deco_u32(var_id, None, DECO_LOCATION)
+            .unwrap_or(0)
+    }
+    fn get_var_desc_bind_or_default(&self, var_id: VariableId) -> DescriptorBinding {
+        let desc_set = self.get_deco_u32(var_id, None, DECO_DESCRIPTOR_SET)
+            .unwrap_or(0);
+        let bind_point = self.get_deco_u32(var_id, None, DECO_BINDING)
+            .unwrap_or(0);
+        DescriptorBinding::desc_bind(desc_set, bind_point)
+    }
     fn get_name(&self, id: InstrId, member_idx: Option<u32>) -> Option<&'a str> {
         self.name_map.get(&(id, member_idx))
             .map(|x| *x)
     }
-    fn ty2node(&self, ty_id: u32, mat_stride: usize, base_offset: usize) -> Result<SymbolNode> {
-        let ty = self.ty_map.get(&ty_id)
-            .ok_or(Error::CorruptedSpirv)?;
-        let node = match ty {
-            Type::Numeric(num_ty) => {
-                if num_ty.is_mat() {
-                    let col_nbyte = (num_ty.nrow() * num_ty.nbyte()) as usize;
-                    let vec = SymbolNode::Leaf {
-                        offset: base_offset,
-                        nbyte: col_nbyte,
-                    };
-                    SymbolNode::Repeat {
-                        major: Some(MatrixAxisOrder::ColumnMajor),
-                        offset: base_offset,
-                        stride: Some(mat_stride),
-                        proto: Box::new(vec),
-                        nrepeat: num_ty.ncol.map(|x| x as usize),
-                    }
-                } else {
-                    SymbolNode::Leaf {
-                        offset: base_offset,
-                        nbyte: num_ty.nbyte() as usize,
-                    }
-                }
-            },
-            Type::Struct(members) => {
-                let mut children = Vec::with_capacity(members.len());
-                let mut name_map = HashMap::new();
-                for (i, member_ty) in members.iter().enumerate() {
-                    let offset = self.get_deco_u32(ty_id, Some(i as u32), DECO_OFFSET)
-                        .ok_or(Error::UnsupportedSpirv)? as usize;
-                    let stride = self.get_deco_u32(ty_id, Some(i as u32), DECO_MATRIX_STRIDE)
-                        .map(|x| x as usize)
-                        .unwrap_or(mat_stride);
-                    children.push(self.ty2node(member_ty.ty, stride, base_offset + offset)?);
-                    if let Some(name) = self.get_name(ty_id, Some(i as u32)) {
-                        if name_map.insert(name.to_owned(), i).is_some() {
-                            return Err(Error::CorruptedSpirv);
-                        }
-                    }
-                }
-                SymbolNode::Node {
-                    offset: base_offset,
-                    children: children,
-                    name_map: name_map,
-                }
-            },
-            Type::Array(arr_ty) => {
-                let stride = self.get_deco_u32(ty_id, None, DECO_ARRAY_STRIDE)
-                    .map(|x| x as usize);
-                SymbolNode::Repeat {
-                    major: None,
-                    offset: base_offset,
-                    stride: stride,
-                    proto: Box::new(self.ty2node(arr_ty.elem_ty, mat_stride, 0)?),
-                    nrepeat: arr_ty.nelem.map(|x| x as usize),
-                }
-            },
-            _ => return Err(Error::CorruptedSpirv),
-        };
-        Ok(node)
-    }
-    fn inflate_entry_point(&mut self, i: usize) -> Result<()> {
-        let entry_point = &self.entry_points[i];
-        let exec_model = entry_point.exec_model;
-
-        let mut attr_templates = Vec::new();
-        let mut attm_templates = Vec::new();
-        let mut desc_binds = HashMap::new();
-        let mut desc_name_map = HashMap::new();
-
-        for var_id in self.collect_fn_vars(entry_point.func) {
-            let var = &self.rsc_map.get(&var_id)
-                .ok_or(Error::CorruptedSpirv)?;
-            let (ty_id, ty) = self.resolve_ref(var.ty)?;
-            let desc_set = self.get_deco_u32(var_id, None, DECO_DESCRIPTOR_SET)
-                .unwrap_or(0);
-            let bind_point = self.get_deco_u32(var_id, None, DECO_BINDING)
-                .unwrap_or(0);
-            let location = self.get_deco_u32(var_id, None, DECO_LOCATION)
-                .unwrap_or(0);
-            match var.store_cls {
-                STORE_CLS_INPUT if exec_model == EXEC_MODEL_VERTEX => {
-                    if let Type::Numeric(num_ty) = ty {
-                        let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
-                        let base_offset = attr_templates.last()
-                            .map(|x: &VertexAttributeContractTemplate| x.offset)
-                            .unwrap_or(0);
-                        for i in 0..num_ty.ncol() {
-                            let template = VertexAttributeContractTemplate {
-                                bind_point: bind_point,
-                                location: location,
-                                offset: base_offset + col_nbyte,
-                                nbyte: col_nbyte,
-                            };
-                            attr_templates.push(template);
-                        }
-                    } else { return Err(Error::CorruptedSpirv); }
-                },
-                STORE_CLS_OUTPUT if exec_model == EXEC_MODEL_FRAGMENT => {
-                    if let Type::Numeric(num_ty) = ty {
-                        // Matrix is not valid attachment type.
-                        if num_ty.is_mat() { return Err(Error::CorruptedSpirv); }
-                        let col_nbyte = (num_ty.nbyte() * num_ty.nrow()) as usize;
-                        let template = AttachmentContractTemplate {
-                            location: location,
-                            nbyte: col_nbyte,
-                        };
-                        attm_templates.push(template);
-                    } else { return Err(Error::CorruptedSpirv); }
-                },
-                STORE_CLS_UNIFORM | STORE_CLS_STORAGE_BUFFER => {
-                    let sym_node = self.ty2node(ty_id, 0, 0)?;
-                    let desc = if var.store_cls == STORE_CLS_STORAGE_BUFFER ||
-                        self.get_deco(var_id, None, DECO_BUFFER_BLOCK).is_some() {
-                        Descriptor::Storage(sym_node)
-                    } else {
-                        Descriptor::Uniform(sym_node)
-                    };
-                    
-                    let desc_bind = DescriptorBinding::desc_bind(desc_set, bind_point);
-                    if desc_binds.insert(desc_bind, desc).is_some() {
-                        return Err(Error::CorruptedSpirv);
-                    }
-                },
-                STORE_CLS_UNIFORM_CONSTANT => {
-                    if let Type::Image(img_ty) = ty {
-                        let desc = if let Some(img_ty) = img_ty {
-                            Descriptor::Image(img_ty.clone())
-                        } else {
-                            let input_attm_idx = self.get_deco_u32(var_id, None, DECO_INPUT_ATTACHMENT_INDEX)
-                                .ok_or(Error::CorruptedSpirv)?;
-                            Descriptor::InputAtatchment(input_attm_idx)
-                        };
-                        let desc_bind = DescriptorBinding::desc_bind(desc_set, bind_point);
-                        if desc_binds.insert(desc_bind, desc).is_some() {
-                            return Err(Error::CorruptedSpirv);
-                        }
-                    }
-                    // Leak out unknown types of uniform constants.
-                }
-                STORE_CLS_PUSH_CONSTANT => {
-                    // Push constants have no global offset. Offsets are applied to
-                    // members.
-                    let sym_node = self.ty2node(ty_id, 0, 0)?;
-                    let desc = Descriptor::Uniform(sym_node);
-
-                    let desc_bind = DescriptorBinding::push_const();
-                    if desc_binds.insert(desc_bind, desc).is_some() {
-                        return Err(Error::CorruptedSpirv);
-                    }
-                },
-                _ => {},
-            }
-            if let Some(name) = self.get_name(var_id, None) {
-                let desc_bind = DescriptorBinding::desc_bind(desc_set, bind_point);
-                if !name.is_empty() &&
-                    desc_name_map.insert(name.to_owned(), desc_bind).is_some() {
-                    return Err(Error::CorruptedSpirv);
-                }
-            }
-        }
-        let mut entry_point = &mut self.entry_points[i];
-        entry_point.attr_templates = attr_templates;
-        entry_point.attm_templates = attm_templates;
-        entry_point.desc_binds = desc_binds;
-        entry_point.desc_name_map = desc_name_map;
-        Ok(())
-    }
 }
-
-#[derive(Debug, Clone)]
-pub struct VertexAttributeContractTemplate {
-    bind_point: u32,
-    location: u32,
-    /// Offset in each set of vertex data.
-    offset: usize,
-    /// Total byte count at this location.
-    nbyte: usize,
-}
-#[derive(Debug, Clone)]
-pub struct AttachmentContractTemplate {
-    location: u32,
-    /// Total byte count at this location.
-    nbyte: usize,
-}
-
-#[derive(Debug, Hash, Clone, Copy)]
-pub enum MatrixAxisOrder {
-    ColumnMajor,
-    RowMajor,
-}
-impl Default for MatrixAxisOrder {
-    fn default() -> MatrixAxisOrder { MatrixAxisOrder::ColumnMajor }
-}
-#[derive(Debug, Clone)]
-pub enum SymbolNode {
-    Node {
-        offset: usize,
-        children: Vec<SymbolNode>,
-        name_map: HashMap<String, usize>,
-    },
-    Repeat {
-        /// The axis order of a matrix. If the field is kept `None`, the repeat
-        /// represents an array.
-        major: Option<MatrixAxisOrder>,
-        offset: usize,
-        /// This field can be `None` when it represents the number of bindings
-        /// at a binding point.
-        stride: Option<usize>,
-        proto: Box<SymbolNode>,
-        nrepeat: Option<usize>,
-    },
-    Leaf {
-        offset: usize,
-        nbyte: usize,
-    },
-}
-
-#[derive(PartialEq, Eq, Hash, Default, Clone, Copy)]
-pub struct DescriptorBinding(Option<(u32, u32)>);
-impl DescriptorBinding {
-    pub fn push_const() -> Self { DescriptorBinding(None) }
-    pub fn desc_bind(desc_set: u32, bind_point: u32) -> Self { DescriptorBinding(Some((desc_set, bind_point))) }
-
-    pub fn is_push_const(&self) -> bool { self.0.is_none() }
-    pub fn is_desc_bind(&self) -> bool { self.0.is_some() }
-    pub fn into_inner(self) -> Option<(u32, u32)> { self.0 }
-}
-impl fmt::Debug for DescriptorBinding {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if let Some((set, bind)) = self.0 {
-            write!(f, "(set={}, bind={})", set, bind)
-        } else {
-            write!(f, "(push_constant)")
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum Descriptor {
-    Storage(SymbolNode),
-    Uniform(SymbolNode),
-    Image(ImageType),
-    Sampler,
-    InputAtatchment(u32),
-}
-
-#[derive(Debug, Default, Clone)]
-struct EntryPoint {
-    func: u32,
-    name: String,
-    exec_model: u32,
-    attr_templates: Vec<VertexAttributeContractTemplate>,
-    attm_templates: Vec<AttachmentContractTemplate>,
-    desc_binds: HashMap<DescriptorBinding, Descriptor>,
-    desc_name_map: HashMap<String, DescriptorBinding>,
-}
-
+/*
 #[derive(Debug, Default)]
 pub struct PipelineMetadata {
     attr_templates: Vec<VertexAttributeContractTemplate>,
@@ -749,11 +771,7 @@ impl PipelineMetadata {
         for spv in spvs {
             let spv_meta: SpirvMetadata = spv.try_into()?;
             for entry_point in spv_meta.entry_points {
-                let EntryPoint {
-                    func, name, exec_model,
-                    attr_templates, attm_templates,
-                    desc_binds, desc_name_map
-                } = entry_point;
+                let EntryPoint { func, name, exec_model } = entry_point;
                 if !found_stages.insert(entry_point.exec_model) {
                     // Stage collision.
                     return Err(Error::MalformedPipeline);
@@ -776,3 +794,4 @@ impl PipelineMetadata {
         Ok(meta)
     }
 }
+*/
