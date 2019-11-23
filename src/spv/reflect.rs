@@ -324,59 +324,50 @@ pub enum DescriptorType<'a> {
     Image(ImageType),
     InputAtatchment(u32),
 }
-
-
-#[derive(Default, Debug)]
-pub struct SpirvMetadata<'a> {
-    entry_points: Vec<EntryPoint>,
+#[derive(Default)]
+struct ReflectIntermediate<'a> {
     name_map: HashMap<(InstrId, Option<u32>), &'a str>,
     deco_map: HashMap<(InstrId, Option<u32>, Decoration), &'a [u32]>,
     ty_map: HashMap<TypeId, Type<'a>>,
-    attr_map: HashMap<Location, InterfaceVariableType>,
-    attm_map: HashMap<Location, InterfaceVariableType>,
-    desc_map: HashMap<DescriptorBinding, DescriptorType<'a>>,
     const_map: HashMap<ConstantId, Constant<'a>>,
-    func_map: HashMap<FunctionId, Function>,
     ptr_map: HashMap<TypeId, TypeId>,
 }
-impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
-    type Error = Error;
-    fn try_from(module: &'a SpirvBinary) -> Result<SpirvMetadata<'a>> {
-        use log::debug;
-        // Don't change the order. See _2.4 Logical Layout of a Module_ of the
-        // SPIR-V specification for more information.
-        let mut instrs = module.instrs().peekable();
-        let mut meta = SpirvMetadata::default();
-        meta.skip_until_range_inclusive(&mut instrs, ENTRY_POINT_RANGE);
-        meta.populate_entry_points(&mut instrs)?;
-        meta.skip_until_range_inclusive(&mut instrs, NAME_RANGE);
-        meta.populate_names(&mut instrs)?;
-        meta.skip_until_range_inclusive(&mut instrs, DECO_RANGE);
-        meta.populate_decos(&mut instrs)?;
-        meta.populate_defs(&mut instrs)?;
-        meta.populate_access(&mut instrs)?;
-        Ok(meta)
+impl<'a> ReflectIntermediate<'a> {
+    /// Resolve one recurring layer of pointers to the pointer that refer to the
+    /// data directly.
+    fn resolve_ref(&self, ty_id: TypeId) -> Option<(TypeId, &Type<'a>)> {
+        self.ptr_map.get(&ty_id)
+            .and_then(|ty_id| {
+                self.ty_map.get(ty_id)
+                    .map(|ty| (*ty_id, ty))
+            })
     }
-}
-impl<'a> SpirvMetadata<'a> {
-    fn skip_until_range_inclusive(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>, rng: RangeInclusive<u32>) {
-        while let Some(instr) = instrs.peek() {
-            if !rng.contains(&instr.opcode()) { instrs.next(); } else { break; }
-        }
+    fn contains_deco(&self, id: ObjectId, member_idx: Option<u32>, deco: Decoration) -> bool {
+        self.deco_map.contains_key(&(id, member_idx, deco))
     }
-    fn populate_entry_points(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
-        while let Some(instr) = instrs.peek() {
-            if instr.opcode() != OP_ENTRY_POINT { break; }
-            let op = OpEntryPoint::try_from(instr)?;
-            let entry_point = EntryPoint {
-                exec_model: op.exec_model,
-                func: op.func_id,
-                name: op.name.to_string(),
-            };
-            self.entry_points.push(entry_point);
-            instrs.next();
-        }
-        Ok(())
+    fn get_deco(&self, id: InstrId, member_idx: Option<u32>, deco: Decoration) -> Option<&[u32]> {
+        self.deco_map.get(&(id, member_idx, deco))
+            .cloned()
+    }
+    fn get_deco_u32(&self, id: InstrId, member_idx: Option<u32>, deco: Decoration) -> Option<u32> {
+        self.deco_map.get(&(id, member_idx, deco))
+            .and_then(|x| x.get(0))
+            .cloned()
+    }
+    fn get_var_location_or_default(&self, var_id: VariableId) -> u32 {
+        self.get_deco_u32(var_id, None, DECO_LOCATION)
+            .unwrap_or(0)
+    }
+    fn get_var_desc_bind_or_default(&self, var_id: VariableId) -> DescriptorBinding {
+        let desc_set = self.get_deco_u32(var_id, None, DECO_DESCRIPTOR_SET)
+            .unwrap_or(0);
+        let bind_point = self.get_deco_u32(var_id, None, DECO_BINDING)
+            .unwrap_or(0);
+        DescriptorBinding::desc_bind(desc_set, bind_point)
+    }
+    fn get_name(&self, id: InstrId, member_idx: Option<u32>) -> Option<&'a str> {
+        self.name_map.get(&(id, member_idx))
+            .map(|x| *x)
     }
     fn populate_names(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
         // Extract naming. Names are generally produced as debug information by
@@ -552,7 +543,15 @@ impl<'a> SpirvMetadata<'a> {
             entry.insert(value); Ok(())
         } else { Err(Error::CorruptedSpirv) }
     }
-    fn populate_one_var(&mut self, instr: &Instr<'a>) -> Result<()> {
+    fn populate_one_const(&mut self, instr: &Instr<'a>) -> Result<()> {
+        if instr.opcode() != OP_CONSTANT { return Ok(()) }
+        let op = OpConstant::try_from(instr)?;
+        let constant = Constant { ty: op.ty_id, value: op.value };
+        if let Vacant(entry) = self.const_map.entry(op.const_id) {
+            entry.insert(constant); Ok(())
+        } else { Err(Error::CorruptedSpirv) }
+    }
+    fn populate_one_var(&mut self, instr: &Instr<'a>, meta: &mut SpirvMetadata<'a>) -> Result<()> {
         let op = OpVariable::try_from(instr)?;
         let (ty_id, ty) = if let Some(x) = self.resolve_ref(op.ty_id) { x } else {
             // If a variable is declared based on a unregistered type, very
@@ -564,7 +563,7 @@ impl<'a> SpirvMetadata<'a> {
             STORE_CLS_INPUT => {
                 if let Some(ivar_ty) = InterfaceVariableType::from_ty(ty) {
                     let location = self.get_var_location_or_default(op.alloc_id);
-                    self.attr_map.insert(location, ivar_ty);
+                    meta.attr_map.insert(location, ivar_ty);
                 }
                 // There can be interface blocks for input and output but there
                 // won't be any for attribute inputs nor for attachment outputs,
@@ -573,7 +572,7 @@ impl<'a> SpirvMetadata<'a> {
             STORE_CLS_OUTPUT => {
                 if let Some(ivar_ty) = InterfaceVariableType::from_ty(ty) {
                     let location = self.get_var_location_or_default(op.alloc_id);
-                    self.attm_map.insert(location, ivar_ty);
+                    meta.attm_map.insert(location, ivar_ty);
                 }
             },
             STORE_CLS_PUSH_CONSTANT => {
@@ -582,7 +581,7 @@ impl<'a> SpirvMetadata<'a> {
                 if let Type::Struct(struct_ty) = ty.clone() {
                     let desc_bind = DescriptorBinding::push_const();
                     let desc_ty = DescriptorType::PushConstant(struct_ty);
-                    if self.desc_map.insert(desc_bind, desc_ty).is_some() {
+                    if meta.desc_map.insert(desc_bind, desc_ty).is_some() {
                         return Err(Error::CorruptedSpirv);
                     }
                 } else { return Err(Error::CorruptedSpirv); }
@@ -591,7 +590,7 @@ impl<'a> SpirvMetadata<'a> {
                 if let Some(iblock_ty) = InterfaceBlockType::from_uniform(ty) {
                     let desc_bind = self.get_var_desc_bind_or_default(op.alloc_id);
                     let desc_ty = DescriptorType::Block(iblock_ty);
-                    if self.desc_map.insert(desc_bind, desc_ty).is_some() {
+                    if meta.desc_map.insert(desc_bind, desc_ty).is_some() {
                         return Err(Error::CorruptedSpirv);
                     }
                 } else { return Err(Error::CorruptedSpirv); }
@@ -600,7 +599,7 @@ impl<'a> SpirvMetadata<'a> {
                 if let Some(iblock_ty) = InterfaceBlockType::from_store_buf(ty) {
                     let desc_bind = self.get_var_desc_bind_or_default(op.alloc_id);
                     let desc_ty = DescriptorType::Block(iblock_ty);
-                    if self.desc_map.insert(desc_bind, desc_ty).is_some() {
+                    if meta.desc_map.insert(desc_bind, desc_ty).is_some() {
                         return Err(Error::CorruptedSpirv);
                     }
                 } else { return Err(Error::CorruptedSpirv); }
@@ -615,7 +614,7 @@ impl<'a> SpirvMetadata<'a> {
                             .ok_or(Error::CorruptedSpirv)?;
                         DescriptorType::InputAtatchment(input_attm_idx)
                     };
-                    if self.desc_map.insert(desc_bind, desc_ty).is_some() {
+                    if meta.desc_map.insert(desc_bind, desc_ty).is_some() {
                         return Err(Error::CorruptedSpirv);
                     }
                 }
@@ -627,15 +626,7 @@ impl<'a> SpirvMetadata<'a> {
         }
         Ok(())
     }
-    fn populate_one_const(&mut self, instr: &Instr<'a>) -> Result<()> {
-        if instr.opcode() != OP_CONSTANT { return Ok(()) }
-        let op = OpConstant::try_from(instr)?;
-        let constant = Constant { ty: op.ty_id, value: op.value };
-        if let Vacant(entry) = self.const_map.entry(op.const_id) {
-            entry.insert(constant); Ok(())
-        } else { Err(Error::CorruptedSpirv) }
-    }
-    fn populate_defs(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
+    fn populate_defs(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>, meta: &mut SpirvMetadata<'a>) -> Result<()> {
         // type definitions always follow decorations, so we don't skip
         // instructions here.
         while let Some(instr) = instrs.peek() {
@@ -644,12 +635,62 @@ impl<'a> SpirvMetadata<'a> {
             if (TYPE_RANGE.contains(&opcode)) {
                 self.populate_one_ty(instr)?;
             } else if opcode == OP_VARIABLE {
-                self.populate_one_var(instr)?;
+                self.populate_one_var(instr, meta)?;
             } else if CONST_RANGE.contains(&opcode) {
                 self.populate_one_const(instr)?;
             } else if SPEC_CONST_RANGE.contains(&opcode) {
                 // TODO: (penguinliong)
             } else { break; }
+            instrs.next();
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct SpirvMetadata<'a> {
+    entry_points: Vec<EntryPoint>,
+    attr_map: HashMap<Location, InterfaceVariableType>,
+    attm_map: HashMap<Location, InterfaceVariableType>,
+    desc_map: HashMap<DescriptorBinding, DescriptorType<'a>>,
+    func_map: HashMap<FunctionId, Function>,
+}
+impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
+    type Error = Error;
+    fn try_from(module: &'a SpirvBinary) -> Result<SpirvMetadata<'a>> {
+        use log::debug;
+        fn skip_until_range_inclusive<'a>(instrs: &'_ mut Peekable<Instrs<'a>>, rng: RangeInclusive<u32>) {
+            while let Some(instr) = instrs.peek() {
+                if !rng.contains(&instr.opcode()) { instrs.next(); } else { break; }
+            }
+        }
+        // Don't change the order. See _2.4 Logical Layout of a Module_ of the
+        // SPIR-V specification for more information.
+        let mut instrs = module.instrs().peekable();
+        let mut meta = SpirvMetadata::default();
+        let mut itm = ReflectIntermediate::default();
+        skip_until_range_inclusive(&mut instrs, ENTRY_POINT_RANGE);
+        meta.populate_entry_points(&mut instrs)?;
+        skip_until_range_inclusive(&mut instrs, NAME_RANGE);
+        itm.populate_names(&mut instrs)?;
+        skip_until_range_inclusive(&mut instrs, DECO_RANGE);
+        itm.populate_decos(&mut instrs)?;
+        itm.populate_defs(&mut instrs, &mut meta)?;
+        meta.populate_access(&mut instrs)?;
+        Ok(meta)
+    }
+}
+impl<'a> SpirvMetadata<'a> {
+    fn populate_entry_points(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
+        while let Some(instr) = instrs.peek() {
+            if instr.opcode() != OP_ENTRY_POINT { break; }
+            let op = OpEntryPoint::try_from(instr)?;
+            let entry_point = EntryPoint {
+                exec_model: op.exec_model,
+                func: op.func_id,
+                name: op.name.to_string(),
+            };
+            self.entry_points.push(entry_point);
             instrs.next();
         }
         Ok(())
@@ -717,43 +758,8 @@ impl<'a> SpirvMetadata<'a> {
         accessed_vars.into_iter()
     }
     */
-    /// Resolve one recurring layer of pointers to the pointer that refer to the
-    /// data directly.
-    fn resolve_ref(&self, ty_id: TypeId) -> Option<(TypeId, &Type<'a>)> {
-        self.ptr_map.get(&ty_id)
-            .and_then(|ty_id| {
-                self.ty_map.get(ty_id)
-                    .map(|ty| (*ty_id, ty))
-            })
-    }
-    fn contains_deco(&self, id: ObjectId, member_idx: Option<u32>, deco: Decoration) -> bool {
-        self.deco_map.contains_key(&(id, member_idx, deco))
-    }
-    fn get_deco(&self, id: InstrId, member_idx: Option<u32>, deco: Decoration) -> Option<&[u32]> {
-        self.deco_map.get(&(id, member_idx, deco))
-            .cloned()
-    }
-    fn get_deco_u32(&self, id: InstrId, member_idx: Option<u32>, deco: Decoration) -> Option<u32> {
-        self.deco_map.get(&(id, member_idx, deco))
-            .and_then(|x| x.get(0))
-            .cloned()
-    }
-    fn get_var_location_or_default(&self, var_id: VariableId) -> u32 {
-        self.get_deco_u32(var_id, None, DECO_LOCATION)
-            .unwrap_or(0)
-    }
-    fn get_var_desc_bind_or_default(&self, var_id: VariableId) -> DescriptorBinding {
-        let desc_set = self.get_deco_u32(var_id, None, DECO_DESCRIPTOR_SET)
-            .unwrap_or(0);
-        let bind_point = self.get_deco_u32(var_id, None, DECO_BINDING)
-            .unwrap_or(0);
-        DescriptorBinding::desc_bind(desc_set, bind_point)
-    }
-    fn get_name(&self, id: InstrId, member_idx: Option<u32>) -> Option<&'a str> {
-        self.name_map.get(&(id, member_idx))
-            .map(|x| *x)
-    }
 }
+
 /*
 #[derive(Debug, Default)]
 pub struct PipelineMetadata {
