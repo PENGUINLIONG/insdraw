@@ -169,27 +169,27 @@ pub struct ImageType {
     arng: ImageArrangement,
 }
 #[derive(Debug, Hash, Clone)]
-struct ArrayType<'a> {
-    proto_ty: Box<Type<'a>>,
+struct ArrayType {
+    proto_ty: Box<Type>,
     nrepeat: Option<u32>,
     stride: Option<usize>,
 }
-impl<'a> ArrayType<'a> {
-    pub fn new_multibind(proto_ty: &Type<'a>, nrepeat: u32) -> ArrayType<'a> {
+impl ArrayType {
+    pub fn new_multibind(proto_ty: &Type, nrepeat: u32) -> ArrayType {
         ArrayType {
             proto_ty: Box::new(proto_ty.clone()),
             nrepeat: Some(nrepeat),
             stride: None,
         }
     }
-    pub fn new(proto_ty: &Type<'a>, nrepeat: u32, stride: usize) -> ArrayType<'a> {
+    pub fn new(proto_ty: &Type, nrepeat: u32, stride: usize) -> ArrayType {
         ArrayType {
             proto_ty: Box::new(proto_ty.clone()),
             nrepeat: Some(nrepeat),
             stride: Some(stride),
         }
     }
-    pub fn new_unsized(proto_ty: &Type<'a>, stride: usize) -> ArrayType<'a> {
+    pub fn new_unsized(proto_ty: &Type, stride: usize) -> ArrayType {
         ArrayType {
             proto_ty: Box::new(proto_ty.clone()),
             nrepeat: None,
@@ -198,16 +198,16 @@ impl<'a> ArrayType<'a> {
     }
 }
 #[derive(Debug, Default, Clone)]
-struct StructType<'a> {
-    members: Vec<(usize, Type<'a>)>, // Offset and type.
-    name_map: BTreeMap<&'a str, MemberIdx>,
+struct StructType {
+    members: Vec<(usize, Type)>, // Offset and type.
+    name_map: BTreeMap<String, MemberIdx>,
     // We assume a structure decorated by `Block` is uniform in the first place.
     // On instanciating the structure type into interface block, we check if the
     // storage class is `StorageClass`. If it is, this field will be canceled in
     // the end to false.
     is_iuniform: bool,
 }
-impl<'a> Hash for StructType<'a> {
+impl<'a> Hash for StructType {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.members.hash(state);
         // NOTE: This enforces that the names for a same member in each stage
@@ -229,13 +229,13 @@ struct Function {
 }
 
 #[derive(Debug, Hash, Clone)]
-enum Type<'a> {
+enum Type {
     Numeric(NumericType),
     Vector(VectorType),
     Matrix(MatrixType),
     Image(Option<ImageType>),
-    Array(ArrayType<'a>),
-    Struct(StructType<'a>),
+    Array(ArrayType),
+    Struct(StructType),
 }
 
 type Location = u32;
@@ -274,7 +274,7 @@ enum InterfaceVariableType {
     Matrix(MatrixType),
 }
 impl InterfaceVariableType {
-    fn from_ty<'a>(ty: &Type<'a>) -> Option<InterfaceVariableType> {
+    fn from_ty<'a>(ty: &Type) -> Option<InterfaceVariableType> {
         let ivar_ty = match ty.clone() {
             Type::Numeric(num_ty) => InterfaceVariableType::Numeric(num_ty),
             Type::Vector(vec_ty) => InterfaceVariableType::Vector(vec_ty),
@@ -285,12 +285,12 @@ impl InterfaceVariableType {
     }
 }
 #[derive(Debug, Clone)]
-struct InterfaceBlockType<'a> {
-    block_ty: StructType<'a>,
+struct InterfaceBlockType {
+    block_ty: StructType,
     nbind: u32,
 }
-impl<'a> InterfaceBlockType<'a> {
-    fn from_store_buf(block_ty: &Type<'a>) -> Option<InterfaceBlockType<'a>> {
+impl<'a> InterfaceBlockType {
+    fn from_store_buf(block_ty: &Type) -> Option<InterfaceBlockType> {
         let (mut block_ty, nbind) = match block_ty {
             Type::Array(arr_ty) => if let Type::Struct(struct_ty) = &*arr_ty.proto_ty {
                 (struct_ty.clone(), arr_ty.nrepeat?)
@@ -303,7 +303,7 @@ impl<'a> InterfaceBlockType<'a> {
         let iblock_ty = InterfaceBlockType { block_ty: block_ty, nbind: nbind };
         Some(iblock_ty)
     }
-    fn from_uniform(block_ty: &Type<'a>) -> Option<InterfaceBlockType<'a>> {
+    fn from_uniform(block_ty: &Type) -> Option<InterfaceBlockType> {
         let (mut block_ty, nbind) = match block_ty {
             Type::Array(arr_ty) => if let Type::Struct(struct_ty) = &*arr_ty.proto_ty {
                 (struct_ty.clone(), arr_ty.nrepeat?)
@@ -318,9 +318,9 @@ impl<'a> InterfaceBlockType<'a> {
     fn is_storage(&self) -> bool { !self.block_ty.is_iuniform }
 }
 #[derive(Debug, Clone)]
-pub enum DescriptorType<'a> {
-    PushConstant(StructType<'a>),
-    Block(InterfaceBlockType<'a>),
+pub enum DescriptorType {
+    PushConstant(StructType),
+    Block(InterfaceBlockType),
     Image(ImageType),
     InputAtatchment(u32),
 }
@@ -328,14 +328,14 @@ pub enum DescriptorType<'a> {
 struct ReflectIntermediate<'a> {
     name_map: HashMap<(InstrId, Option<u32>), &'a str>,
     deco_map: HashMap<(InstrId, Option<u32>, Decoration), &'a [u32]>,
-    ty_map: HashMap<TypeId, Type<'a>>,
+    ty_map: HashMap<TypeId, Type>,
     const_map: HashMap<ConstantId, Constant<'a>>,
     ptr_map: HashMap<TypeId, TypeId>,
 }
 impl<'a> ReflectIntermediate<'a> {
     /// Resolve one recurring layer of pointers to the pointer that refer to the
     /// data directly.
-    fn resolve_ref(&self, ty_id: TypeId) -> Option<(TypeId, &Type<'a>)> {
+    fn resolve_ref(&self, ty_id: TypeId) -> Option<(TypeId, &Type)> {
         self.ptr_map.get(&ty_id)
             .and_then(|ty_id| {
                 self.ty_map.get(ty_id)
@@ -517,7 +517,7 @@ impl<'a> ReflectIntermediate<'a> {
                     }
                     if let Some(name) = self.get_name(op.ty_id, Some(i as u32)) {
                         if !name.is_empty() {
-                            struct_ty.name_map.insert(name, i);
+                            struct_ty.name_map.insert(name.to_owned(), i);
                         }
                     }
                     if let Some(offset) = self.get_deco_u32(op.ty_id, Some(i as u32), DECO_OFFSET) {
@@ -551,7 +551,7 @@ impl<'a> ReflectIntermediate<'a> {
             entry.insert(constant); Ok(())
         } else { Err(Error::CorruptedSpirv) }
     }
-    fn populate_one_var(&mut self, instr: &Instr<'a>, meta: &mut SpirvMetadata<'a>) -> Result<()> {
+    fn populate_one_var(&mut self, instr: &Instr<'a>, meta: &mut SpirvMetadata) -> Result<()> {
         let op = OpVariable::try_from(instr)?;
         let (ty_id, ty) = if let Some(x) = self.resolve_ref(op.ty_id) { x } else {
             // If a variable is declared based on a unregistered type, very
@@ -626,7 +626,7 @@ impl<'a> ReflectIntermediate<'a> {
         }
         Ok(())
     }
-    fn populate_defs(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>, meta: &mut SpirvMetadata<'a>) -> Result<()> {
+    fn populate_defs(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>, meta: &mut SpirvMetadata) -> Result<()> {
         // type definitions always follow decorations, so we don't skip
         // instructions here.
         while let Some(instr) = instrs.peek() {
@@ -648,16 +648,16 @@ impl<'a> ReflectIntermediate<'a> {
 }
 
 #[derive(Default, Debug)]
-pub struct SpirvMetadata<'a> {
+pub struct SpirvMetadata {
     entry_points: Vec<EntryPoint>,
     attr_map: HashMap<Location, InterfaceVariableType>,
     attm_map: HashMap<Location, InterfaceVariableType>,
-    desc_map: HashMap<DescriptorBinding, DescriptorType<'a>>,
+    desc_map: HashMap<DescriptorBinding, DescriptorType>,
     func_map: HashMap<FunctionId, Function>,
 }
-impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
+impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata {
     type Error = Error;
-    fn try_from(module: &'a SpirvBinary) -> Result<SpirvMetadata<'a>> {
+    fn try_from(module: &'a SpirvBinary) -> Result<SpirvMetadata> {
         use log::debug;
         fn skip_until_range_inclusive<'a>(instrs: &'_ mut Peekable<Instrs<'a>>, rng: RangeInclusive<u32>) {
             while let Some(instr) = instrs.peek() {
@@ -680,7 +680,7 @@ impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata<'a> {
         Ok(meta)
     }
 }
-impl<'a> SpirvMetadata<'a> {
+impl<'a> SpirvMetadata {
     fn populate_entry_points(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
         while let Some(instr) = instrs.peek() {
             if instr.opcode() != OP_ENTRY_POINT { break; }
