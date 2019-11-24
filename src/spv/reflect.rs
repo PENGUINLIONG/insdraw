@@ -261,11 +261,18 @@ impl fmt::Debug for DescriptorBinding {
 }
 
 
-#[derive(Debug, Clone)]
-struct EntryPoint {
-    func: u32,
+struct EntryPointDeclartion {
+    func_id: u32,
     name: String,
-    exec_model: u32,
+    exec_model: ExecutionModel,
+}
+#[derive(Debug, Default, Clone)]
+struct EntryPoint {
+    exec_model: ExecutionModel,
+    name: String,
+    attr_map: HashMap<Location, InterfaceVariableType>,
+    attm_map: HashMap<Location, InterfaceVariableType>,
+    desc_map: HashMap<DescriptorBinding, DescriptorType>,
 }
 #[derive(Debug, Clone)]
 enum InterfaceVariableType {
@@ -324,13 +331,24 @@ pub enum DescriptorType {
     Image(ImageType),
     InputAtatchment(u32),
 }
+
+#[derive(Clone)]
+enum Variable {
+    Input(Location, InterfaceVariableType),
+    Output(Location, InterfaceVariableType),
+    Descriptor(DescriptorBinding, DescriptorType),
+}
+
 #[derive(Default)]
 struct ReflectIntermediate<'a> {
+    entry_point_declrs: Vec<EntryPointDeclartion>,
     name_map: HashMap<(InstrId, Option<u32>), &'a str>,
     deco_map: HashMap<(InstrId, Option<u32>, Decoration), &'a [u32]>,
     ty_map: HashMap<TypeId, Type>,
+    var_map: HashMap<VariableId, Variable>,
     const_map: HashMap<ConstantId, Constant<'a>>,
     ptr_map: HashMap<TypeId, TypeId>,
+    func_map: HashMap<FunctionId, Function>,
 }
 impl<'a> ReflectIntermediate<'a> {
     /// Resolve one recurring layer of pointers to the pointer that refer to the
@@ -368,6 +386,20 @@ impl<'a> ReflectIntermediate<'a> {
     fn get_name(&self, id: InstrId, member_idx: Option<u32>) -> Option<&'a str> {
         self.name_map.get(&(id, member_idx))
             .map(|x| *x)
+    }
+    fn populate_entry_points(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
+        while let Some(instr) = instrs.peek() {
+            if instr.opcode() != OP_ENTRY_POINT { break; }
+            let op = OpEntryPoint::try_from(instr)?;
+            let entry_point_declr = EntryPointDeclartion {
+                exec_model: op.exec_model,
+                func_id: op.func_id,
+                name: op.name.to_string(),
+            };
+            self.entry_point_declrs.push(entry_point_declr);
+            instrs.next();
+        }
+        Ok(())
     }
     fn populate_names(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
         // Extract naming. Names are generally produced as debug information by
@@ -529,6 +561,8 @@ impl<'a> ReflectIntermediate<'a> {
                         return Ok(())
                     }
                 }
+                // Don't have to shrink-to-fit because the types in `ty_map`
+                // won't be used directly and will be cloned later.
                 (op.ty_id, Type::Struct(struct_ty))
             },
             OP_TYPE_POINTER => {
@@ -551,7 +585,7 @@ impl<'a> ReflectIntermediate<'a> {
             entry.insert(constant); Ok(())
         } else { Err(Error::CorruptedSpirv) }
     }
-    fn populate_one_var(&mut self, instr: &Instr<'a>, meta: &mut SpirvMetadata) -> Result<()> {
+    fn populate_one_var(&mut self, instr: &Instr<'a>) -> Result<()> {
         let op = OpVariable::try_from(instr)?;
         let (ty_id, ty) = if let Some(x) = self.resolve_ref(op.ty_id) { x } else {
             // If a variable is declared based on a unregistered type, very
@@ -563,7 +597,10 @@ impl<'a> ReflectIntermediate<'a> {
             STORE_CLS_INPUT => {
                 if let Some(ivar_ty) = InterfaceVariableType::from_ty(ty) {
                     let location = self.get_var_location_or_default(op.alloc_id);
-                    meta.attr_map.insert(location, ivar_ty);
+                    let var = Variable::Input(location, ivar_ty);
+                    if self.var_map.insert(op.alloc_id, var).is_some() {
+                        return Err(Error::CorruptedSpirv);
+                    }
                 }
                 // There can be interface blocks for input and output but there
                 // won't be any for attribute inputs nor for attachment outputs,
@@ -572,7 +609,10 @@ impl<'a> ReflectIntermediate<'a> {
             STORE_CLS_OUTPUT => {
                 if let Some(ivar_ty) = InterfaceVariableType::from_ty(ty) {
                     let location = self.get_var_location_or_default(op.alloc_id);
-                    meta.attm_map.insert(location, ivar_ty);
+                    let var = Variable::Output(location, ivar_ty);
+                    if self.var_map.insert(op.alloc_id, var).is_some() {
+                        return Err(Error::CorruptedSpirv);
+                    }
                 }
             },
             STORE_CLS_PUSH_CONSTANT => {
@@ -581,7 +621,8 @@ impl<'a> ReflectIntermediate<'a> {
                 if let Type::Struct(struct_ty) = ty.clone() {
                     let desc_bind = DescriptorBinding::push_const();
                     let desc_ty = DescriptorType::PushConstant(struct_ty);
-                    if meta.desc_map.insert(desc_bind, desc_ty).is_some() {
+                    let var = Variable::Descriptor(desc_bind, desc_ty);
+                    if self.var_map.insert(op.alloc_id, var).is_some() {
                         return Err(Error::CorruptedSpirv);
                     }
                 } else { return Err(Error::CorruptedSpirv); }
@@ -590,7 +631,8 @@ impl<'a> ReflectIntermediate<'a> {
                 if let Some(iblock_ty) = InterfaceBlockType::from_uniform(ty) {
                     let desc_bind = self.get_var_desc_bind_or_default(op.alloc_id);
                     let desc_ty = DescriptorType::Block(iblock_ty);
-                    if meta.desc_map.insert(desc_bind, desc_ty).is_some() {
+                    let var = Variable::Descriptor(desc_bind, desc_ty);
+                    if self.var_map.insert(op.alloc_id, var).is_some() {
                         return Err(Error::CorruptedSpirv);
                     }
                 } else { return Err(Error::CorruptedSpirv); }
@@ -599,7 +641,8 @@ impl<'a> ReflectIntermediate<'a> {
                 if let Some(iblock_ty) = InterfaceBlockType::from_store_buf(ty) {
                     let desc_bind = self.get_var_desc_bind_or_default(op.alloc_id);
                     let desc_ty = DescriptorType::Block(iblock_ty);
-                    if meta.desc_map.insert(desc_bind, desc_ty).is_some() {
+                    let var = Variable::Descriptor(desc_bind, desc_ty);
+                    if self.var_map.insert(op.alloc_id, var).is_some() {
                         return Err(Error::CorruptedSpirv);
                     }
                 } else { return Err(Error::CorruptedSpirv); }
@@ -614,7 +657,8 @@ impl<'a> ReflectIntermediate<'a> {
                             .ok_or(Error::CorruptedSpirv)?;
                         DescriptorType::InputAtatchment(input_attm_idx)
                     };
-                    if meta.desc_map.insert(desc_bind, desc_ty).is_some() {
+                    let var = Variable::Descriptor(desc_bind, desc_ty);
+                    if self.var_map.insert(op.alloc_id, var).is_some() {
                         return Err(Error::CorruptedSpirv);
                     }
                 }
@@ -626,7 +670,7 @@ impl<'a> ReflectIntermediate<'a> {
         }
         Ok(())
     }
-    fn populate_defs(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>, meta: &mut SpirvMetadata) -> Result<()> {
+    fn populate_defs(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
         // type definitions always follow decorations, so we don't skip
         // instructions here.
         while let Some(instr) = instrs.peek() {
@@ -635,62 +679,12 @@ impl<'a> ReflectIntermediate<'a> {
             if (TYPE_RANGE.contains(&opcode)) {
                 self.populate_one_ty(instr)?;
             } else if opcode == OP_VARIABLE {
-                self.populate_one_var(instr, meta)?;
+                self.populate_one_var(instr)?;
             } else if CONST_RANGE.contains(&opcode) {
                 self.populate_one_const(instr)?;
             } else if SPEC_CONST_RANGE.contains(&opcode) {
                 // TODO: (penguinliong)
             } else { break; }
-            instrs.next();
-        }
-        Ok(())
-    }
-}
-
-#[derive(Default, Debug)]
-pub struct SpirvMetadata {
-    entry_points: Vec<EntryPoint>,
-    attr_map: HashMap<Location, InterfaceVariableType>,
-    attm_map: HashMap<Location, InterfaceVariableType>,
-    desc_map: HashMap<DescriptorBinding, DescriptorType>,
-    func_map: HashMap<FunctionId, Function>,
-}
-impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata {
-    type Error = Error;
-    fn try_from(module: &'a SpirvBinary) -> Result<SpirvMetadata> {
-        use log::debug;
-        fn skip_until_range_inclusive<'a>(instrs: &'_ mut Peekable<Instrs<'a>>, rng: RangeInclusive<u32>) {
-            while let Some(instr) = instrs.peek() {
-                if !rng.contains(&instr.opcode()) { instrs.next(); } else { break; }
-            }
-        }
-        // Don't change the order. See _2.4 Logical Layout of a Module_ of the
-        // SPIR-V specification for more information.
-        let mut instrs = module.instrs().peekable();
-        let mut meta = SpirvMetadata::default();
-        let mut itm = ReflectIntermediate::default();
-        skip_until_range_inclusive(&mut instrs, ENTRY_POINT_RANGE);
-        meta.populate_entry_points(&mut instrs)?;
-        skip_until_range_inclusive(&mut instrs, NAME_RANGE);
-        itm.populate_names(&mut instrs)?;
-        skip_until_range_inclusive(&mut instrs, DECO_RANGE);
-        itm.populate_decos(&mut instrs)?;
-        itm.populate_defs(&mut instrs, &mut meta)?;
-        meta.populate_access(&mut instrs)?;
-        Ok(meta)
-    }
-}
-impl<'a> SpirvMetadata {
-    fn populate_entry_points(&mut self, instrs: &'_ mut Peekable<Instrs<'a>>) -> Result<()> {
-        while let Some(instr) = instrs.peek() {
-            if instr.opcode() != OP_ENTRY_POINT { break; }
-            let op = OpEntryPoint::try_from(instr)?;
-            let entry_point = EntryPoint {
-                exec_model: op.exec_model,
-                func: op.func_id,
-                name: op.name.to_string(),
-            };
-            self.entry_points.push(entry_point);
             instrs.next();
         }
         Ok(())
@@ -741,23 +735,85 @@ impl<'a> SpirvMetadata {
         }
         Ok(())
     }
-    /*
-    fn collect_fn_vars_impl(&self, func: FunctionId, vars: &mut HashSet<ResourceId>) {
+    fn collect_fn_vars_impl(&self, func: FunctionId, vars: &mut HashSet<VariableId>) {
         if let Some(func) = self.func_map.get(&func) {
             let it = func.accessed_vars.iter()
-                .filter(|x| self.rsc_map.contains_key(x));
+                .filter(|x| self.var_map.contains_key(x));
             vars.extend(it);
             for call in func.calls.iter() {
                 self.collect_fn_vars_impl(*call, vars);
             }
         }
     }
-    pub fn collect_fn_vars(&self, func: FunctionId) -> impl Iterator<Item=ResourceId> {
+    fn collect_fn_vars(&self, func: FunctionId) -> HashSet<VariableId> {
         let mut accessed_vars = HashSet::new();
         self.collect_fn_vars_impl(func, &mut accessed_vars);
-        accessed_vars.into_iter()
+        accessed_vars
     }
-    */
+    fn collect_entry_points(&self) -> Result<Vec<EntryPoint>> {
+        let mut entry_points = Vec::with_capacity(self.entry_point_declrs.len());
+        for entry_point_declr in self.entry_point_declrs.iter() {
+            let mut entry_point = EntryPoint {
+                name: entry_point_declr.name.to_owned(),
+                exec_model: entry_point_declr.exec_model,
+                ..Default::default()
+            };
+            let accessed_var_ids = self.collect_fn_vars(entry_point_declr.func_id);
+            for accessed_var_id in accessed_var_ids {
+                let accessed_var = self.var_map.get(&accessed_var_id)
+                    .cloned()
+                    .ok_or(Error::CorruptedSpirv)?;
+                let collision = match accessed_var {
+                    Variable::Input(location, ivar_ty) => {
+                        entry_point.attr_map.insert(location, ivar_ty).is_some()
+                    },
+                    Variable::Output(location, ivar_ty) => {
+                        entry_point.attm_map.insert(location, ivar_ty).is_some()
+                    },
+                    Variable::Descriptor(desc_bind, desc_ty) => {
+                        entry_point.desc_map.insert(desc_bind, desc_ty).is_some()
+                    },
+                };
+                if collision { return Err(Error::CorruptedSpirv); }
+            }
+            entry_points.push(entry_point);
+        }
+        Ok(entry_points)
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct SpirvMetadata {
+    entry_points: Vec<EntryPoint>,
+}
+impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata {
+    type Error = Error;
+    fn try_from(module: &'a SpirvBinary) -> Result<SpirvMetadata> {
+        use log::debug;
+        fn skip_until_range_inclusive<'a>(instrs: &'_ mut Peekable<Instrs<'a>>, rng: RangeInclusive<u32>) {
+            while let Some(instr) = instrs.peek() {
+                if !rng.contains(&instr.opcode()) { instrs.next(); } else { break; }
+            }
+        }
+        // Don't change the order. See _2.4 Logical Layout of a Module_ of the
+        // SPIR-V specification for more information.
+        let mut instrs = module.instrs().peekable();
+        let mut itm = ReflectIntermediate::default();
+        skip_until_range_inclusive(&mut instrs, ENTRY_POINT_RANGE);
+        itm.populate_entry_points(&mut instrs)?;
+        skip_until_range_inclusive(&mut instrs, NAME_RANGE);
+        itm.populate_names(&mut instrs)?;
+        skip_until_range_inclusive(&mut instrs, DECO_RANGE);
+        itm.populate_decos(&mut instrs)?;
+        itm.populate_defs(&mut instrs)?;
+        itm.populate_access(&mut instrs)?;
+        let mut meta = SpirvMetadata {
+            entry_points: itm.collect_entry_points()?,
+        };
+        Ok(meta)
+    }
+}
+impl<'a> SpirvMetadata {
 }
 
 /*
