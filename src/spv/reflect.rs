@@ -7,8 +7,7 @@ use std::ops::RangeInclusive;
 use std::hash::{Hash, Hasher};
 use super::consts::*;
 use super::instr::*;
-use super::parse::{SpirvBinary, Instrs, Instr};
-use super::{Error, Result};
+use super::{SpirvBinary, Instrs, Instr, Error, Result};
 use log::debug;
 
 type ObjectId = u32;
@@ -21,7 +20,7 @@ type Decoration = u32;
 type StorageClass = u32;
 
 #[derive(Debug, Hash, Clone)]
-struct NumericType {
+pub struct NumericType {
     /// Byte-width of this type.
     pub nbyte: usize,
     /// For integral types the field indicate it's signed ness, true for signed
@@ -52,12 +51,12 @@ impl NumericType {
     }
 }
 #[derive(Debug, Hash, Clone)]
-struct NumericVariable {
+pub struct NumericVariable {
     pub nbyte: usize,
     pub is_signed: Option<bool>,
 }
 #[derive(Debug, Hash, Clone)]
-struct VectorType {
+pub struct VectorType {
     pub num_ty: NumericType,
     pub nnum: u32,
 }
@@ -76,7 +75,7 @@ impl Default for MatrixAxisOrder {
     fn default() -> MatrixAxisOrder { MatrixAxisOrder::ColumnMajor }
 }
 #[derive(Debug, Hash, Clone)]
-struct MatrixType {
+pub struct MatrixType {
     pub vec_ty: VectorType,
     pub nvec: u32,
     pub stride: usize,
@@ -169,7 +168,7 @@ pub struct ImageType {
     arng: ImageArrangement,
 }
 #[derive(Debug, Hash, Clone)]
-struct ArrayType {
+pub struct ArrayType {
     proto_ty: Box<Type>,
     nrepeat: Option<u32>,
     stride: Option<usize>,
@@ -198,7 +197,7 @@ impl ArrayType {
     }
 }
 #[derive(Debug, Default, Clone)]
-struct StructType {
+pub struct StructType {
     members: Vec<(usize, Type)>, // Offset and type.
     name_map: BTreeMap<String, MemberIdx>,
     // We assume a structure decorated by `Block` is uniform in the first place.
@@ -229,7 +228,7 @@ struct Function {
 }
 
 #[derive(Debug, Hash, Clone)]
-enum Type {
+pub enum Type {
     Numeric(NumericType),
     Vector(VectorType),
     Matrix(MatrixType),
@@ -238,7 +237,7 @@ enum Type {
     Struct(StructType),
 }
 
-type Location = u32;
+pub type Location = u32;
 
 #[derive(PartialEq, Eq, Hash, Default, Clone, Copy)]
 pub struct DescriptorBinding(Option<(u32, u32)>);
@@ -267,7 +266,7 @@ struct EntryPointDeclartion<'a> {
     exec_model: ExecutionModel,
 }
 #[derive(Debug, Default, Clone)]
-struct EntryPoint {
+pub struct EntryPoint {
     exec_model: ExecutionModel,
     name: String,
     attr_map: HashMap<Location, InterfaceVariableType>,
@@ -292,7 +291,7 @@ impl InterfaceVariableType {
     }
 }
 #[derive(Debug, Clone)]
-struct InterfaceBlockType {
+pub struct InterfaceBlockType {
     block_ty: StructType,
     nbind: u32,
 }
@@ -750,7 +749,7 @@ impl<'a> ReflectIntermediate<'a> {
         self.collect_fn_vars_impl(func, &mut accessed_vars);
         accessed_vars
     }
-    fn collect_entry_points(&self) -> Result<Vec<EntryPoint>> {
+    fn collect_entry_points(&self) -> Result<Box<[EntryPoint]>> {
         let mut entry_points = Vec::with_capacity(self.entry_point_declrs.len());
         for entry_point_declr in self.entry_point_declrs.iter() {
             let mut entry_point = EntryPoint {
@@ -778,42 +777,29 @@ impl<'a> ReflectIntermediate<'a> {
             }
             entry_points.push(entry_point);
         }
-        Ok(entry_points)
+        Ok(entry_points.into_boxed_slice())
     }
 }
 
-#[derive(Default, Debug)]
-pub struct SpirvMetadata {
-    entry_points: Vec<EntryPoint>,
-}
-impl<'a> TryFrom<&'a SpirvBinary> for SpirvMetadata {
-    type Error = Error;
-    fn try_from(module: &'a SpirvBinary) -> Result<SpirvMetadata> {
-        use log::debug;
-        fn skip_until_range_inclusive<'a>(instrs: &'_ mut Peekable<Instrs<'a>>, rng: RangeInclusive<u32>) {
-            while let Some(instr) = instrs.peek() {
-                if !rng.contains(&instr.opcode()) { instrs.next(); } else { break; }
-            }
+pub fn reflect_spirv<'a>(module: &'a SpirvBinary) -> Result<Box<[EntryPoint]>> {
+    fn skip_until_range_inclusive<'a>(instrs: &'_ mut Peekable<Instrs<'a>>, rng: RangeInclusive<u32>) {
+        while let Some(instr) = instrs.peek() {
+            if !rng.contains(&instr.opcode()) { instrs.next(); } else { break; }
         }
-        // Don't change the order. See _2.4 Logical Layout of a Module_ of the
-        // SPIR-V specification for more information.
-        let mut instrs = module.instrs().peekable();
-        let mut itm = ReflectIntermediate::default();
-        skip_until_range_inclusive(&mut instrs, ENTRY_POINT_RANGE);
-        itm.populate_entry_points(&mut instrs)?;
-        skip_until_range_inclusive(&mut instrs, NAME_RANGE);
-        itm.populate_names(&mut instrs)?;
-        skip_until_range_inclusive(&mut instrs, DECO_RANGE);
-        itm.populate_decos(&mut instrs)?;
-        itm.populate_defs(&mut instrs)?;
-        itm.populate_access(&mut instrs)?;
-        let mut meta = SpirvMetadata {
-            entry_points: itm.collect_entry_points()?,
-        };
-        Ok(meta)
     }
-}
-impl<'a> SpirvMetadata {
+    // Don't change the order. See _2.4 Logical Layout of a Module_ of the
+    // SPIR-V specification for more information.
+    let mut instrs = module.instrs().peekable();
+    let mut itm = ReflectIntermediate::default();
+    skip_until_range_inclusive(&mut instrs, ENTRY_POINT_RANGE);
+    itm.populate_entry_points(&mut instrs)?;
+    skip_until_range_inclusive(&mut instrs, NAME_RANGE);
+    itm.populate_names(&mut instrs)?;
+    skip_until_range_inclusive(&mut instrs, DECO_RANGE);
+    itm.populate_decos(&mut instrs)?;
+    itm.populate_defs(&mut instrs)?;
+    itm.populate_access(&mut instrs)?;
+    Ok(itm.collect_entry_points()?)
 }
 
 /*

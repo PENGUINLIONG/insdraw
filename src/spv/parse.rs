@@ -1,23 +1,13 @@
 use std::iter::FromIterator;
 use super::{Error, Result};
 
-pub struct SpirvBinary(Vec<u32>);
-impl From<Vec<u32>> for SpirvBinary {
-    fn from(x: Vec<u32>) -> Self { SpirvBinary(x) }
-}
-impl FromIterator<u32> for SpirvBinary {
-    fn from_iter<I: IntoIterator<Item=u32>>(iter: I) -> Self { SpirvBinary(iter.into_iter().collect::<Vec<u32>>()) }
-}
-
-impl SpirvBinary {
-    pub fn instrs<'a>(&'a self) -> Instrs<'a> {
+pub struct Instrs<'a>(&'a [u32]);
+impl<'a> Instrs<'a> {
+    pub fn new(spv: &'a [u32]) -> Instrs<'a> {
         const HEADER_LEN: usize = 5;
-        Instrs(&self.0[HEADER_LEN..])
+        Instrs(&spv[HEADER_LEN..])
     }
 }
-
-
-pub struct Instrs<'a>(&'a [u32]);
 impl<'a> Iterator for Instrs<'a> {
     type Item = Instr<'a>;
     fn next(&mut self) -> Option<Self::Item> {

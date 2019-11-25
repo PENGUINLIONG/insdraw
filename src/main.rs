@@ -27,9 +27,8 @@ fn main() {
     */
     let spvs = collect_spirv_binaries("assets/effects/uniform-pbr");
     info!("collected spirvs: {:?}", spvs.iter().map(|x| x.0.as_ref()).collect::<Vec<&str>>());
-    let meta = crate::spv::SpirvMetadata::try_from(&spvs["uniform-pbr.frag"])
-        .unwrap();
-    debug!("{:#?}", meta);
+    let entries = spvs["uniform-pbr.frag"].reflect();
+    debug!("{:#?}", entries);
     /*
     let spvs = spvs.into_iter()
         .map(|(_, bin)| bin)
