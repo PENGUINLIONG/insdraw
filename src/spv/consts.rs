@@ -97,7 +97,7 @@ pub const DIM_IMAGE_3D: Dimension = 2;
 pub const DIM_IMAGE_CUBE: Dimension = 3;
 pub const DIM_IMAGE_SUBPASS_DATA: Dimension = 6;
 
-pub type ImageUnitFormat = u32;
-pub const IMG_UNIT_FMT_RGBA32F: ImageUnitFormat = 1;
-pub const IMG_UNIT_FMT_R32F: ImageUnitFormat = 3;
-pub const IMG_UNIT_FMT_RGBA8: ImageUnitFormat = 4;
+pub type ColorFormat = u32;
+pub const IMG_UNIT_FMT_RGBA32F: ColorFormat = 1;
+pub const IMG_UNIT_FMT_R32F: ColorFormat = 3;
+pub const IMG_UNIT_FMT_RGBA8: ColorFormat = 4;

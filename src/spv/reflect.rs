@@ -19,7 +19,7 @@ type MemberIdx = usize;
 type Decoration = u32;
 type StorageClass = u32;
 
-#[derive(Debug, Hash, Clone)]
+#[derive(Hash, Clone)]
 pub struct NumericType {
     /// Byte-width of this type.
     pub nbyte: usize,
@@ -50,12 +50,18 @@ impl NumericType {
         if let None = self.is_signed { true } else { false }
     }
 }
-#[derive(Debug, Hash, Clone)]
-pub struct NumericVariable {
-    pub nbyte: usize,
-    pub is_signed: Option<bool>,
+impl fmt::Debug for NumericType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.is_signed {
+            Some(true) => write!(f, "i{}", self.nbyte << 3),
+            Some(false) => write!(f, "u{}", self.nbyte << 3),
+            None => write!(f, "f{}", self.nbyte << 3),
+        }
+    }
 }
-#[derive(Debug, Hash, Clone)]
+
+
+#[derive(Hash, Clone)]
 pub struct VectorType {
     pub num_ty: NumericType,
     pub nnum: u32,
@@ -66,7 +72,14 @@ impl VectorType {
     }
     pub fn nbyte(&self) -> usize { self.nnum as usize * self.num_ty.nbyte }
 }
-#[derive(Debug, Hash, Clone, Copy)]
+impl fmt::Debug for VectorType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "vec{}<{:?}>", self.nnum, self.num_ty)
+    }
+}
+
+
+#[derive(Hash, Clone, Copy)]
 pub enum MatrixAxisOrder {
     ColumnMajor,
     RowMajor,
@@ -74,7 +87,9 @@ pub enum MatrixAxisOrder {
 impl Default for MatrixAxisOrder {
     fn default() -> MatrixAxisOrder { MatrixAxisOrder::ColumnMajor }
 }
-#[derive(Debug, Hash, Clone)]
+
+
+#[derive(Hash, Clone)]
 pub struct MatrixType {
     pub vec_ty: VectorType,
     pub nvec: u32,
@@ -96,6 +111,19 @@ impl MatrixType {
     }
     pub fn nbyte(&self) -> usize { self.nvec as usize * self.stride }
 }
+impl fmt::Debug for MatrixType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let transpose = match self.major {
+            MatrixAxisOrder::ColumnMajor => "",
+            MatrixAxisOrder::RowMajor => "T",
+        };
+        let nrow = self.vec_ty.nnum;
+        let ncol = self.nvec;
+        let num_ty = &self.vec_ty.num_ty;
+        write!(f, "mat{}x{}{}<{:?}>", nrow, ncol, transpose, num_ty)
+    }
+}
+
 
 #[derive(Debug, Hash, Clone, Copy)]
 pub enum ColorFormat {
@@ -114,7 +142,8 @@ impl ColorFormat {
         Ok(color_fmt)
     }
 }
-#[derive(Debug, Hash, Clone, Copy)]
+
+#[derive(Hash, Clone, Copy)]
 pub enum ImageUnitFormat {
     Color(ColorFormat),
     Sampled,
@@ -131,7 +160,9 @@ impl ImageUnitFormat {
         Ok(img_unit_fmt)
     }
 }
-#[derive(Debug, Hash, Clone, Copy)]
+
+
+#[derive(Hash, Clone, Copy)]
 pub enum ImageArrangement {
     Image1D,
     Image2D,
@@ -162,12 +193,51 @@ impl ImageArrangement {
         Ok(arng)
     }
 }
-#[derive(Debug, Hash, Clone)]
+
+
+#[derive(Hash, Clone)]
 pub struct ImageType {
-    fmt: ImageUnitFormat,
+    unit_fmt: ImageUnitFormat,
     arng: ImageArrangement,
 }
-#[derive(Debug, Hash, Clone)]
+impl fmt::Debug for ImageType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use ImageArrangement::*;
+        use ImageUnitFormat::*;
+        match (self.arng, self.unit_fmt) {
+            (Image1D, Color(fmt)) => write!(f, "image1D<{:?}>", fmt),
+            (Image2D, Color(fmt)) => write!(f, "image2D<{:?}>", fmt),
+            (Image2DMS, Color(fmt)) => write!(f, "image2DMS<{:?}>", fmt),
+            (Image3D, Color(fmt)) => write!(f, "image3D<{:?}>", fmt),
+            (CubeMap, Color(fmt)) => write!(f, "imageCube<{:?}>", fmt),
+            (Image1DArray, Color(fmt)) => write!(f, "image1DArray<{:?}>", fmt),
+            (Image2DArray, Color(fmt)) => write!(f, "image2DArray<{:?}>", fmt),
+            (Image2DMSArray, Color(fmt)) => write!(f, "image2DMSArray<{:?}>", fmt),
+            (CubeMapArray, Color(fmt)) => write!(f, "imageCubeArray<{:?}>", fmt),
+            
+            (Image1D, Sampled) => f.write_str("sampler1D"),
+            (Image2D, Sampled) => f.write_str("sampler2D"),
+            (Image2DMS, Sampled) => f.write_str("sampler2DMS"),
+            (Image3D, Sampled) => f.write_str("sampler3D"),
+            (CubeMap, Sampled) => f.write_str("samplerCube"),
+            (Image1DArray, Sampled) => f.write_str("sampler1DArray"),
+            (Image2DArray, Sampled) => f.write_str("sampler2DArray"),
+            (Image2DMSArray, Sampled) => f.write_str("sampler2DMSArray"),
+            (CubeMapArray, Sampled) => f.write_str("samplerCubeArray"),
+
+            (Image1D, Depth) => f.write_str("sampler1DShadow"),
+            (Image2D, Depth) => f.write_str("sampler2DShadow"),
+            (CubeMap, Depth) => f.write_str("samplerCubeShadow"),
+            (Image1DArray, Depth) => f.write_str("sampler1DArrayShadow"),
+            (Image2DArray, Depth) => f.write_str("sampler2DArrayShadow"),
+            (CubeMapArray, Depth) => f.write_str("samplerCubeShadowArray"),
+            _ => Err(fmt::Error::default()),
+        }
+    }
+}
+
+
+#[derive(Hash, Clone)]
 pub struct ArrayType {
     proto_ty: Box<Type>,
     nrepeat: Option<u32>,
@@ -196,7 +266,18 @@ impl ArrayType {
         }
     }
 }
-#[derive(Debug, Default, Clone)]
+impl fmt::Debug for ArrayType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if let Some(nrepeat) = self.nrepeat {
+            write!(f, "[{:?}; {}]", self.proto_ty, nrepeat)
+        } else {
+            write!(f, "[{:?}", self.proto_ty)
+        }
+    }
+}
+
+
+#[derive(Default, Clone)]
 pub struct StructType {
     members: Vec<(usize, Type)>, // Offset and type.
     name_map: BTreeMap<String, MemberIdx>,
@@ -206,7 +287,7 @@ pub struct StructType {
     // the end to false.
     is_iuniform: bool,
 }
-impl<'a> Hash for StructType {
+impl Hash for StructType {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.members.hash(state);
         // NOTE: This enforces that the names for a same member in each stage
@@ -216,6 +297,21 @@ impl<'a> Hash for StructType {
         }
     }
 }
+impl fmt::Debug for StructType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("{ ")?;
+        for (i, (_offset, member_ty)) in self.members.iter().enumerate() {
+            if i != 0 { f.write_str(", "); }
+            if let Some(name) = self.name_map.iter()
+                .find_map(|(name, &idx)| if idx == i { Some(name) } else { None }) {
+                write!(f, "{}: {:?}", name, member_ty)?;
+            }
+        }
+        f.write_str(" }")
+    }
+}
+
+
 #[derive(Debug, Clone)]
 struct Constant<'a> {
     ty: InstrId,
@@ -227,7 +323,7 @@ struct Function {
     calls: HashSet<InstrId>,
 }
 
-#[derive(Debug, Hash, Clone)]
+#[derive(Hash, Clone)]
 pub enum Type {
     Numeric(NumericType),
     Vector(VectorType),
@@ -235,6 +331,19 @@ pub enum Type {
     Image(Option<ImageType>),
     Array(ArrayType),
     Struct(StructType),
+}
+impl fmt::Debug for Type {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Type::Numeric(num_ty) => num_ty.fmt(f),
+            Type::Vector(vec_ty) => vec_ty.fmt(f),
+            Type::Matrix(mat_ty) => mat_ty.fmt(f),
+            Type::Image(Some(img_ty)) => img_ty.fmt(f),
+            Type::Image(None) => write!(f, "subpassData"),
+            Type::Array(arr_ty) => arr_ty.fmt(f),
+            Type::Struct(struct_ty) => struct_ty.fmt(f),
+        }
+    }
 }
 
 pub type Location = u32;
@@ -273,7 +382,7 @@ pub struct EntryPoint {
     attm_map: HashMap<Location, InterfaceVariableType>,
     desc_map: HashMap<DescriptorBinding, DescriptorType>,
 }
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum InterfaceVariableType {
     Numeric(NumericType),
     Vector(VectorType),
@@ -290,12 +399,24 @@ impl InterfaceVariableType {
         Some(ivar_ty)
     }
 }
-#[derive(Debug, Clone)]
+impl fmt::Debug for InterfaceVariableType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use InterfaceVariableType::*;
+        match self {
+            Numeric(num_ty) => fmt::Debug::fmt(num_ty, f),
+            Vector(vec_ty) => fmt::Debug::fmt(vec_ty, f),
+            Matrix(mat_ty) => fmt::Debug::fmt(mat_ty, f),
+        }
+    }
+}
+
+
+#[derive(Clone)]
 pub struct InterfaceBlockType {
     block_ty: StructType,
     nbind: u32,
 }
-impl<'a> InterfaceBlockType {
+impl InterfaceBlockType {
     fn from_store_buf(block_ty: &Type) -> Option<InterfaceBlockType> {
         let (mut block_ty, nbind) = match block_ty {
             Type::Array(arr_ty) => if let Type::Struct(struct_ty) = &*arr_ty.proto_ty {
@@ -323,12 +444,31 @@ impl<'a> InterfaceBlockType {
     fn is_uniform(&self) -> bool { self.block_ty.is_iuniform }
     fn is_storage(&self) -> bool { !self.block_ty.is_iuniform }
 }
-#[derive(Debug, Clone)]
+impl fmt::Debug for InterfaceBlockType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let buf_ty = if self.block_ty.is_iuniform { "uniform" } else { "buffer" };
+        write!(f, "[{}: {:?}; {}]", buf_ty, self.block_ty, self.nbind)
+    }
+}
+
+
+#[derive(Clone)]
 pub enum DescriptorType {
     PushConstant(StructType),
     Block(InterfaceBlockType),
     Image(ImageType),
     InputAtatchment(u32),
+}
+impl fmt::Debug for DescriptorType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use DescriptorType::*;
+        match self {
+            PushConstant(struct_ty) => write!(f, "{:?}", struct_ty),
+            Block(iblock_ty) => write!(f, "{:?}", iblock_ty),
+            Image(img_ty) => write!(f, "{:?}", img_ty),
+            InputAtatchment(idx) => write!(f, "subpassData[{}]", idx),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -475,9 +615,9 @@ impl<'a> ReflectIntermediate<'a> {
                 } else {
                     // Only unit types allowed to be stored in storage images can
                     // have given format.
-                    let fmt = ImageUnitFormat::from_spv_def(op.is_sampled, op.is_depth, op.color_fmt)?;
+                    let unit_fmt = ImageUnitFormat::from_spv_def(op.is_sampled, op.is_depth, op.color_fmt)?;
                     let arng = ImageArrangement::from_spv_def(op.dim, op.is_array, op.is_multisampled)?;
-                    let img_ty = ImageType { fmt: fmt, arng: arng };
+                    let img_ty = ImageType { unit_fmt: unit_fmt, arng: arng };
                     Type::Image(Some(img_ty))
                 };
                 (op.ty_id, img_ty)
