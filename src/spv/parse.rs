@@ -5,6 +5,7 @@ pub struct Instrs<'a>(&'a [u32]);
 impl<'a> Instrs<'a> {
     pub fn new(spv: &'a [u32]) -> Instrs<'a> {
         const HEADER_LEN: usize = 5;
+        if spv.len() < HEADER_LEN { return Instrs(&[] as &[u32]) }
         Instrs(&spv[HEADER_LEN..])
     }
 }

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use ash::vk;
 use crate::gfx::{Context, InterfaceConfig};
-use crate::spv::SpirvBinary;
+use crate::spv::{SpirvBinary, Sym};
 
 fn main() {
     use log::debug;
@@ -27,8 +27,21 @@ fn main() {
     */
     let spvs = collect_spirv_binaries("assets/effects/uniform-pbr");
     info!("collected spirvs: {:?}", spvs.iter().map(|x| x.0.as_ref()).collect::<Vec<&str>>());
-    let entries = spvs["uniform-pbr.frag"].reflect();
+    let entries = spvs["uniform-pbr.vert"].reflect().unwrap();
     debug!("{:#?}", entries);
+    let (offset, var_ty) = entries[0].resolve_desc(Sym::new(".model_view")).unwrap();
+    debug!("push_constant[model_view]: offset={:?}, ty={:?}", offset, var_ty);
+    let (offset, var_ty) = entries[0].resolve_desc(Sym::new(".view_proj")).unwrap();
+    debug!("push_constant[view_proj]: offset={:?}, ty={:?}", offset, var_ty);
+
+    let entries = spvs["uniform-pbr.frag"].reflect().unwrap();
+    debug!("{:#?}", entries);
+    let (offset, var_ty) = entries[0].resolve_desc(Sym::new("mat.fdsa.1")).unwrap();
+    debug!("mat.fdsa.1: offset={:?}, ty={:?}", offset, var_ty);
+    let (offset, var_ty) = entries[0].resolve_desc(Sym::new("someImage")).unwrap();
+    debug!("someImage: offset={:?}, ty={:?}", offset, var_ty);
+    let (offset, var_ty) = entries[0].resolve_desc(Sym::new("imgggg")).unwrap();
+    debug!("imgggg: offset={:?}, ty={:?}", offset, var_ty);
     /*
     let spvs = spvs.into_iter()
         .map(|(_, bin)| bin)
@@ -66,14 +79,7 @@ fn collect_spirv_binaries<P: AsRef<Path>>(path: P) -> HashMap<String, SpirvBinar
                 buf.len() & 3 != 0 {
                 return None;
             }
-            let spv = buf.chunks_exact(4)
-                .map(|x| x.try_into().unwrap())
-                .map(match buf[0] {
-                    0x03 => u32::from_le_bytes,
-                    0x07 => u32::from_be_bytes,
-                    _ => return None,
-                })
-                .collect::<SpirvBinary>();
+            let spv = buf.into();
             let name = x.file_stem()
                 .and_then(OsStr::to_str)
                 .map(ToOwned::to_owned)

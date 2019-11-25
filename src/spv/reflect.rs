@@ -5,6 +5,7 @@ use std::iter::Peekable;
 use std::fmt;
 use std::ops::RangeInclusive;
 use std::hash::{Hash, Hasher};
+use super::sym::{Sym, Segment};
 use super::consts::*;
 use super::instr::*;
 use super::{SpirvBinary, Instrs, Instr, Error, Result};
@@ -374,14 +375,112 @@ struct EntryPointDeclartion<'a> {
     name: &'a str,
     exec_model: ExecutionModel,
 }
-#[derive(Debug, Default, Clone)]
+
+
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+enum ResourceLocator {
+    Attribute(Location),
+    Attachment(Location),
+    Descriptor(DescriptorBinding),
+}
+
+
+#[derive(Default, Clone)]
 pub struct EntryPoint {
     exec_model: ExecutionModel,
     name: String,
     attr_map: HashMap<Location, InterfaceVariableType>,
     attm_map: HashMap<Location, InterfaceVariableType>,
     desc_map: HashMap<DescriptorBinding, DescriptorType>,
+    var_name_map: HashMap<String, ResourceLocator>,
 }
+impl EntryPoint {
+    pub fn resolve_desc(&self, sym: &Sym) -> Option<(Option<usize>, Type)> {
+        let mut segs = sym.segments();
+        let desc_bind = match segs.next() {
+            Some(Segment::Index(desc_set)) => {
+                if let Some(Segment::Index(bind_point)) = segs.next() {
+                    DescriptorBinding::desc_bind(desc_set as u32, bind_point as u32)
+                } else { return None; }
+            },
+            Some(Segment::Empty) => {
+                // Symbols started with an empty head, like ".modelView", is
+                // used to identify push constants.
+                DescriptorBinding::push_const()
+            }
+            Some(Segment::Name(name)) => {
+                if let Some(ResourceLocator::Descriptor(desc_bind)) = self.var_name_map.get(name) {
+                    *desc_bind
+                } else { return None; }
+            },
+            None => return None,
+        };
+        let desc_ty = self.desc_map.get(&desc_bind)?;
+        let mut ty: Type = match desc_ty {
+            DescriptorType::InputAtatchment(_) => {
+                // Subpass data have no members.
+                return if segs.next().is_none() {
+                    Some((None, Type::Image(None)))
+                } else { None };
+            },
+            DescriptorType::Image(img_ty) => {
+                // Images have no members.
+                return if segs.next().is_none() {
+                    Some((None, Type::Image(Some(img_ty.clone()))))
+                } else { None };
+            },
+            DescriptorType::PushConstant(struct_ty) => Type::Struct(struct_ty.clone()),
+            DescriptorType::Block(iblock_ty) => Type::Struct(iblock_ty.block_ty.clone()),
+        };
+        let mut offset = 0;
+        while let Some(seg) = segs.next() {
+            match ty {
+                Type::Struct(struct_ty) => {
+                    let idx = match seg {
+                        Segment::Index(idx) => idx,
+                        Segment::Name(name) => {
+                            if let Some(idx) = struct_ty.name_map.get(name) {
+                                *idx
+                            } else { return None; }
+                        },
+                        _ => return None,
+                    };
+                    if let Some((local_offset, new_ty)) = struct_ty.members.get(idx) {
+                        offset += local_offset;
+                        // TODO: Use `Cow`.
+                        ty = new_ty.clone();
+                    } else { return None; }
+                },
+                Type::Array(arr_ty) => {
+                    if let Segment::Index(idx) = seg {
+                        if let Some(nrepeat) = arr_ty.nrepeat {
+                            if idx >= nrepeat as usize {
+                                return None;
+                            }
+                        }
+                        if let Some(stride) = arr_ty.stride {
+                            offset += stride * idx;
+                        } else { return None; }
+                        ty = (*arr_ty.proto_ty).clone();
+                    } else { return None; }
+                },
+                _ => return None,
+            }
+        }
+        Some((Some(offset), ty.clone()))
+    }
+}
+impl fmt::Debug for EntryPoint {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct(&self.name)
+            .field("attributes", &self.attr_map)
+            .field("attachments", &self.attm_map)
+            .field("descriptors", &self.desc_map)
+            .finish()
+    }
+}
+
+
 #[derive(Clone)]
 enum InterfaceVariableType {
     Numeric(NumericType),
@@ -904,13 +1003,28 @@ impl<'a> ReflectIntermediate<'a> {
                     .ok_or(Error::CorruptedSpirv)?;
                 let collision = match accessed_var {
                     Variable::Input(location, ivar_ty) => {
-                        entry_point.attr_map.insert(location, ivar_ty).is_some()
+                        let mut collision = entry_point.attr_map.insert(location, ivar_ty).is_some();
+                        if let Some(name) = self.get_name(accessed_var_id, None) {
+                            collision |= entry_point.var_name_map
+                                .insert(name.to_owned(), ResourceLocator::Attribute(location)).is_some();
+                        }
+                        collision
                     },
                     Variable::Output(location, ivar_ty) => {
-                        entry_point.attm_map.insert(location, ivar_ty).is_some()
+                        let mut collision = entry_point.attm_map.insert(location, ivar_ty).is_some();
+                        if let Some(name) = self.get_name(accessed_var_id, None) {
+                            collision |= entry_point.var_name_map
+                                .insert(name.to_owned(), ResourceLocator::Attachment(location)).is_some();
+                        }
+                        collision
                     },
                     Variable::Descriptor(desc_bind, desc_ty) => {
-                        entry_point.desc_map.insert(desc_bind, desc_ty).is_some()
+                        let mut collision = entry_point.desc_map.insert(desc_bind, desc_ty).is_some();
+                        if let Some(name) = self.get_name(accessed_var_id, None) {
+                            collision |= entry_point.var_name_map
+                                .insert(name.to_owned(), ResourceLocator::Descriptor(desc_bind)).is_some();
+                        }
+                        collision
                     },
                 };
                 if collision { return Err(Error::CorruptedSpirv); }

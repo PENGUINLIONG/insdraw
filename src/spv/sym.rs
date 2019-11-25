@@ -50,6 +50,7 @@ impl Deref for Symbol {
 pub enum Segment<'a> {
     Index(usize),
     Name(&'a str),
+    Empty,
 }
 
 pub struct Segments<'a>(&'a str);
@@ -68,12 +69,13 @@ impl<'a> Iterator for Segments<'a> {
                 self.0 = &self.0[self.0.len()..];
                 txt
             };
-            if txt.is_empty() { continue; }
+            if txt.is_empty() { return Some(Segment::Empty); }
             let seg = if let Ok(idx) = usize::from_str(txt) {
                 Segment::Index(idx)
             } else {
                 Segment::Name(txt)
             };
+            use log::debug;
             return Some(seg);
         }
     }
