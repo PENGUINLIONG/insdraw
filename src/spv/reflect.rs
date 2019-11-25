@@ -261,9 +261,9 @@ impl fmt::Debug for DescriptorBinding {
 }
 
 
-struct EntryPointDeclartion {
+struct EntryPointDeclartion<'a> {
     func_id: u32,
-    name: String,
+    name: &'a str,
     exec_model: ExecutionModel,
 }
 #[derive(Debug, Default, Clone)]
@@ -341,7 +341,7 @@ enum Variable {
 
 #[derive(Default)]
 struct ReflectIntermediate<'a> {
-    entry_point_declrs: Vec<EntryPointDeclartion>,
+    entry_point_declrs: Vec<EntryPointDeclartion<'a>>,
     name_map: HashMap<(InstrId, Option<u32>), &'a str>,
     deco_map: HashMap<(InstrId, Option<u32>, Decoration), &'a [u32]>,
     ty_map: HashMap<TypeId, Type>,
@@ -394,7 +394,7 @@ impl<'a> ReflectIntermediate<'a> {
             let entry_point_declr = EntryPointDeclartion {
                 exec_model: op.exec_model,
                 func_id: op.func_id,
-                name: op.name.to_string(),
+                name: op.name,
             };
             self.entry_point_declrs.push(entry_point_declr);
             instrs.next();
