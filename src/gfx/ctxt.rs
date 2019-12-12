@@ -2,11 +2,14 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::iter::repeat;
 use std::ffi::{CStr, CString};
-use log::{info};
+use std::marker::PhantomData;
+use log::{info, error};
 use ash::vk;
 use ash::{vk_make_version, Entry, Instance, Device};
 use ash::version::{EntryV1_0, InstanceV1_0, DeviceV1_0};
-use super::{Error, Result};
+use spirq::SpirvBinary;
+use spirq::reflect::{EntryPoint as EntryPointManifest, Pipeline as PipelineManifest};
+use super::error::{Error, Result};
 
 #[derive(Default)]
 pub struct InterfaceConfig {
@@ -203,6 +206,8 @@ impl ContextBuilder {
         Ok(ctxt)
     }
 }
+
+
 pub struct Context {
     // Don't change the order. Things should be dropped from top to bottom.
     queues: HashMap<&'static str, vk::Queue>,
@@ -216,5 +221,47 @@ impl Context {
             app_name: app_name,
             ..Default::default()
         }
+    }
+}
+impl PartialEq for Context {
+    fn eq(&self, rhs: &Self) -> bool { self.dev.handle() == rhs.dev.handle() }
+}
+impl Eq for Context {}
+
+
+pub struct ShaderModule<'a> {
+    ctxt: &'a Context,
+    handle: vk::ShaderModule,
+    entry_points: HashMap<String, EntryPointManifest>,
+}
+impl<'a> ShaderModule<'a> {
+    pub fn new(ctxt: &'a Context, spv: &SpirvBinary) -> Result<ShaderModule<'a>> {
+        let create_info = vk::ShaderModuleCreateInfo::builder()
+            .code(spv.words())
+            .build();
+        let handle = unsafe { ctxt.dev.create_shader_module(&create_info, None)? };
+        let entry_points = spv.reflect()?
+            .into_iter()
+            .map(|x| (x.name.to_owned(), x.clone()))
+            .collect::<HashMap<_, _>>();
+        let shader_mod = ShaderModule {
+            ctxt: ctxt,
+            handle: handle,
+            entry_points: entry_points,
+        };
+        info!("created shader module");
+        Ok(shader_mod)
+    }
+    pub fn entry_points(&self) -> impl Iterator<Item=&EntryPointManifest> {
+        self.entry_points.values()
+    }
+    pub fn get(&self, entry_point_name: &str) -> Option<&EntryPointManifest> {
+        self.entry_points.get(entry_point_name)
+    }
+}
+impl<'a> Drop for ShaderModule<'a> {
+    fn drop(&mut self) {
+        unsafe { self.ctxt.dev.destroy_shader_module(self.handle, None) };
+        info!("destroyed shader module");
     }
 }

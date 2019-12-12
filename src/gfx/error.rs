@@ -1,6 +1,7 @@
 use std::fmt;
 use std::error;
 use ash::{LoadingError, InstanceError};
+use spirq::error::Error as SpirqError;
 type VkResultCode = ash::vk::Result;
 
 #[derive(Debug)]
@@ -11,6 +12,8 @@ pub enum Error {
     NoCapablePhysicalDevice,
     InflexibleMemory,
     InvalidOperation,
+    InvalidName(bool), // Whether the name is expected to exist before the op.
+    SpirqError(SpirqError),
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -22,6 +25,9 @@ impl fmt::Display for Error {
             NoCapablePhysicalDevice => write!(f, "no capable device available"),
             InflexibleMemory => write!(f, "memory cannot be resized"),
             InvalidOperation => write!(f, "an invalid operation was invoked internally"),
+            InvalidName(true) => write!(f, "expect an existing name"),
+            InvalidName(false) => write!(f, "expect an absent name"),
+            SpirqError(err) => write!(f, "reflection error: {}", err),
         }
     }
 }
@@ -31,6 +37,7 @@ impl error::Error for Error {
         match self {
             LibraryError(err) => Some(err),
             RuntimeError(err) => Some(err),
+            SpirqError(err) => Some(err),
             _ => None,
         }
     }
@@ -45,3 +52,8 @@ impl From<InstanceError> for Error {
 impl From<VkResultCode> for Error {
     fn from(x: VkResultCode) -> Error { Error::VulkanError(x) }
 }
+impl From<SpirqError> for Error {
+    fn from(x: SpirqError) -> Error { Error::SpirqError(x) }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;

@@ -1,18 +1,19 @@
 pub mod gfx;
 pub mod math;
 pub mod topo;
-pub mod spv;
 
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use ash::vk;
-use crate::gfx::{Context, InterfaceConfig};
-use crate::spv::{SpirvBinary, Sym};
+use spirq::error::{Error as SpirvError, Result as SpirvResult};
+use spirq::SpirvBinary;
+use spirq::reflect::Pipeline;
+use spirq::sym::{Sym, Symbol};
+use crate::gfx::{Context, InterfaceConfig, ShaderModule};
 
 fn main() {
-    use log::debug;
+    use log::{debug, info, warn};
     env_logger::init();
-    /*
     let render_cfg = InterfaceConfig::new("render")
         .require_transfer()
         .require_graphics();
@@ -24,31 +25,19 @@ fn main() {
         .with_interface(render_cfg)
         .build()
         .unwrap();
-    */
-    let spvs = collect_spirv_binaries("assets/effects/uniform-pbr");
-    info!("collected spirvs: {:?}", spvs.iter().map(|x| x.0.as_ref()).collect::<Vec<&str>>());
-    let entries = spvs["uniform-pbr.vert"].reflect().unwrap();
-    debug!("{:#?}", entries);
-    let (offset, var_ty) = entries[0].resolve_desc(Sym::new(".model_view")).unwrap();
-    debug!("push_constant[model_view]: offset={:?}, ty={:?}", offset, var_ty);
-    let (offset, var_ty) = entries[0].resolve_desc(Sym::new(".view_proj")).unwrap();
-    debug!("push_constant[view_proj]: offset={:?}, ty={:?}", offset, var_ty);
-
-    let entries = spvs["uniform-pbr.frag"].reflect().unwrap();
-    debug!("{:#?}", entries);
-    let (offset, var_ty) = entries[0].resolve_desc(Sym::new("mat.fdsa.1")).unwrap();
-    debug!("mat.fdsa.1: offset={:?}, ty={:?}", offset, var_ty);
-    let (offset, var_ty) = entries[0].resolve_desc(Sym::new("someImage")).unwrap();
-    debug!("someImage: offset={:?}, ty={:?}", offset, var_ty);
-    let (offset, var_ty) = entries[0].resolve_desc(Sym::new("imgggg")).unwrap();
-    debug!("imgggg: offset={:?}, ty={:?}", offset, var_ty);
-    /*
-    let spvs = spvs.into_iter()
-        .map(|(_, bin)| bin)
+    let spvs = collect_spirv_binaries("assets/effects/uniform-pbr")
+        .into_iter()
+        .filter_map(|(name, spv)| {
+            let spv = SpirvBinary::from(spv);
+            if let Ok(shader_mod) = ShaderModule::new(&ctxt, &spv) {
+                Some(shader_mod)
+            } else {
+                warn!("unable to create shader module for '{}'", name);
+                None
+            }
+        })
         .collect::<Vec<_>>();
-    let pipe = spv::PipelineMetadata::new(&spvs);
-    debug!("{:#?}", pipe);
-    */
+    graph_pipe = spvs;
 }
 
 
