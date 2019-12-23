@@ -1,9 +1,10 @@
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::iter::repeat;
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
-use log::{info, error};
+use std::os::raw::c_char;
+use log::{info, warn, error, debug, trace};
 use ash::vk;
 use ash::{vk_make_version, Entry, Instance, Device};
 use ash::version::{EntryV1_0, InstanceV1_0, DeviceV1_0};
@@ -47,25 +48,22 @@ pub struct ContextBuilder {
     app_name: &'static str,
     icfgs: Vec<InterfaceConfig>,
     dev_sel: Option<Box<dyn Fn(&vk::PhysicalDeviceProperties) -> bool>>,
-    api_exts: Vec<CString>,
-    dev_exts: Vec<CString>,
+    api_exts: Vec<&'static CStr>,
+    dev_exts: Vec<&'static CStr>,
     feats: vk::PhysicalDeviceFeatures,
 }
 impl ContextBuilder {
+    const API_VERSION: u32 = vk_make_version!(1, 1, 0);
     pub fn filter_device<DevSel: 'static + Fn(&vk::PhysicalDeviceProperties) -> bool>(mut self, dev_sel: DevSel) -> Self {
         self.dev_sel = Some(Box::new(dev_sel));
         self
     }
-    pub fn with_api_extensions(&mut self, api_exts: &'static [&'static str]) -> &mut Self {
-        self.api_exts = api_exts.iter()
-            .map(|&x| CString::new(x).unwrap())
-            .collect::<Vec<_>>();
+    pub fn with_api_extensions(&mut self, api_exts: &[&'static CStr]) -> &mut Self {
+        self.api_exts = api_exts.to_owned();
         self
     }
-    pub fn with_device_extensions(&mut self, dev_exts: &'static [&'static str]) -> &mut Self {
-        self.dev_exts = dev_exts.iter()
-            .map(|&x| CString::new(x).unwrap())
-            .collect::<Vec<_>>();
+    pub fn with_device_extensions(&mut self, dev_exts: &[&'static CStr]) -> &mut Self {
+        self.dev_exts = dev_exts.to_owned();
         self
     }
     pub fn with_interface(&mut self, icfg: InterfaceConfig) -> &mut Self {
@@ -78,28 +76,84 @@ impl ContextBuilder {
         self.feats = feats;
         self
     }
-    fn try_create_inst(&self) -> Result<(Entry, Instance)> {
-        use ash::extensions::{khr::Surface, khr::Win32Surface};
-        let entry = Entry::new()?;
+    fn make_ext_prop(ext_name: &str) -> vk::ExtensionProperties {
+        let mut props = vk::ExtensionProperties {
+            extension_name: [0; 256],
+            spec_version: Self::API_VERSION,
+        };
+        let ext_name_len = ext_name.len();
+        // Do not check equal because '\0' take a byte.
+        assert!(ext_name_len < vk::MAX_EXTENSION_NAME_SIZE,
+            "extension name too long");
+        let ext_name = unsafe { std::slice::from_raw_parts(ext_name.as_ptr() as *const c_char, ext_name_len) };
+        props.extension_name[..ext_name.len()].copy_from_slice(ext_name);
+        return props;
+    }
+    //make_ext_prop("VK_KHR_surface", vk_make_version!(1, 0, 0));
+    fn filter_api_exts(&self, entry: &Entry) -> Result<Vec<*const c_char>> {
+        let layer_name = std::ptr::null_mut::<c_char>();
+        let ext_props = unsafe { entry.enumerate_instance_extension_properties() }?;
+        let avail_exts = ext_props.iter()
+            .filter_map(|ext_prop| {
+                if ext_prop.spec_version <= Self::API_VERSION {
+                    unsafe { Some(CStr::from_ptr(ext_prop.extension_name.as_ptr())) }
+                } else { None }
+            })
+            .collect::<HashSet<_>>();
+        trace!("instance supported extensions: {:?}", avail_exts);
+        let exts = self.api_exts.iter()
+            .filter_map(|x| {
+                if avail_exts.contains(x) {
+                    Some(x.as_ptr())
+                } else {
+                    warn!("instance doesn't support extension '{}'", x.to_string_lossy());
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        return Ok(exts);
+    }
+    fn filter_dev_exts(&self, inst: &Instance, physdev: vk::PhysicalDevice) -> Result<Vec<*const c_char>> {
+        let layer_name = std::ptr::null_mut::<c_char>();
+        let ext_props = unsafe { inst.enumerate_device_extension_properties(physdev) }?;
+        let avail_exts = ext_props.iter()
+            .filter_map(|ext_prop| {
+                if ext_prop.spec_version <= Self::API_VERSION {
+                    unsafe { Some(CStr::from_ptr(ext_prop.extension_name.as_ptr())) }
+                } else { None }
+            })
+            .collect::<HashSet<_>>();
+        trace!("device supported extensions: {:?}", avail_exts);
+        let exts = self.dev_exts.iter()
+            .filter_map(|x| {
+                if avail_exts.contains(x) {
+                    Some(x.as_ptr())
+                } else {
+                    warn!("device doesn't support extension '{}'", x.to_string_lossy());
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        return Ok(exts);
+    }
+    fn try_create_inst(&self, entry: &Entry) -> Result<Instance> {
         // Create vulkan instance.
         let app_name = CString::new(self.app_name).unwrap();
         let engine_name = CString::new("insdraw").unwrap();
         let app_info = vk::ApplicationInfo::builder()
-            .api_version(vk_make_version!(1, 1, 0))
+            .api_version(Self::API_VERSION)
             .application_name(&app_name)
             .application_version(vk_make_version!(0, 0, 1))
             .engine_name(&engine_name)
             .engine_version(vk_make_version!(0, 0, 1))
             .build();
-        let api_exts = self.api_exts.iter()
-            .map(|x| x.as_ptr())
-            .collect::<Vec<_>>();
+        let api_exts = self.filter_api_exts(&entry)?;
         let inst_create_info = vk::InstanceCreateInfo::builder()
             .application_info(&app_info)
             .enabled_extension_names(&api_exts)
             .build();
         let inst = unsafe { entry.create_instance(&inst_create_info, None)? };
-        Ok((entry, inst))
+        Ok(inst)
     }
     fn try_create_dev(&mut self, inst: &Instance, physdev: vk::PhysicalDevice) -> Result<(Device, HashMap<&'static str, vk::Queue>)> {
         // In following codes, `i` is queue family index; `j` is queue index in
@@ -156,9 +210,7 @@ impl ContextBuilder {
             })
             .collect::<Vec<_>>();
         // Create device.
-        let dev_exts = self.dev_exts.iter()
-            .map(|x| x.as_ptr())
-            .collect::<Vec<_>>();
+        let dev_exts = self.filter_dev_exts(inst, physdev)?;
         let dev_create_info = vk::DeviceCreateInfo::builder()
             .enabled_features(&self.feats)
             .queue_create_infos(&create_infos)
@@ -177,7 +229,8 @@ impl ContextBuilder {
         Ok((dev, queues))
     }
     pub fn build(&mut self) -> Result<Context> {
-        let (entry, inst) = self.try_create_inst()?;
+        let entry = Entry::new()?;
+        let inst = self.try_create_inst(&entry)?;
         info!("created vulkan instance");
         let physdevs = unsafe { inst.enumerate_physical_devices() }?;
         info!("discovered {} physical devices", physdevs.len());
@@ -202,6 +255,8 @@ impl ContextBuilder {
             inst: inst,
             dev: dev,
             queues: queues,
+            api_exts: Default::default(),
+            dev_exts: Default::default(),
         };
         Ok(ctxt)
     }
@@ -210,10 +265,12 @@ impl ContextBuilder {
 
 pub struct Context {
     // Don't change the order. Things should be dropped from top to bottom.
-    queues: HashMap<&'static str, vk::Queue>,
-    dev: Device,
-    inst: Instance,
-    entry: Entry,
+    pub queues: HashMap<&'static str, vk::Queue>,
+    pub dev: Device,
+    pub inst: Instance,
+    pub entry: Entry,
+    pub api_exts: HashSet<&'static CStr>,
+    pub dev_exts: HashSet<&'static CStr>,
 }
 impl Context {
     pub fn builder(app_name: &'static str) -> ContextBuilder {
@@ -231,7 +288,7 @@ impl Eq for Context {}
 
 pub struct ShaderModule<'a> {
     ctxt: &'a Context,
-    handle: vk::ShaderModule,
+    pub handle: vk::ShaderModule,
     entry_points: HashMap<String, EntryPointManifest>,
 }
 impl<'a> ShaderModule<'a> {
@@ -265,3 +322,86 @@ impl<'a> Drop for ShaderModule<'a> {
         info!("destroyed shader module");
     }
 }
+
+/*
+pub struct RenderPass {
+    handle: vk::RenderPass,
+    subpasses: Vec<Subpass>,
+}
+pub struct Subpass {
+    handle: vk::Pipeline,
+    manifest: Manifest,
+    vert_binds: VertexBinding,
+}
+
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct VertexBinding {
+    bind_point: u32,
+    stride: usize,
+    input_rate: vk::VertexInputRate,
+}
+impl VertexBinding {
+    pub fn per_vertex(bind_point: u32, stride: usize) -> VertexBinding {
+        VertexBinding {
+            bind_point: bind_point,
+            stride: stride,
+            input_rate: vk::VertexInputRate::VERTEX,
+        }
+    }
+    pub fn per_instance(bind_point: u32, stride: usize) -> VertexBinding {
+        VertexBinding {
+            bind_point: bind_point,
+            stride: stride,
+            input_rate: vk::VertexInputRate::INSTANCE,
+        }
+    }
+}
+
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct VertexAttribute {
+    vert_bind: &'_ VertexBinding,
+    location: Location,
+    offset: usize,
+    fmt: vk::Format,
+}
+impl VertexAttribute {
+    pub fn new(vert_bind: &VertexBinding, location: Location, offset: usize, fmt: vk::Format) -> VertexAttribute {
+        VertexAttribute {
+            vert_bind: vert_bind,
+            location: location,
+            offset: offset,
+            fmt: fmt,
+        }
+    }
+}
+
+
+pub struct Pipeline {
+    vert_attr
+    entry_points: Vec<EntryPointManifest>,
+}
+impl Pipeline {
+    pub fn new(entry_points: Vec<EntryPointManifest>) -> Pipeline {
+
+    }
+}
+
+pub struct Attachment {
+    location: Location,
+    load_op: vk::AttachmentLoadOp,
+    store_op: vk::AttachmentStoreOp,
+    stencil_load_op: vk::AttachmentLoadOp,
+    stencil_store_op: vk::AttachmentStoreOp,
+    ms_rate: vk::SampleCountFlagBits,
+    fmt: vk::Format,
+    from_layout: vk::ImageLayout,
+    to_layout: vk::ImageLayout,
+}
+
+struct AttributeMapping {
+    vert_attrs: HashMap<Location, VertexAttribute>;
+    vert_binds: HashMap<BindingPoint, VertexBinding>;
+}
+*/
