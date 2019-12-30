@@ -1,6 +1,5 @@
 pub mod gfx;
 pub mod math;
-pub mod topo;
 
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -10,35 +9,31 @@ use spirq::error::{Error as SpirvError, Result as SpirvResult};
 use spirq::SpirvBinary;
 use spirq::reflect::Pipeline;
 use spirq::sym::{Sym, Symbol};
-use crate::gfx::{Context, InterfaceConfig, ShaderModule};
+use crate::gfx::{Context, Device, InterfaceConfig, ShaderModule};
 
 use ash::version::DeviceV1_0;
 
 fn main() {
     use log::{debug, info, warn};
     env_logger::init();
-    let render_cfg = InterfaceConfig::new("render")
+    let render_icfg = InterfaceConfig::new("render")
         .require_transfer()
         .require_graphics();
+    let present_icfg = InterfaceConfig::new("present")
+        .require_transfer();
+    //    .require_present();
 
-    let extensions = [
-        ash::extensions::khr::Surface::name(),
-        ash::extensions::khr::Win32Surface::name(),
-    ];
-
-    let ctxt = Context::builder("demo")
-        .filter_device(|prop| {
-            prop.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
-        })
-        .with_api_extensions(&extensions)
-        .with_interface(render_cfg)
-        .build()
-        .unwrap();
+    let ctxt = Context::new("demo").unwrap();
+    let physdev = ctxt.physdevs()
+        .find(|physdev| {
+            physdev.prop.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+        }).unwrap();
+    let dev = Device::new(&physdev, &[render_icfg, present_icfg]).unwrap();
     let shader_mods = collect_spirv_binaries("assets/effects/example")
         .into_iter()
         .filter_map(|(name, spv)| {
             let spv = SpirvBinary::from(spv);
-            if let Ok(shader_mod) = ShaderModule::new(&ctxt, &spv) {
+            if let Ok(shader_mod) = ShaderModule::new(&dev, &spv) {
                 Some((name, shader_mod))
             } else {
                 warn!("unable to create shader module for '{}'", name);
@@ -50,7 +45,7 @@ fn main() {
 
 
 
-
+/*
     let width: u32 = 1024;
     let height: u32 = 768;
 
@@ -220,6 +215,7 @@ fn main() {
         let pipe = unsafe { ctxt.dev.create_graphics_pipelines(pipe_cache, &*create_infos, None) }.unwrap();
         pipe
     };
+    */
 
     use winit::{
         event::{Event, WindowEvent},
@@ -238,19 +234,20 @@ fn main() {
         .unwrap();
     let hinst = window.hinstance();
     let hwnd = window.hwnd();
-
+/*
     let surf = {
         let create_info = vk::Win32SurfaceCreateInfoKHR::builder()
             .hinstance(hinst)
             .hwnd(hwnd)
             .build();
         unsafe {
-            ashex::khr::Win32Surface::new(&ctxt.entry, &ctxt.inst)
+            ashex::khr::Win32Surface::new(&ctxt.0.entry, &ctxt.inst)
                 .create_win32_surface(&create_info, None)
-                .unwrap()
+                .unwrap();
         }
         info!("created window surface");
     };
+    */
 
     event_loop.run(move |event, _, control_flow| {
         match event {
