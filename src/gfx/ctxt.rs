@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::iter::repeat;
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::os::raw::c_char;
 use std::sync::Arc;
 use log::{info, warn, error, debug, trace};
@@ -88,22 +89,43 @@ fn filter_exts(ext_props: &[vk::ExtensionProperties], wanted_exts: &HashSet<&'st
         .collect::<HashSet<_>>()
 }
 
-#[derive(Default)]
-pub(crate) struct ApiExtensions {
-    pub khr_surface: Option<vkx::khr::Surface>,
-    #[cfg(windows)]
-    pub khr_win32_surface: Option<vkx::khr::Win32Surface>,
+macro_rules! try_ext {
+    ($a: expr, $b: expr, $enabled_exts: expr, $ext_ty: ty) => {
+        if $enabled_exts.contains(<$ext_ty>::name()) {
+            Ok(<$ext_ty>::new($a, $b))
+        } else { Err(Error::MissingExtension(<$ext_ty>::name())) }
+    }
 }
-impl ApiExtensions {
-    fn new(entry: &ash::Entry, inst: &ash::Instance, enabled_exts: &HashSet<&CStr>) -> ApiExtensions {
-        let mut rv = ApiExtensions::default();
-        if enabled_exts.contains(vkx::khr::Surface::name()) {
-            rv.khr_surface = Some(vkx::khr::Surface::new(entry, inst));
+
+macro_rules! def_exts {
+    ($ty:ident ($a_name:ident: $a_ty:ty, $b_name:ident: $b_ty:ty) => {$($ext_name:ident: $ext_ty:ty,)*}) => {
+        pub(crate) struct $ty {
+            $( $ext_name: Option<$ext_ty>, )*
         }
-        if cfg!(windows) && enabled_exts.contains(vkx::khr::Win32Surface::name()) {
-            rv.khr_win32_surface = Some(vkx::khr::Win32Surface::new(entry, inst));
+        impl $ty {
+            fn new($a_name: &$a_ty, $b_name: &$b_ty, enabled_exts: &HashSet<&CStr>) -> $ty {
+                let mut rv = unsafe { MaybeUninit::<Self>::uninit().assume_init() };
+                $(
+                    if enabled_exts.contains(<$ext_ty>::name()) {
+                        rv.$ext_name = Some(<$ext_ty>::new($a_name, $b_name))
+                    };
+                )*
+                rv
+            }
+            $(
+                fn $ext_name(&self) -> Result<&$ext_ty> {
+                    self.$ext_name.as_ref()
+                        .ok_or(Error::MissingExtension(<$ext_ty>::name()))
+                }
+            )*
         }
-        rv
+    }
+}
+
+def_exts! {
+    ApiExtensions(entry: ash::Entry, inst: ash::Instance) => {
+        khr_surface: vkx::khr::Surface,
+        khr_win32_surface: vkx::khr::Win32Surface,
     }
 }
 
@@ -162,6 +184,13 @@ pub(crate) struct SurfaceInner {
     pub(crate) ctxt: Arc<ContextInner>,
     pub handle: vk::SurfaceKHR,
 }
+impl Drop for SurfaceInner {
+    fn drop(&mut self) {
+        unsafe {
+            self.ctxt.api_exts.khr_surface().unwrap().destroy_surface(self.handle, None);
+        }
+    }
+}
 pub struct Surface(Arc<SurfaceInner>);
 impl Surface {
     fn create_surf(ctxt: &ContextInner, wnd: &Window) -> Result<vk::SurfaceKHR> {
@@ -171,12 +200,11 @@ impl Surface {
                 .hinstance(wnd.hinstance())
                 .hwnd(wnd.hwnd())
                 .build();
-            ctxt.api_exts.khr_win32_surface.as_ref()
-                .ok_or(Error::MissingExtension(vkx::khr::Win32Surface::name()))
-                .and_then(|x| unsafe {
-                    let surf = x.create_win32_surface(&create_info, None)?;
-                    Ok(surf)
-                })
+            let surf = unsafe {
+                ctxt.api_exts.khr_win32_surface()?
+                    .create_win32_surface(&create_info, None)?
+            };
+            Ok(surf)
         } else { Err(Error::UnsupportedPlatform) }
     }
     pub fn new(ctxt: &Context, wnd: &Window) -> Result<Surface> {
@@ -208,13 +236,8 @@ impl PhysicalDevice {
     }
 }
 
-#[derive(Default)]
-pub struct DeviceExtensions {
-}
-impl DeviceExtensions {
-    pub fn new(inst: &ash::Instance, dev: &ash::Device, enabled_exts: &HashSet<&'static CStr>) -> DeviceExtensions {
-        let mut rv = DeviceExtensions::default();
-        rv
+def_exts! {
+    DeviceExtensions(inst: ash::Instance, dev: ash::Device) => {
     }
 }
 
@@ -303,6 +326,7 @@ impl Device {
                             };
                             if !supports_surf { return None }
                         }
+                        // Ensure the queue family support all declared flags.
                         if flags.contains(icfg.flags) && qfam_counts[i] > j {
                             qfam_queue_idxs[i] += 1;
                             Some((i, j, k))
