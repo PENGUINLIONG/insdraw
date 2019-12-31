@@ -32,28 +32,11 @@ lazy_static! {
     };
 }
 
-#[cfg(windows)]
-#[derive(Clone)]
-struct SurfaceConfig {
-    hinst: *mut std::ffi::c_void,
-    hwnd: *mut std::ffi::c_void,
-}
-impl SurfaceConfig {
-    #[cfg(windows)]
-    pub fn new(wnd: &Window) -> SurfaceConfig {
-        use winit::platform::windows::WindowExtWindows;
-        SurfaceConfig {
-            hinst: wnd.hinstance(),
-            hwnd: wnd.hwnd(),
-        }
-    }
-}
-
 #[derive(Default, Clone)]
 pub struct InterfaceConfig {
     name: &'static str,
     flags: vk::QueueFlags,
-    surf_cfg: Option<SurfaceConfig>,
+    surf: Option<Arc<SurfaceInner>>,
     priority: f32,
 }
 impl InterfaceConfig {
@@ -75,13 +58,22 @@ impl InterfaceConfig {
         self.flags |= vk::QueueFlags::GRAPHICS;
         self
     }
-    pub fn require_present(mut self, wnd: &Window) -> Self {
-        self.surf_cfg = Some(SurfaceConfig::new(wnd));
+    pub fn require_present(mut self, surf: &Surface) -> Self {
+        self.surf = Some(surf.0.clone());
         self
     }
     pub fn require_compute(mut self) -> Self {
         self.flags |= vk::QueueFlags::COMPUTE;
         self
+    }
+}
+pub struct Interface {
+    pub queue: vk::Queue,
+    pub(crate) surf: Option<Arc<SurfaceInner>>,
+}
+impl Interface {
+    fn new(queue: vk::Queue, icfg: &InterfaceConfig) -> Interface {
+        Interface { queue, surf: icfg.surf.clone() }
     }
 }
 
@@ -108,7 +100,7 @@ impl ApiExtensions {
         if enabled_exts.contains(vkx::khr::Surface::name()) {
             rv.khr_surface = Some(vkx::khr::Surface::new(entry, inst));
         }
-        if enabled_exts.contains(vkx::khr::Win32Surface::name()) {
+        if cfg!(windows) && enabled_exts.contains(vkx::khr::Win32Surface::name()) {
             rv.khr_win32_surface = Some(vkx::khr::Win32Surface::new(entry, inst));
         }
         rv
@@ -155,7 +147,6 @@ impl Context {
         Ok(Context(Arc::new(inner)))
     }
     pub fn physdevs(&self) -> impl Iterator<Item=PhysicalDevice> + '_ {
-        let ctxt = self.0.clone();
         if let Ok(physdevs) = unsafe { self.0.inst.enumerate_physical_devices() } {
             info!("discovered {} physical devices", physdevs.len());
             physdevs
@@ -163,10 +154,43 @@ impl Context {
             warn!("unable to enumerate physical devices");
             Vec::default()
         }.into_iter()
-            .map(move |physdev| PhysicalDevice::new(ctxt.clone(), physdev))
+            .map(move |physdev| PhysicalDevice::new(self, physdev))
     }
 }
 
+pub(crate) struct SurfaceInner {
+    pub(crate) ctxt: Arc<ContextInner>,
+    pub handle: vk::SurfaceKHR,
+}
+pub struct Surface(Arc<SurfaceInner>);
+impl Surface {
+    fn create_surf(ctxt: &ContextInner, wnd: &Window) -> Result<vk::SurfaceKHR> {
+        if cfg!(windows) {
+            use winit::platform::windows::WindowExtWindows;
+            let create_info = vk::Win32SurfaceCreateInfoKHR::builder()
+                .hinstance(wnd.hinstance())
+                .hwnd(wnd.hwnd())
+                .build();
+            ctxt.api_exts.khr_win32_surface.as_ref()
+                .ok_or(Error::MissingExtension(vkx::khr::Win32Surface::name()))
+                .and_then(|x| unsafe {
+                    let surf = x.create_win32_surface(&create_info, None)?;
+                    Ok(surf)
+                })
+        } else { Err(Error::UnsupportedPlatform) }
+    }
+    pub fn new(ctxt: &Context, wnd: &Window) -> Result<Surface> {
+        let ctxt = ctxt.0.clone();
+        match Self::create_surf(&*ctxt, wnd) {
+            Ok(handle) => {
+                info!("created surface");
+                let inner = SurfaceInner { ctxt, handle };
+                Ok(Surface(Arc::new(inner)))
+            },
+            Err(err) => Err(err),
+        }
+    }
+}
 
 pub struct PhysicalDevice {
     pub(crate) ctxt: Arc<ContextInner>,
@@ -175,7 +199,8 @@ pub struct PhysicalDevice {
     pub qfam_props: Vec<vk::QueueFamilyProperties>,
 }
 impl PhysicalDevice {
-    fn new(ctxt: Arc<ContextInner>, handle: vk::PhysicalDevice) -> PhysicalDevice {
+    fn new(ctxt: &Context, handle: vk::PhysicalDevice) -> PhysicalDevice {
+        let ctxt = ctxt.0.clone();
         // Assign physical device queues.
         let prop = unsafe { ctxt.inst.get_physical_device_properties(handle) };
         let qfam_props = unsafe { ctxt.inst.get_physical_device_queue_family_properties(handle) };
@@ -270,8 +295,13 @@ impl Device {
                         let j = qfam_queue_idxs[i];
                         // Test whether the queue family support presenting, if
                         // present is required.
-                        if let Some(surf_cfg) = &icfg.surf_cfg {
-                            // physdev.ctxt.api_exts.khr_surface. // TODO:
+                        if let Some(surf) = &icfg.surf {
+                            let supports_surf = unsafe {
+                                physdev.ctxt.api_exts.khr_surface.as_ref().map(|x| {
+                                    x.get_physical_device_surface_support(physdev.handle, i as u32, surf.handle)
+                                }).unwrap_or(false)
+                            };
+                            if !supports_surf { return None }
                         }
                         if flags.contains(icfg.flags) && qfam_counts[i] > j {
                             qfam_queue_idxs[i] += 1;
@@ -281,7 +311,7 @@ impl Device {
             })
             .collect::<Vec<_>>();
         if interface_qfam_idxs.len() != icfgs.len() {
-            return Err(Error::NoCapablePhysicalDevice);
+            return Err(Error::UnsupportedPlatform);
         }
         // Mapping from queue family index to queue priorities.
         let mut priorities = HashMap::<usize, Vec<f32>>::new();

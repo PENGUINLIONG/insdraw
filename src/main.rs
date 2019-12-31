@@ -9,25 +9,44 @@ use spirq::error::{Error as SpirvError, Result as SpirvResult};
 use spirq::SpirvBinary;
 use spirq::reflect::Pipeline;
 use spirq::sym::{Sym, Symbol};
-use crate::gfx::{Context, Device, InterfaceConfig, ShaderModule};
+use crate::gfx::{Context, Device, InterfaceConfig, Surface, ShaderModule};
 
 use ash::version::DeviceV1_0;
 
 fn main() {
     use log::{debug, info, warn};
     env_logger::init();
+
+    use winit::{
+        event::{Event, WindowEvent},
+        event_loop::{ControlFlow, EventLoop},
+        window::WindowBuilder,
+        dpi::LogicalSize,
+    };
+    use winit::platform::windows::WindowExtWindows;
+
+    let event_loop = EventLoop::new();
+    let window = WindowBuilder::new()
+        .with_min_inner_size(LogicalSize::new(1024.0, 768.0))
+        .with_title("insdraw lab")
+        .with_transparent(true)
+        .build(&event_loop)
+        .unwrap();
+
+    let ctxt = Context::new("demo").unwrap();
+    let physdev = ctxt.physdevs()
+    .find(|physdev| {
+        physdev.prop.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+    }).unwrap();
+
+    let surf = Surface::new(&ctxt, &window)
+        .unwrap();
     let render_icfg = InterfaceConfig::new("render")
         .require_transfer()
         .require_graphics();
     let present_icfg = InterfaceConfig::new("present")
-        .require_transfer();
-    //    .require_present();
-
-    let ctxt = Context::new("demo").unwrap();
-    let physdev = ctxt.physdevs()
-        .find(|physdev| {
-            physdev.prop.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
-        }).unwrap();
+        .require_transfer()
+        .require_present(&surf);
     let dev = Device::new(&physdev, &[render_icfg, present_icfg]).unwrap();
     let shader_mods = collect_spirv_binaries("assets/effects/example")
         .into_iter()
@@ -217,23 +236,6 @@ fn main() {
     };
     */
 
-    use winit::{
-        event::{Event, WindowEvent},
-        event_loop::{ControlFlow, EventLoop},
-        window::WindowBuilder,
-        dpi::LogicalSize,
-    };
-    use winit::platform::windows::WindowExtWindows;
-
-    let event_loop = EventLoop::new();
-    let window = WindowBuilder::new()
-        .with_min_inner_size(LogicalSize::new(1024.0, 768.0))
-        .with_title("insdraw lab")
-        .with_transparent(true)
-        .build(&event_loop)
-        .unwrap();
-    let hinst = window.hinstance();
-    let hwnd = window.hwnd();
 /*
     let surf = {
         let create_info = vk::Win32SurfaceCreateInfoKHR::builder()
