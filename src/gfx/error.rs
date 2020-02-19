@@ -15,6 +15,8 @@ pub enum Error {
     InvalidOperation,
     InvalidName(bool), // Whether the name is expected to exist before the op.
     SpirqError(SpirqError),
+    PipelineMismatched(&'static str),
+    OutOfMemory,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -26,10 +28,12 @@ impl fmt::Display for Error {
             MissingExtension(ext_name) => write!(f, "{:?} is required but unsupported", ext_name),
             UnsupportedPlatform => write!(f, "unsupported platform"),
             InflexibleMemory => write!(f, "memory cannot be resized"),
-            InvalidOperation => write!(f, "an invalid operation was invoked internally"),
+            InvalidOperation => write!(f, "an invalid operation was invoked"),
             InvalidName(true) => write!(f, "expect an existing name"),
             InvalidName(false) => write!(f, "expect an absent name"),
             SpirqError(err) => write!(f, "reflection error: {}", err),
+            PipelineMismatched(msg) => msg.fmt(f),
+            OutOfMemory => write!(f, "out of managed memory"),
         }
     }
 }

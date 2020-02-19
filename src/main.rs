@@ -6,10 +6,12 @@ use std::convert::TryFrom;
 use ash::vk;
 use ash::extensions as ashex;
 use spirq::error::{Error as SpirvError, Result as SpirvResult};
-use spirq::SpirvBinary;
-use spirq::reflect::Pipeline;
+use spirq::{SpirvBinary};
 use spirq::sym::{Sym, Symbol};
-use crate::gfx::{Context, Device, InterfaceConfig, Surface, ShaderModule};
+use crate::gfx::{Context, Device, ShaderModule, Buffer, BufferConfig,
+    MemoryUsage, VertexHead, FragmentHead, AttributeBinding, Task, BindPoint,
+    AttachmentReference, FlowHead, ShaderArray, GraphicsPipeline, RenderPass,
+    GraphicsRasterizationConfig};
 
 use ash::version::DeviceV1_0;
 
@@ -33,21 +35,15 @@ fn main() {
         .build(&event_loop)
         .unwrap();
 
-    let ctxt = Context::new("demo").unwrap();
+    let ctxt = Context::new("demo", Some(&window)).unwrap();
     let physdev = ctxt.physdevs()
-    .find(|physdev| {
-        physdev.prop.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
-    }).unwrap();
-
-    let surf = Surface::new(&ctxt, &window)
+        .filter_map(|physdev| physdev.ok())
+        .find(|physdev| {
+            physdev.prop.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+        })
         .unwrap();
-    let render_icfg = InterfaceConfig::new("render")
-        .require_transfer()
-        .require_graphics();
-    let present_icfg = InterfaceConfig::new("present")
-        .require_transfer()
-        .require_present(&surf);
-    let dev = Device::new(&physdev, &[render_icfg, present_icfg]).unwrap();
+
+    let dev = Device::new(&physdev).unwrap();
     let shader_mods = collect_spirv_binaries("assets/effects/example")
         .into_iter()
         .filter_map(|(name, spv)| {
@@ -60,197 +56,123 @@ fn main() {
             }
         })
         .collect::<HashMap<_, _>>();
-
-
-
-
-/*
-    let width: u32 = 1024;
-    let height: u32 = 768;
-
-    let layout = {
-        let create_info = vk::PipelineLayoutCreateInfo::builder()
-            // .set_layouts(/* (...) */)
-            // .push_constant_ranges(/* (..) */)
-            .build();
-        let layout = unsafe { ctxt.dev.create_pipeline_layout(&create_info, None) }.unwrap();
-        layout
+    let buf_cfg = BufferConfig {
+        size: 12,
+        usage: vk::BufferUsageFlags::empty(),
     };
+    let buf = Buffer::new(&dev, &buf_cfg, MemoryUsage::Device).unwrap();
 
-    let pass = {
-        let attms = &[
-            vk::AttachmentDescription {
-                flags: Default::default(),
-                format: vk::Format::R8G8B8A8_UNORM,
-                samples: vk::SampleCountFlags::TYPE_1,
-                load_op: vk::AttachmentLoadOp::CLEAR,
-                store_op: vk::AttachmentStoreOp::STORE,
-                stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
-                stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
-                initial_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
-            },
-        ];
-        let color_attms = &[
-            vk::AttachmentReference {
-                attachment: 0,
-                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            },
-        ];
-        let subpasses = &[
-            vk::SubpassDescription::builder()
-                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                .color_attachments(color_attms)
-                .build(),
-        ];
-        let create_info = vk::RenderPassCreateInfo::builder()
-            .attachments(attms)
-            .subpasses(subpasses)
-            // .dependencies(/* (...) */)
-            .build();
-        let pass = unsafe { ctxt.dev.create_render_pass(&create_info, None) }.unwrap();
-        pass
+    struct Head {
+        attr_bind: AttributeBinding,
+        attm_ref: AttachmentReference,
     };
-
-    let entry_point_name = std::ffi::CString::new("main").unwrap();
-    let pipe = {
-        let psscis = vec![
-            vk::PipelineShaderStageCreateInfo::builder()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(shader_mods["example.vert"].handle)
-                .name(&entry_point_name)
-                // .specialization_info(/* ... */)
-                .build(),
-            vk::PipelineShaderStageCreateInfo::builder()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(shader_mods["example.frag"].handle)
-                .name(&entry_point_name)
-                .build(),
-        ];
-
-        let vert_binds = vec![
-            vk::VertexInputBindingDescription {
-                binding: 0,
-                stride: 2 * std::mem::size_of::<f32>() as u32,
-                input_rate: vk::VertexInputRate::VERTEX,
-            },
-        ];
-        let vert_attrs = vec![
-            vk::VertexInputAttributeDescription {
-                location: 0,
-                binding: 0,
-                format: vk::Format::R32G32B32_SFLOAT,
-                offset: 0,
-            },
-        ];
-        let pvisci = vk::PipelineVertexInputStateCreateInfo::builder()
-            .vertex_binding_descriptions(&vert_binds)
-            .vertex_attribute_descriptions(&vert_attrs)
-            .build();
-        let piasci = vk::PipelineInputAssemblyStateCreateInfo::builder()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-            // This one is interesting.
-            .primitive_restart_enable(false)
-            .build();
-        let ptsci = vk::PipelineTessellationStateCreateInfo::builder()
-            .build();
-        let viewports = &[
-            vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: width as f32,
-                height: height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            },
-        ];
-        let scissors = &[
-            vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D { width: width, height: height },
-            },
-        ];
-        let pvsci = vk::PipelineViewportStateCreateInfo::builder()
-            .viewport_count(viewports.len() as u32)
-            .viewports(viewports)
-            .scissor_count(scissors.len() as u32)
-            .scissors(scissors)
-            .build();
-        let prsci = vk::PipelineRasterizationStateCreateInfo::builder()
-            .depth_clamp_enable(false)
-            .rasterizer_discard_enable(false)
-            .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
-            .depth_bias_enable(false)
-            .line_width(1.0)
-            .build();
-        let pmsci = vk::PipelineMultisampleStateCreateInfo::builder()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-            .sample_shading_enable(false)
-            .min_sample_shading(1.0)
-            .build();
-        let pdssci = vk::PipelineDepthStencilStateCreateInfo::builder()
-            .build();
-        let blend_attms = &[
-            // Remember to multiply the color with the corresponding alpha.
-            vk::PipelineColorBlendAttachmentState {
-                blend_enable: vk::TRUE,
-                src_color_blend_factor: vk::BlendFactor::ONE,
-                dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
-                color_blend_op: vk::BlendOp::ADD,
-                src_alpha_blend_factor: vk::BlendFactor::ONE,
-                dst_alpha_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
-                alpha_blend_op: vk::BlendOp::ADD,
-                color_write_mask: vk::ColorComponentFlags::all(),
-            },
-        ];
-        let pcbsci = vk::PipelineColorBlendStateCreateInfo::builder()
-            .logic_op_enable(false)
-            .attachments(blend_attms)
-            .blend_constants([1.0, 1.0, 1.0, 1.0])
-            .build();
-        let pdsci = vk::PipelineDynamicStateCreateInfo::builder()
-            .build();
-        let create_infos = &[
-            vk::GraphicsPipelineCreateInfo::builder()
-                .stages(&psscis)
-                .vertex_input_state(&pvisci)
-                .input_assembly_state(&piasci)
-                .tessellation_state(&ptsci)
-                .viewport_state(&pvsci)
-                .rasterization_state(&prsci)
-                .multisample_state(&pmsci)
-                .depth_stencil_state(&pdssci)
-                .color_blend_state(&pcbsci)
-                .dynamic_state(&pdsci)
-                .layout(layout)
-                .render_pass(pass)
-                .subpass(0)
-                .build(),
-        ];
-
-
-        let pipe_cache = vk::PipelineCache::null();
-        let pipe = unsafe { ctxt.dev.create_graphics_pipelines(pipe_cache, &*create_infos, None) }.unwrap();
-        pipe
-    };
-    */
-
-/*
-    let surf = {
-        let create_info = vk::Win32SurfaceCreateInfoKHR::builder()
-            .hinstance(hinst)
-            .hwnd(hwnd)
-            .build();
-        unsafe {
-            ashex::khr::Win32Surface::new(&ctxt.0.entry, &ctxt.inst)
-                .create_win32_surface(&create_info, None)
-                .unwrap();
+    impl Head {
+        fn new() -> Head {
+            Head {
+                attr_bind: AttributeBinding {
+                    bind: 0,
+                    offset: 0,
+                    stride: 2 * std::mem::size_of::<f32>(),
+                    fmt: vk::Format::R32G32_SFLOAT,
+                },
+                attm_ref: AttachmentReference {
+                    attm_idx: 0,
+                    fmt: vk::Format::R8G8B8A8_UNORM,
+                    load_op: vk::AttachmentLoadOp::DONT_CARE,
+                    store_op: vk::AttachmentStoreOp::STORE,
+                    blend_state: None,
+                    final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+                }
+            }
         }
-        info!("created window surface");
+    }
+    impl VertexHead for Head {
+        fn attr_bind(&self, location: u32) -> Option<&AttributeBinding> {
+            if location == 0 { Some(&self.attr_bind) } else { None }
+        }
+    }
+    impl FragmentHead for Head {
+        fn attm_ref(&self, location: u32) -> Option<&AttachmentReference> {
+            if location == 0 { Some(&self.attm_ref) } else { None }
+        }
+        fn depth_attm_idx(&self, depth_attm_id: u32) -> Option<u32> {
+            None
+        }
+    }
+    let vert = shader_mods["example.vert"].entry_points().next().unwrap().unwrap();
+    let frag = shader_mods["example.frag"].entry_points().next().unwrap().unwrap();
+    let head = Head::new();
+    // Note that this is sorted in stage order.
+    let shader_arr = ShaderArray::new(&[vert, frag]).unwrap();
+    let raster_cfg = GraphicsRasterizationConfig {
+        wireframe: false,
+        cull_mode: vk::CullModeFlags::NONE,
     };
-    */
+    let graph_pipe = GraphicsPipeline::new(
+        &shader_arr, &head, &head, None, raster_cfg, None, None
+    ).unwrap();
+    let pass = RenderPass::new(&dev, &[graph_pipe], &[], &[]).unwrap();
 
+
+
+
+
+
+
+    let flow_graph = Task::new(|mut sym| {
+        //use crate::gfx::task::prelude::*;
+        // TODO: Use macro to make this neat.
+        let indices        = sym.buf("indices");
+        let mesh           = sym.buf("mesh");
+        let sampler        = sym.sampler("sampler");
+        let nvert          = sym.count("nvert");
+
+        // NOTE: Order is important.
+        let read_pass = sym.flow()
+            .bind(BindPoint::Index, Some(indices))
+            .bind(BindPoint::VertexInput(0), Some(mesh))
+            .draw(&pass, nvert, 1)
+            .pause();
+
+        sym.graph(&read_pass)
+    });
+    // let transact = Transaction::new(flow_graph);
+    // let transact_state = TransactionState::new(flow_graph);
+
+
+
+
+
+
+/* USAGE CODE
+
+    let pass = RenderPass::new(&dev, ..);
+    let img = Image(dev, .., usage);
+    let buf = Buffer(dev, .., usage);
+    let param = RenderPassParameterPack::new(&pass);
+    param.vert_input(buf);
+    param.push_const(&[0,0,0,0] as Bytes);
+    param.desc_bind(0, 0, buf);
+    param.desc_bind(0, 1, img);
+    let vert_input = VertexInput::new(&[data]);
+
+    img.push(data, dev_offset); // <- should be equivalent to:
+    let dev_offset = 0;
+    while let Err(nbyte_txed) = buf.try_push(data, dev_offset) {
+        data = &data[nbyte_txed..];
+        dev_offset += nbyte_txed;
+        dev.sync_data();
+    }
+
+    let mut trans = Transaction::new(&dev);
+    trans.then(pass, param)
+        .then(task, param);
+    trans.commit()
+        .await!();
+
+*/
+
+/*
     event_loop.run(move |event, _, control_flow| {
         match event {
             Event::EventsCleared => {
@@ -269,6 +191,7 @@ fn main() {
         }
     });
     info!("insdraw terminated");
+*/
 
 /*
     let bind1 = VertexBindingPoint::new(pass, stride, input_rate);
