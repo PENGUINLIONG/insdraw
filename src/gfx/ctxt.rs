@@ -1465,7 +1465,7 @@ fn fmt2size(fmt: vk::Format) -> Result<usize> {
 }
 
 
-
+#[derive(Default)]
 pub struct GraphicsDepthStencilConfig {
     /// Compare operator used in depth test.
     cmp_op: vk::CompareOp,
@@ -1477,10 +1477,12 @@ pub struct GraphicsDepthStencilConfig {
     /// first value is the front op state, and the second the back op state.
     stencil_ops: Option<(vk::StencilOpState, vk::StencilOpState)>,
 }
+#[derive(Default)]
 pub struct GraphicsRasterizationConfig {
     pub wireframe: bool,
     pub cull_mode: vk::CullModeFlags,
 }
+#[derive(Default)]
 pub struct GraphicsColorBlendConfig {
     pub src_factor: vk::BlendFactor,
     pub dst_factor: vk::BlendFactor,
@@ -1630,6 +1632,14 @@ pub struct RenderPassInner {
     framebuf: vk::Framebuffer,
     pipes: Vec<Pipeline>,
     imgs: Vec<Image>, // Render targets.
+}
+impl Drop for RenderPassInner {
+    fn drop(&mut self) {
+        unsafe {
+            self.dev.dev.destroy_render_pass(self.pass, None);
+            self.dev.dev.destroy_framebuffer(self.framebuf, None);
+        }
+    }
 }
 impl_ptr_wrapper!(RenderPass -> RenderPassInner);
 pub struct RenderPass(Arc<RenderPassInner>);
@@ -2412,10 +2422,12 @@ impl SymbolSource {
     }
 }
 
-pub struct Task {
+pub struct TaskInner {
     graph: FlowGraph,
     sym_map: HashMap<String, VariableType>,
 }
+impl_ptr_wrapper!(Task -> TaskInner);
+pub struct Task(Arc<TaskInner>);
 impl Task {
     // TODO: Pass in dev to ensure all pipelines are constructed on the same
     // device.
@@ -2428,7 +2440,8 @@ impl Task {
         let sym_map = name_map.into_iter()
             .map(|(name, token)| (name, syms[token]))
             .collect::<HashMap<_, _>>();
-        Task { graph, sym_map }
+        let inner = TaskInner { graph, sym_map };
+        Task(Arc::new(inner))
     }
 }
 
