@@ -1,8 +1,10 @@
+use log::info;
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum State {
     Vacant,
     Split,
-    Occupied,
+    Occupied(usize),
 }
 
 pub struct BuddyAllocator {
@@ -25,6 +27,9 @@ impl BuddyAllocator {
                 .collect::<Vec<_>>(),
         }
     }
+    pub fn is_unused(&self) -> bool {
+        self.get_state(0, 0) == State::Vacant
+    }
 
     #[inline]
     fn get_state(&self, i: usize, rorder: u32) -> State {
@@ -40,13 +45,21 @@ impl BuddyAllocator {
         let base = len - 1;
         self.buddies[base + i] = state;
     }
-    // Allocate a piece of memory in the managed memory page. Returns the
-    // address (offset from the beginning of the memory pate) to the allocated
-    // memory.
-    pub fn alloc(&mut self, alloc_size: usize) -> Option<usize> {
+    /// Allocate a piece of memory in the managed memory page. Returns the
+    /// address (offset from the beginning of the memory pate) to the allocated
+    /// memory.
+    ///
+    /// WARN: It should be noted that the reference count is initially set to 0.
+    /// The user code MUST `refer` to the base address of the allocated memory
+    /// otherwise the mechanism will break.
+    pub fn alloc(&mut self, alloc_size: usize, align: usize) -> Option<usize> {
+        const NBIT_USIZE: u32 = (std::mem::size_of::<usize>() * 8) as u32;
         // Reject invalid sizes right away.
         if alloc_size == 0 || alloc_size > self.size { return None }
-        const NBIT_USIZE: u32 = (std::mem::size_of::<usize>() * 8) as u32;
+        debug_assert!(!align.is_power_of_two(),
+            "doesn't support non pow-of-2 alignment");
+        // Step of each iteration.
+        let step = (align + self.unit - 1) / self.unit;
         // The number of units needed to contain the allocation.
         let nunit = (alloc_size + self.unit - 1) / self.unit;
         // The length of integer needed to describe the allocation size. With
@@ -70,12 +83,12 @@ impl BuddyAllocator {
             if self.buddies[order_base + i] != State::Vacant {
                 // The block is not vacant or has been split in to sub-blocks.
                 // Don't care.
-                i += 1;
+                i += step;
             } else if let Some(occupied_rorder) = (0..rorder).into_iter().rev()
                 .filter_map(|cur_rorder| {
                     let cur_order = self.max_order - cur_rorder;
                     match self.get_state(i >> cur_order, cur_rorder) {
-                        State::Occupied => Some(cur_rorder),
+                        State::Occupied(_) => Some(cur_rorder),
                         State::Vacant => { top_vacant_rorder = cur_rorder; None },
                         _ => None,
                     }
@@ -85,26 +98,24 @@ impl BuddyAllocator {
                 // been occupied. If so, skip the entire parent block.
                 let delta_rorder = rorder - occupied_rorder;
                 i >>= delta_rorder;
-                i += 1;
+                i += step;
                 i <<= delta_rorder;
             } else {
                 // Found a vacant block. Occupy the block and split higher level
                 // blocks.
-                self.buddies[order_base + i] = State::Occupied;
+                self.buddies[order_base + i] = State::Occupied(0);
                 for cur_rorder in top_vacant_rorder..rorder {
                     let cur_order = self.max_order - cur_rorder;
                     self.set_state(i >> cur_order, cur_rorder, State::Split);
                 }
                 let offset = i * (self.unit << nbit_addr);
-                println!("{:?}", self.buddies);
+                info!("allocated {} bytes at offset {:#x}", alloc_size, offset);
                 return Some(offset);
             }
         }
         None
     }
-    // Release a piece of allocated memory located at `addr`. If the memory
-    // address has not been allocated yet, the method works as an no-op.
-    pub fn free(&mut self, addr: usize) -> Option<()>{
+    fn get_addr_occupied_location(&self, addr: usize) -> Option<(usize, u32)> {
         // Reject unaddressable locations right away.
         if addr >= self.size || addr % self.unit != 0 { return None }
         let unit_idx = addr / self.unit;
@@ -119,28 +130,64 @@ impl BuddyAllocator {
             rorder = self.max_order - cur_order;
             match self.get_state(i, rorder) {
                 // This address hasn't been allocated yet. Cast no side-effect.
-                State::Vacant => return Some(()),
+                State::Vacant => return None,
                 // Discovered the actual order the memory has been allocated.
-                State::Occupied => { nbit_addr = cur_order; break },
+                State::Occupied(_) => return Some((i, rorder)),
                 _ => {},
             }
         }
-
-        // Release allocation and merge parents (if possible).
-        self.set_state(unit_idx >> nbit_addr, rorder, State::Vacant);
-        for cur_rorder in 0..rorder {
-            // We only have to check the neighbors' state because the states of
-            // parent-blocks are managed by us. Here we toggle the LSB to switch
-            // to the other bisection.
-            let cur_child_rorder = cur_rorder + 1;
-            let cur_child_order = self.max_order - cur_child_rorder;
-            let child_i = (unit_idx >> cur_child_order) ^ 1;
-            if self.get_state(child_i, cur_child_order) != State::Vacant { break }
-            let cur_order = self.max_order - cur_rorder;
-            let i = unit_idx >> cur_order;
-            self.set_state(i, cur_rorder, State::Vacant);
+        None
+    }
+    // Release a piece of allocated memory located at `addr`. If the memory
+    // address has not been allocated yet, the method works as an no-op. `true`
+    // is returned when the memory needs to be freed since the reference count
+    // is reduced to 0.
+    pub fn free(&mut self, addr: usize) -> Option<bool> {
+        let (i, rorder) = self.get_addr_occupied_location(addr)?;
+        match self.get_state(i, rorder) {
+            // Discovered the actual order the memory has been allocated.
+            State::Occupied(ref_count) => {
+                // Reduce reference count.
+                self.set_state(i, rorder, State::Occupied(ref_count - 1));
+                info!("decreased reference counting at offset {:#x}", addr);
+                Some(false)
+            },
+            State::Occupied(1) => {
+                // After this free the reference count is decreased to 0.
+                // There will be no referrer, so release allocation and merge
+                // parents (if possible).
+                self.set_state(i, rorder, State::Vacant);
+                let unit_idx = addr / self.unit;
+                for cur_rorder in 0..rorder {
+                    // We only have to check the neighbors' state because the
+                    // states of parent-blocks are managed by us. Here we toggle
+                    // the LSB to switch to the other bisection.
+                    let cur_child_rorder = cur_rorder + 1;
+                    let cur_child_order = self.max_order - cur_child_rorder;
+                    let child_i = (unit_idx >> cur_child_order) ^ 1;
+                    let cur_state = self.get_state(child_i, cur_child_order);
+                    if cur_state != State::Vacant { break }
+                    let cur_order = self.max_order - cur_rorder;
+                    let i = unit_idx >> cur_order;
+                    info!("freed memory at offset {:#x}", addr);
+                    self.set_state(i, cur_rorder, State::Vacant);
+                }
+                Some(true)
+            },
+            _ => unreachable!(),
         }
-        println!("{:?}", self.buddies);
-        Some(())
+    }
+    // Increase the reference count at `addr`. This method works as an no-op if
+    // the address hasn't been allocated yet.
+    pub fn refer(&mut self, addr: usize) -> Option<()> {
+        let (i, rorder) = self.get_addr_occupied_location(addr)?;
+        match self.get_state(i, rorder) {
+            State::Occupied(ref_count) => {
+                self.set_state(i, rorder, State::Occupied(ref_count + 1));
+                info!("increased reference counting at offset {:#x}", addr);
+                Some(())
+            },
+            _ => unreachable!(),
+        }
     }
 }
