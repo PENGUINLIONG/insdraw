@@ -1,7 +1,7 @@
 //! Memory sizing and arrangement contract checked against to ensure a basic
 //! level of memory usage conformance.
 use std::ops::Range;
-use ash::vk::{ImageViewType, Format, VertexInputRate, AttachmentLoadOp, AttachmentStoreOp, ImageLayout, DescriptorType};
+use ash::vk::{Format, VertexInputRate, AttachmentLoadOp, AttachmentStoreOp};
 
 pub struct RenderPassContract {
     /// Pipeline stages sorted in order, with each subpass started by a

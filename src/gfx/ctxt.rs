@@ -11,7 +11,7 @@ use ash::extensions as vkx;
 use lazy_static::lazy_static;
 use spirq::{SpirvBinary, EntryPoint as EntryPointManifest, InterfaceLocation,
     Manifest};
-use spirq::ty::{DescriptorType};
+use spirq::ty::{DescriptorType, Type};
 use winit::window::Window;
 use super::error::{Error, Result};
 use super::alloc::BuddyAllocator;
@@ -108,8 +108,24 @@ macro_rules! impl_ptr_wrapper {
 }
 
 
-fn fmt2aspect(fmt: vk::Format) -> vk::ImageAspectFlags {
-    unimplemented!();
+fn fmt2aspect(fmt: vk::Format) -> Result<vk::ImageAspectFlags> {
+    // TODO: Check this format code limit.
+    if fmt.as_raw() >= 1000156000 {
+        return Err(Error::UnsupportedPlatform);
+    }
+    let aspect = match fmt {
+        vk::Format::UNDEFINED => Default::default(),
+        vk::Format::D16_UNORM |
+            vk::Format::X8_D24_UNORM_PACK32 |
+            vk::Format::D32_SFLOAT => { vk::ImageAspectFlags::DEPTH },
+        vk::Format::S8_UINT => vk::ImageAspectFlags::STENCIL,
+        vk::Format::D16_UNORM_S8_UINT |
+            vk::Format::D24_UNORM_S8_UINT |
+            vk::Format::D32_SFLOAT_S8_UINT =>
+        { vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL },
+        _ => vk::ImageAspectFlags::COLOR,
+    };
+    Ok(aspect)
 }
 
 
@@ -179,7 +195,18 @@ impl Context {
 
     pub fn physdevs(&self) -> impl Iterator<Item=Result<PhysicalDevice>> + '_ {
         (0..self.physdevs.len()).into_iter()
-            .map(move |i| PhysicalDevice::new(self, i))
+            .map(move |i| {
+                match PhysicalDevice::new(self, i) {
+                    Ok(physdev) => {
+                        info!("device #{}: {:?}", i, physdev);
+                        Ok(physdev)
+                    },
+                    Err(e) => {
+                        info!("device #{} not accessible", i);
+                        Err(e)
+                    },
+                }
+            })
     }
 }
 impl Drop for ContextInner {
@@ -335,6 +362,15 @@ impl PhysicalDevice {
         Ok(PhysicalDevice(Arc::new(inner)))
     }
 }
+impl std::fmt::Debug for PhysicalDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let dev_name = unsafe {
+            CStr::from_ptr(self.prop.device_name.as_ptr()).to_string_lossy()
+        };
+        let dev_ty = self.prop.device_type;
+        write!(f, "'{}' ({:?})", dev_name, dev_ty)
+    }
+}
 
 struct PhysicalDeviceSurfaceDetail {
     surf_cap: vk::SurfaceCapabilitiesKHR,
@@ -430,11 +466,7 @@ impl Device {
             physdev.ctxt.inst.create_device(physdev.physdev, &create_info,
                 None)?
         };
-        let dev_name = unsafe {
-            CStr::from_ptr(physdev.prop.device_name.as_ptr()).to_string_lossy()
-        };
-        let dev_ty = physdev.prop.device_type;
-        info!("created device on '{}' ({:?})", dev_name, dev_ty);
+        info!("created device on {:?}", physdev);
         Ok(dev)
     }
     fn collect_qmap(
@@ -519,6 +551,12 @@ impl Device {
     ) -> Result<MemorySlice> {
         let mem_req = unsafe { dev.dev.get_buffer_memory_requirements(buf) };
         Self::alloc_mem(dev, &mem_req, mem_usage)
+            .and_then(|mem| unsafe {
+                let offset = mem.offset as u64;
+                let dev_mem = mem.mem.dev_mem;
+                dev.dev.bind_buffer_memory(buf, dev_mem, offset)?;
+                Ok(mem)
+            })
     }
     fn alloc_img_mem(
         dev: &Device,
@@ -527,6 +565,12 @@ impl Device {
     ) -> Result<MemorySlice> {
         let mem_req = unsafe { dev.dev.get_image_memory_requirements(img) };
         Self::alloc_mem(dev, &mem_req, mem_usage)
+            .and_then(|mem| unsafe {
+                let offset = mem.offset as u64;
+                let dev_mem = mem.mem.dev_mem;
+                dev.dev.bind_image_memory(img, dev_mem, offset)?;
+                Ok(mem)
+            })
     }
 }
 #[derive(PartialEq, Eq, Debug, Clone, Copy, Hash)]
@@ -735,7 +779,14 @@ impl Drop for MemoryInner {
 #[derive(Clone)]
 pub struct MemorySlice {
     mem: Memory,
-    /// Offset of the suballocation in the owner memory page.
+    /// Offset of the suballocation in the owner memory page. `page_offset` is
+    /// always less than any current offset of the slice; and `offset + size` is
+    /// always within the bound of the allocated range. E.g.
+    ///
+    /// ```
+    /// page_offset->|<- allocated size ->|
+    ///           offset->|<- size ->|
+    /// ```
     page_offset: usize,
     offset: usize,
     size: usize,
@@ -1013,7 +1064,8 @@ impl DevicePresentationDetail {
             .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
             .present_mode(physdev_surf_detail.present_mode)
             .clipped(true)
-            .composite_alpha(vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED)
+            .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .build();
 
         let swapchain = unsafe {
@@ -1076,6 +1128,7 @@ pub struct BufferInner {
 }
 impl Buffer {
     fn create_buf(dev: &Device, buf_cfg: &BufferConfig) -> Result<vk::Buffer> {
+        if buf_cfg.usage.as_raw() == 0 { return Err(Error::InvalidOperation) }
         let create_info = vk::BufferCreateInfo::builder()
             .size(buf_cfg.size as u64)
             .usage(buf_cfg.usage)
@@ -1122,8 +1175,9 @@ pub struct ImageInner {
 }
 impl_ptr_wrapper!(Image -> ImageInner);
 pub struct Image(Arc<ImageInner>);
-impl ImageInner {
+impl Image {
     fn create_img(dev: &Device, img_cfg: &ImageConfig) -> Result<vk::Image> {
+        if img_cfg.usage.as_raw() == 0 { return Err(Error::InvalidOperation) }
         let flags = match img_cfg.view_ty {
             vk::ImageViewType::CUBE | vk::ImageViewType::CUBE_ARRAY => {
                 vk::ImageCreateFlags::CUBE_COMPATIBLE
@@ -1133,7 +1187,7 @@ impl ImageInner {
         let img_ty = match img_cfg.view_ty {
             vk::ImageViewType::TYPE_1D => vk::ImageType::TYPE_1D,
             vk::ImageViewType::TYPE_2D |
-            vk::ImageViewType::CUBE |
+                vk::ImageViewType::CUBE |
                 vk::ImageViewType::TYPE_1D_ARRAY => vk::ImageType::TYPE_2D,
             vk::ImageViewType::TYPE_3D |
                 vk::ImageViewType::TYPE_2D_ARRAY |
@@ -1167,7 +1221,7 @@ impl ImageInner {
         img: vk::Image,
     ) -> Result<vk::ImageView> {
         let subrsc_rng = vk::ImageSubresourceRange {
-            aspect_mask: fmt2aspect(img_cfg.fmt),
+            aspect_mask: fmt2aspect(img_cfg.fmt)?,
             base_mip_level: 0,
             level_count: img_cfg.nmip,
             base_array_layer: 0,
@@ -1190,8 +1244,8 @@ impl ImageInner {
         mem_use: MemoryUsage,
     ) -> Result<Image> {
         let img = Self::create_img(dev, img_cfg)?;
-        let img_view = Self::create_img_view(dev, img_cfg, img)?;
         let mem = Device::alloc_img_mem(dev, img, mem_use)?;
+        let img_view = Self::create_img_view(dev, img_cfg, img)?;
         let inner = ImageInner { img, img_view, mem, cfg: img_cfg.clone() };
         Ok(Image(Arc::new(inner)))
     }
@@ -1457,14 +1511,6 @@ pub trait FragmentHead {
     fn depth_attm_idx(&self, depth_attm_id: u32) -> Option<u32>;
 }
 
-fn ty2fmt(ty: &spirq::ty::Type) -> Result<vk::Format> {
-    unimplemented!();
-}
-fn fmt2size(fmt: vk::Format) -> Result<usize> {
-    unimplemented!();
-}
-
-
 #[derive(Default)]
 pub struct GraphicsDepthStencilConfig {
     /// Compare operator used in depth test.
@@ -1539,18 +1585,13 @@ impl GraphicsPipeline {
         let mut attr_map = HashMap::new();
         for attr_res in manifest.inputs() {
             let location = attr_res.location;
-            let ty = &attr_res.ty;
-            let nbyte = ty.nbyte()
-                // Wrong type.
-                .ok_or(Error::PipelineMismatched("attribute cannot be opaque type"));
+            if let None = attr_res.ty.nbyte() {
+                return Err(Error::PipelineMismatched("attachment cannot be opaque type"));
+            }
             let attr_bind = vert_head.attr_bind(location.loc())
                 // Attribute not supported.
                 .ok_or(Error::PipelineMismatched("attribute not supported by head"))?;
             if let Vacant(entry) = attr_map.entry(location) {
-                if attr_bind.fmt != ty2fmt(ty)? {
-                    // Incompatible format.
-                    return Err(Error::PipelineMismatched("attribute format mismatched"));
-                }
                 entry.insert(attr_bind.clone());
             } else {
                 return Err(Error::PipelineMismatched("attribute location collision"));
@@ -1566,15 +1607,12 @@ impl GraphicsPipeline {
         let mut attm_map = HashMap::new();
         for attm_ref in manifest.outputs() {
             let location = attm_ref.location;
-            let ty = &attm_ref.ty;
-            let nbyte = ty.nbyte()
-                .ok_or(Error::PipelineMismatched("attachment cannot be opaque type"))?;
+            if let None = attm_ref.ty.nbyte() {
+                return Err(Error::PipelineMismatched("attachment cannot be opaque type"));
+            }
             let attm_ref = frag_head.attm_ref(location.loc())
                 .ok_or(Error::PipelineMismatched("attachment not supported by head"))?;
             if let Vacant(entry) = attm_map.entry(location) {
-                if attm_ref.fmt != ty2fmt(ty)? {
-                    return Err(Error::PipelineMismatched("attachment format mismatched"));
-                }
                 entry.insert(attm_ref.clone());
             } else {
                 return Err(Error::PipelineMismatched("attachment location collision"));
@@ -2445,8 +2483,33 @@ impl Task {
     }
 }
 
-
-
+/*
+pub struct TransactionInner {
+    cmdpool: Vec<vk::CommandPool>,
+    /// Mapping from queue to command pool.
+    queue_map: HashMap,////////////////////////////////////////////////////////
+    cmdbufs: Vec<vk::CommandBuffer>,
+}
+pub struct Transaction(Arc<TransactionInner>);
+impl Transaction {
+    pub fn new(dev: &Device) -> Result<Transaction> {
+        let cmdpool = {
+            let create_info = vk::CommandPoolCreateInfo::builder()
+                .queue_family_index()
+                .build();
+            let cmdpool = unsafe {
+                dev.0.dev.create_command_pool(create_info, None)?
+            };
+            cmdpool
+        }
+        let inner = TransactionInner { cmdpool, cmdbufs };
+        Transaction(Arc::new(inner))
+    }
+    pub fn commit(&mut self) {
+        
+    }
+}
+*/
 
 
 

@@ -11,7 +11,7 @@ use spirq::sym::{Sym, Symbol};
 use crate::gfx::{Context, Device, ShaderModule, Buffer, BufferConfig,
     MemoryUsage, VertexHead, FragmentHead, AttributeBinding, Task, BindPoint,
     AttachmentReference, FlowHead, ShaderArray, GraphicsPipeline, RenderPass,
-    GraphicsRasterizationConfig};
+    GraphicsRasterizationConfig, Image, ImageConfig};
 
 use ash::version::DeviceV1_0;
 
@@ -58,7 +58,7 @@ fn main() {
         .collect::<HashMap<_, _>>();
     let buf_cfg = BufferConfig {
         size: 12,
-        usage: vk::BufferUsageFlags::empty(),
+        usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
     };
     let buf = Buffer::new(&dev, &buf_cfg, MemoryUsage::Device).unwrap();
 
@@ -108,10 +108,23 @@ fn main() {
         wireframe: false,
         cull_mode: vk::CullModeFlags::NONE,
     };
+    let render_target = {
+        let cfg = ImageConfig {
+            fmt: vk::Format::R8_UNORM,
+            view_ty: vk::ImageViewType::TYPE_2D,
+            width: 64,
+            height: 64,
+            depth: 1,
+            nlayer: 1,
+            nmip: 1,
+            usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        };
+        Image::new(&dev, &cfg, MemoryUsage::Device).unwrap()
+    };
     let graph_pipe = GraphicsPipeline::new(
         &shader_arr, &head, &head, None, raster_cfg, None, None
     ).unwrap();
-    let pass = RenderPass::new(&dev, &[graph_pipe], &[], &[]).unwrap();
+    let pass = RenderPass::new(&dev, &[graph_pipe], &[], &[render_target]).unwrap();
 
 
 

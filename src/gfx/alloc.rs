@@ -1,4 +1,4 @@
-use log::info;
+use log::trace;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum State {
@@ -109,7 +109,7 @@ impl BuddyAllocator {
                     self.set_state(i >> cur_order, cur_rorder, State::Split);
                 }
                 let offset = i * (self.unit << nbit_addr);
-                info!("allocated {} bytes at offset {:#x}", alloc_size, offset);
+                trace!("allocated {} bytes at offset {:#x}", alloc_size, offset);
                 return Some(offset);
             }
         }
@@ -149,7 +149,7 @@ impl BuddyAllocator {
             State::Occupied(ref_count) => {
                 // Reduce reference count.
                 self.set_state(i, rorder, State::Occupied(ref_count - 1));
-                info!("decreased reference counting at offset {:#x}", addr);
+                trace!("decreased reference counting at offset {:#x}", addr);
                 Some(false)
             },
             State::Occupied(1) => {
@@ -169,7 +169,7 @@ impl BuddyAllocator {
                     if cur_state != State::Vacant { break }
                     let cur_order = self.max_order - cur_rorder;
                     let i = unit_idx >> cur_order;
-                    info!("freed memory at offset {:#x}", addr);
+                    trace!("freed memory at offset {:#x}", addr);
                     self.set_state(i, cur_rorder, State::Vacant);
                 }
                 Some(true)
@@ -184,7 +184,7 @@ impl BuddyAllocator {
         match self.get_state(i, rorder) {
             State::Occupied(ref_count) => {
                 self.set_state(i, rorder, State::Occupied(ref_count + 1));
-                info!("increased reference counting at offset {:#x}", addr);
+                trace!("increased reference counting at offset {:#x}", addr);
                 Some(())
             },
             _ => unreachable!(),
