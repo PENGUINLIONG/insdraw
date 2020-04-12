@@ -9,9 +9,10 @@ use spirq::error::{Error as SpirvError, Result as SpirvResult};
 use spirq::{SpirvBinary};
 use spirq::sym::{Sym, Symbol};
 use crate::gfx::{Context, Device, ShaderModule, Buffer, BufferConfig,
-    MemoryUsage, VertexHead, FragmentHead, AttributeBinding, Task, BindPoint,
-    AttachmentReference, FlowHead, ShaderArray, GraphicsPipeline, RenderPass,
-    GraphicsRasterizationConfig, Image, ImageConfig};
+    MemoryUsage, VertexHead, FragmentHead, AttributeBinding, DeviceProc,
+    /*Transaction,*/ BindPoint, AttachmentReference, FlowHead, ShaderArray,
+    GraphicsPipeline, RenderPass, GraphicsRasterizationConfig, Image,
+    ImageConfig};
 
 use ash::version::DeviceV1_0;
 
@@ -132,9 +133,8 @@ fn main() {
 
 
 
-    let flow_graph = Task::new(|mut sym| {
-        //use crate::gfx::task::prelude::*;
-        // TODO: Use macro to make this neat.
+    let devproc = DeviceProc::new(|mut sym| {
+        // TODO: Use macro to make this neat?
         let indices        = sym.buf("indices");
         let mesh           = sym.buf("mesh");
         let sampler        = sym.sampler("sampler");
@@ -149,8 +149,8 @@ fn main() {
 
         sym.graph(&read_pass)
     });
-    // let transact = Transaction::new(flow_graph);
-    // let transact_state = TransactionState::new(flow_graph);
+    //let transact = Transaction::new(devproc).unwrap();
+    //transact.submit().unwrap();
 
 
 

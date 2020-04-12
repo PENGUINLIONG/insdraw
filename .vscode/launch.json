@@ -14,7 +14,8 @@
             "cwd": "${workspaceFolder}",
             "environment": [
                 { "name": "RUST_LOG", "value": "trace" },
-                { "name": "VK_INSTANCE_LAYERS", "value": "VK_LAYER_LUNARG_api_dump;VK_LAYER_KHRONOS_validation" }
+                //{ "name": "VK_INSTANCE_LAYERS", "value": "VK_LAYER_LUNARG_api_dump;VK_LAYER_KHRONOS_validation" }
+                { "name": "VK_INSTANCE_LAYERS", "value": "VK_LAYER_KHRONOS_validation" }
             ],
             "externalConsole": false
         }

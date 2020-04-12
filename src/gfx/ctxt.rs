@@ -433,6 +433,7 @@ pub struct DeviceInner {
     cap_detail: DeviceCapabilityDetail,
     malloc_detail: DeviceMemoryAllocationDetail,
     present_detail: Option<DevicePresentationDetail>,
+    qmap: HashMap<QueueInterface, vk::Queue>,
 }
 impl_ptr_wrapper!(Device -> DeviceInner);
 pub struct Device(Arc<DeviceInner>);
@@ -513,7 +514,7 @@ impl Device {
         };
         let physdev = physdev.clone();
         let inner = DeviceInner { physdev, dev, cap_detail,
-            malloc_detail, present_detail };
+            malloc_detail, present_detail, qmap };
         Ok(Device(Arc::new(inner)))
     }
 
@@ -2200,6 +2201,16 @@ impl Event {
             _ => None,
         }
     }
+    /// Get the queue interface the event should be submitted to.
+    fn qi(&self) -> Option<QueueInterface> {
+        match self {
+            Self::Transfer(_) => Some(QueueInterface::Transfer),
+            Self::Dispatch(_) => Some(QueueInterface::Compute),
+            Self::Draw(_) => Some(QueueInterface::Graphics),
+            Self::Present(_) => Some(QueueInterface::Present),
+            _ => None,
+        }
+    }
 }
 
 
@@ -2212,6 +2223,10 @@ struct Chunk {
     /// later.
     deps: Vec<usize>,
     events: Vec<Event>,
+    /// The queue interface the chunk has been bound to. It depends on the last
+    /// interface-bound event in this chunk. A chunk only contains events bound
+    /// to a same interface.
+    qi: Option<QueueInterface>,
 }
 pub struct FlowHead {
     serial: usize,
@@ -2225,6 +2240,7 @@ impl Flow {
         let chunk = Chunk {
             deps: Vec::new(),
             events: Vec::new(),
+            qi: None,
         };
         let chunks = vec![chunk];
         Flow { serial, chunks }
@@ -2256,6 +2272,7 @@ impl Flow {
             let chunk = Chunk {
                 deps: vec![head.serial],
                 events: Vec::new(),
+                qi: None,
             };
             self.chunks.push(chunk);
         }
@@ -2263,6 +2280,32 @@ impl Flow {
     }
     
     fn push_event(&mut self, event: Event) -> &mut Self {
+        if let Some(qi) = event.qi() {
+            let mut last_chunk = self.last_chunk();
+            if let Some(last_qi) = last_chunk.qi {
+                // The interface has already been assigned.
+                if last_qi != qi {
+                    // Split and add a new chunk if the queue interface
+                    // requirements are in conflict.
+                    let ilast_bound = last_chunk.events.iter()
+                        .rposition(|x| x.qi().is_some())
+                        .expect("queue interface not assigned for events but for chunks");
+                    let events = last_chunk.events
+                        .drain((ilast_bound + 1)..)
+                        .collect();
+                    let chunk = Chunk {
+                        deps: Vec::new(),
+                        events,
+                        qi: Some(qi),
+                    };
+                    self.chunks.push(chunk);
+                }
+            } else {
+                // The interface has not been assigned yet. Set the current
+                // event's interface as chunk interface.
+                last_chunk.qi = Some(qi);
+            }
+        }
         self.last_chunk().events.push(event);
         self
     }
@@ -2330,7 +2373,10 @@ pub struct FlowGraph {
     /// Chunks of events ordered in a way that all chunks will not depend on any
     /// chunk which has higher index than it.
     chunks: Vec<Chunk>,
-    /// Reversed dependency mapping from dependee to dependers.
+    /// Reversed dependency mapping from dependee to dependers. Note that the
+    /// length of this list is the number of semaphores needed for one
+    /// execution; the length of this list plus one is the number of command
+    /// buffer needed for one execution of the flow graph.
     rev_dep_map: Vec<Vec<usize>>,
 }
 impl FlowGraph {
@@ -2382,7 +2428,7 @@ impl FlowGraph {
                 deps.extend(exref);
     
                 let events = chunk.events.clone();
-                chunks.push(Chunk { deps, events });
+                chunks.push(Chunk { deps, events, qi: None });
             }
             let end = chunks.len();
             rng_map[flow_serial] = Some(beg..end);
@@ -2481,16 +2527,16 @@ impl SymbolSource {
     }
 }
 
-pub struct TaskInner {
+pub struct DeviceProcInner {
     graph: FlowGraph,
     sym_map: HashMap<String, VariableType>,
 }
-impl_ptr_wrapper!(Task -> TaskInner);
-pub struct Task(Arc<TaskInner>);
-impl Task {
+impl_ptr_wrapper!(DeviceProc -> DeviceProcInner);
+pub struct DeviceProc(Arc<DeviceProcInner>);
+impl DeviceProc {
     // TODO: Pass in dev to ensure all pipelines are constructed on the same
     // device.
-    pub fn new<'a, F>(graph_fn: F) -> Task
+    pub fn new<'a, F>(graph_fn: F) -> DeviceProc
         where F: FnOnce(&mut SymbolSource) -> FlowGraph
     {
         let mut sym_src = SymbolSource::new();
@@ -2499,38 +2545,53 @@ impl Task {
         let sym_map = name_map.into_iter()
             .map(|(name, token)| (name, syms[token]))
             .collect::<HashMap<_, _>>();
-        let inner = TaskInner { graph, sym_map };
-        Task(Arc::new(inner))
+
+        let inner = DeviceProcInner { graph, sym_map };
+        DeviceProc(Arc::new(inner))
     }
 }
-
 /*
 pub struct TransactionInner {
+    dev: Arc<DeviceInner>,
     cmdpool: Vec<vk::CommandPool>,
     /// Mapping from queue to command pool.
-    queue_map: HashMap,////////////////////////////////////////////////////////
+    queue_map: HashMap<vk>,
     cmdbufs: Vec<vk::CommandBuffer>,
 }
+impl_ptr_wrapper!(Transaction -> TransactionInner);
 pub struct Transaction(Arc<TransactionInner>);
 impl Transaction {
-    pub fn new(dev: &Device) -> Result<Transaction> {
-        let cmdpool = {
+    fn create_cmdpool(
+        dev: &Device,
+        iq: QueueInterface) -> Result<vk::CommandPool>
+    {
+        if let Some(queue) = dev.qmap.get(&iq) {
             let create_info = vk::CommandPoolCreateInfo::builder()
-                .queue_family_index()
+                .queue_family_index(queue)
                 .build();
             let cmdpool = unsafe {
                 dev.0.dev.create_command_pool(create_info, None)?
             };
-            cmdpool
+            Ok(cmdpool)
+        } else { Err(Error::InvalidOperation) }
+    }
+    pub fn new(dev: &Device, devproc: &DeviceProc) -> Result<Transaction> {
+        let graph = &devproc.graph;
+        for chunk in graph.chunks.iter() {
+            for event in events.iter() {
+                push_event()
+            }
         }
-        let inner = TransactionInner { cmdpool, cmdbufs };
+        let inner = TransactionInner { dev, cmdpool, cmdbufs };
         Transaction(Arc::new(inner))
     }
-    pub fn commit(&mut self) {
-        
+    pub fn submit(&mut self) {
+        //self.dev.dev.queue_wait_idle();
     }
 }
+
 */
+
 
 
 
