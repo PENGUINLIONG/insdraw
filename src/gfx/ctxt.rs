@@ -816,14 +816,35 @@ impl MemorySlice {
             Err(Error::InvalidOperation)
         }
     }
-    pub fn write(&self, data: &[u8]) -> Result<()> {
-        unimplemented!();
+    pub fn write(&self, src: &[u8]) -> Result<()> {
+        let dev_mem = self.mem.dev_mem;
+        let dev = &self.mem.dev.dev;
+        unsafe {
+            let offset = self.offset as u64;
+            let dst = dev.map_memory(
+                dev_mem,
+                offset,
+                self.size as u64,
+                vk::MemoryMapFlags::empty())? as *mut u8;
+            std::intrinsics::copy(src.as_ptr(), dst, self.size);
+            dev.unmap_memory(dev_mem);
+        }
+        Ok(())
     }
-    pub fn read(&self, data: &mut [u8]) -> Result<()> {
-        unimplemented!();
-    }
-    pub fn copy_to(&self, offset: usize, size: usize) -> Result<()> {
-        unimplemented!();
+    pub fn read(&self, dst: &mut [u8]) -> Result<()> {
+        let dev_mem = self.mem.dev_mem;
+        let dev = &self.mem.dev.dev;
+        unsafe {
+            let offset = self.offset as u64;
+            let src = dev.map_memory(
+                dev_mem,
+                offset,
+                self.size as u64,
+                vk::MemoryMapFlags::empty())? as *mut u8;
+            std::intrinsics::copy(src, dst.as_mut_ptr(), self.size);
+            dev.unmap_memory(dev_mem);
+        }
+        Ok(())
     }
 }
 impl Drop for MemorySlice {
