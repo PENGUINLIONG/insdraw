@@ -3,6 +3,7 @@ use std::ffi::{CStr, CString};
 use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex, Weak};
 use std::ops::Range;
+use std::marker::PhantomData;
 use log::{info, warn, error, debug, trace};
 use ash::vk;
 use ash::vk_make_version;
@@ -1194,6 +1195,8 @@ pub struct ImageInner {
     img_view: vk::ImageView,
     mem: MemorySlice,
     cfg: ImageConfig,
+    layout: Cell<vk::ImageLayout>,
+    aspect: vk::ImageAspect,
 }
 impl_ptr_wrapper!(Image -> ImageInner);
 pub struct Image(Arc<ImageInner>);
@@ -1240,10 +1243,11 @@ impl Image {
     fn create_img_view(
         dev: &Device,
         img_cfg: &ImageConfig,
+        aspect: vk::ImageAspect,
         img: vk::Image,
     ) -> Result<vk::ImageView> {
         let subrsc_rng = vk::ImageSubresourceRange {
-            aspect_mask: fmt2aspect(img_cfg.fmt)?,
+            aspect_mask: aspect,
             base_mip_level: 0,
             level_count: img_cfg.nmip,
             base_array_layer: 0,
@@ -1256,7 +1260,7 @@ impl Image {
             .subresource_range(subrsc_rng)
             .build();
         let img_view = unsafe {
-            dev.dev.create_image_view(&create_info, None)?
+            dev.dev.create_img_view(&create_info, None)?
         };
         Ok(img_view)
     }
@@ -1267,8 +1271,12 @@ impl Image {
     ) -> Result<Image> {
         let img = Self::create_img(dev, img_cfg)?;
         let mem = Device::alloc_img_mem(dev, img, mem_use)?;
+        let aspect = fmt2aspect(img_cfg.fmt)?;
         let img_view = Self::create_img_view(dev, img_cfg, img)?;
-        let inner = ImageInner { img, img_view, mem, cfg: img_cfg.clone() };
+        let layout = Cell::new(vk::ImageLayout::UNDEFINED);
+        let inner = ImageInner {
+            img, img_view, mem, cfg: img_cfg.clone(), layout, aspect,
+        };
         Ok(Image(Arc::new(inner)))
     }
 }
@@ -1276,6 +1284,33 @@ impl Drop for ImageInner {
     fn drop(&mut self) {
         unsafe { self.mem.mem.dev.dev.destroy_image(self.img, None) };
         info!("destroyed image");
+    }
+}
+
+#[derive(Clone)]
+struct SamplerConfig {
+    // TODO: (penguinliong) impl
+}
+struct SamplerInner {
+    sampler: vk::Sampler,
+    sampler_cfg: SamplerConfig,
+}
+impl_ptr_wrapper!(Sampler -> SamplerInner);
+struct Sampler(Arc<SamplerInner>);
+impl Drop for SamplerInner {
+    fn drop(&mut self) {
+        unsafe { self.dev.dev.destroy_sampler(self.sampler, None) };
+        info!("destroyed sampler");
+    }
+}
+impl Sampler {
+    fn create_sampler() -> Result<vk::Sampler> {
+
+    }
+    fn new(dev: &Device, sampler_cfg: SamplerConfig) -> Result<Sampler> {
+        let dev = dev.clone();
+        
+        Ok()
     }
 }
 
@@ -1357,6 +1392,34 @@ impl ShaderEntryPoint {
     }
 }
 
+fn spirq_desc_ty2vk_desc_ty(desc_ty: &spirq::DescriptorType) -> vk::DescriptorType {
+    match desc_ty {
+        DescriptorType::UniformBuffer(..) => {
+            vk::DescriptorType::UNIFORM_BUFFER
+        },
+        DescriptorType::StorageBuffer(..) => {
+            vk::DescriptorType::STORAGE_BUFFER
+        },
+        DescriptorType::Image(_, ty) => {
+            let spirq::Type::Image(img_ty) = ty;
+            if let spirq::ImageType::Sampled = img_ty.unit_fmt {
+                vk::DescriptorType::SAMPLED_IMAGE
+            } else {
+                vk::DescriptorType::STORAGE_IMAGE
+            }
+        },
+        DescriptorType::Sampler(..) => {
+            vk::DescriptorType::SAMPLER
+        }
+        DescriptorType::SampledImage(..) => {
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+        }
+        DescriptorType::InputAttachment(..) => {
+            vk::DescriptorType::INPUT_ATTACHMENT
+        },
+    }
+}
+
 pub struct ShaderArrayInner {
     entry_points: Vec<ShaderEntryPoint>,
     manifest: Manifest,
@@ -1399,26 +1462,7 @@ impl ShaderArray {
             let (set, bind) = desc.desc_bind.into_inner();
             // Process actual descriptor bindings.
             let nbind = desc.desc_ty.nbind();
-            let desc_ty = match desc.desc_ty {
-                DescriptorType::UniformBuffer(..) => {
-                    vk::DescriptorType::UNIFORM_BUFFER
-                },
-                DescriptorType::StorageBuffer(..) => {
-                    vk::DescriptorType::STORAGE_BUFFER
-                },
-                DescriptorType::Image(..) => {
-                    vk::DescriptorType::SAMPLED_IMAGE
-                },
-                DescriptorType::Sampler(..) => {
-                    vk::DescriptorType::SAMPLER
-                }
-                DescriptorType::SampledImage(..) => {
-                    vk::DescriptorType::COMBINED_IMAGE_SAMPLER
-                }
-                DescriptorType::InputAttachment(..) => {
-                    vk::DescriptorType::INPUT_ATTACHMENT
-                },
-            };
+            let desc_ty = spirq_desc_ty2vk_desc_ty(&desc.desc_ty);
             let dslb = vk::DescriptorSetLayoutBinding::builder()
                 .binding(bind)
                 .descriptor_type(desc_ty)
@@ -1519,6 +1563,8 @@ pub struct AttachmentReference {
     /// attachment is a depth-stencil attachment.
     pub fmt: vk::Format,
     /// The operation done on loading.
+    ///
+    /// WARNING: Currently CLEAR variant is not supported.
     pub load_op: vk::AttachmentLoadOp,
     /// The operation done on storing.
     pub store_op: vk::AttachmentStoreOp,
@@ -1558,7 +1604,7 @@ pub struct GraphicsColorBlendConfig {
     pub blend_consts: [f32; 4],
 }
 pub struct GraphicsPipeline {
-    pub shader_arr: ShaderArray,
+    pub shader_arr: Arc<ShaderArrayInner>,
     pub attr_map: HashMap<InterfaceLocation, AttributeBinding>,
     pub attm_map: HashMap<InterfaceLocation, AttachmentReference>,
     /// Index of the depth-stencil attachment to be written in the framebuffer.
@@ -1592,7 +1638,7 @@ impl GraphicsPipeline {
                 .ok_or(Error::InvalidOperation)?;
             Some(depth_attm_idx)
         } else { None };
-        let shader_arr = shader_arr.clone();
+        let shader_arr = shader_arr.0.clone();
         let graph_pipe_req = GraphicsPipeline {
             shader_arr, attr_map, attm_map, depth_attm_idx, raster_cfg,
             depth_cfg, blend_cfg
@@ -1660,9 +1706,11 @@ fn is_depth_fmt(fmt: vk::Format) -> bool {
 
 
 struct PipelineInner {
-    dev: Device,
+    dev: Arc<DeviceInner>,
+    shader_arr: Arc<ShaderArrayInner>,
     pipe: vk::Pipeline,
     pipe_layout: vk::PipelineLayout,
+    pipe_bp: vk::PipelineBindPoint,
 }
 impl Drop for PipelineInner {
     fn drop(&mut self) {
@@ -1677,11 +1725,15 @@ struct Pipeline(Arc<PipelineInner>);
 impl Pipeline {
     fn new(
         dev: &Device,
+        shader_arr: Arc<ShaderArrayInner>,
         pipe: vk::Pipeline,
         pipe_layout: vk::PipelineLayout,
+        pipe_bp: vk::PipelineBindPoint,
     ) -> Pipeline {
         let dev = dev.clone();
-        let inner = PipelineInner { dev, pipe, pipe_layout };
+        let inner = PipelineInner {
+            dev, shader_arr, pipe, pipe_layout, pipe_bp
+        };
         Pipeline(Arc::new(inner))
     }
 }
@@ -2155,27 +2207,29 @@ pub enum BindPoint {
 type VariableToken = usize;
 #[derive(Clone)]
 struct TransferEventArgs {
-    src_var_idx: usize,
-    dst_var_idx: usize,
+    src_var_idx: VariableToken,
+    dst_var_idx: VariableToken,
 }
 #[derive(Clone)]
 struct PushConstantEventArgs {
-    push_const_var_idx: usize,
+    push_const_var_idx: VariableToken,
 }
 #[derive(Clone)]
 struct BindEventArgs {
     bp: BindPoint,
-    var_idx: Option<usize>,
+    var_idx: Option<VariableToken>,
 }
 #[derive(Clone)]
 struct DispatchEventArgs {
-    nworkgrp_var_idx: usize,
+    nworkgrp_x_var_idx: VariableToken,
+    nworkgrp_y_var_idx: VariableToken,
+    nworkgrp_z_var_idx: VariableToken,
 }
 #[derive(Clone)]
 struct DrawEventArgs {
     pass: Arc<RenderPassInner>,
-    nvert_var_idx: usize,
-    ninst_var_idx: usize,
+    nvert_var_idx: VariableToken,
+    ninst_var_idx: VariableToken,
 }
 #[derive(Clone)]
 struct PresentEventArgs {
@@ -2220,7 +2274,7 @@ struct Chunk {
     ///
     /// This dependency is `FlowHead` dependency, not `Chunk` dependency. This
     /// `FlowHead` dependency will be then converted to `Chunk` dependency
-    /// later.
+    /// later, tho.
     deps: Vec<usize>,
     events: Vec<Event>,
     /// The queue interface the chunk has been bound to. It depends on the last
@@ -2405,8 +2459,8 @@ impl FlowGraph {
                         fn_impl(flow_serial, flows, chunks, rng_map);
                     }
                 }
-                // Don't replace the `i` below with `chunks.len()`. Remember
-                // that `chunks` has been modified.
+                // Don't replace the `i` below with `chunks.deps.len()`.
+                // Remember that `chunks` has been modified.
                 let nexdep = chunk.deps.len();
                 let mut deps = if i == 0 {
                     // No internal reference for the first chunk.
@@ -2421,9 +2475,8 @@ impl FlowGraph {
                 // dependency.
                 let exref = chunk.deps.iter()
                     .map(|&flow_serial| {
-                        if let Some(rng) = &rng_map[flow_serial] {
-                            rng.end - 1
-                        } else { unreachable!() }
+                        let Some(rng) = &rng_map[flow_serial];
+                        rng.end - 1
                     });
                 deps.extend(exref);
     
@@ -2474,7 +2527,7 @@ pub struct SymbolSource {
     flows: Vec<Flow>,
     /// Variable tokens are mapped to indices of `syms`.
     syms: Vec<VariableType>,
-    /// Mapping from symbol names to symbol tokens.
+    /// Mapping from symbol names to symbol tokens. One-to-one mapping.
     name_map: HashMap<String, VariableToken>,
 }
 impl SymbolSource {
@@ -2528,6 +2581,7 @@ impl SymbolSource {
 }
 
 pub struct DeviceProcInner {
+    dev: Arc<DeviceInner>,
     graph: FlowGraph,
     sym_map: HashMap<String, VariableType>,
 }
@@ -2536,9 +2590,10 @@ pub struct DeviceProc(Arc<DeviceProcInner>);
 impl DeviceProc {
     // TODO: Pass in dev to ensure all pipelines are constructed on the same
     // device.
-    pub fn new<'a, F>(graph_fn: F) -> DeviceProc
+    pub fn new<'a, F>(dev: &Device, graph_fn: F) -> DeviceProc
         where F: FnOnce(&mut SymbolSource) -> FlowGraph
     {
+        let dev = dev.0.clone();
         let mut sym_src = SymbolSource::new();
         let graph = graph_fn(&mut sym_src);
         let SymbolSource { syms, name_map, .. } = sym_src;
@@ -2546,58 +2601,815 @@ impl DeviceProc {
             .map(|(name, token)| (name, syms[token]))
             .collect::<HashMap<_, _>>();
 
-        let inner = DeviceProcInner { graph, sym_map };
+        let inner = DeviceProcInner { dev, graph, sym_map };
         DeviceProc(Arc::new(inner))
     }
 }
-/*
+
+#[derive(Clone)]
+pub enum Variable<'a> {
+    HostMemory(&'a [u8]),
+    Buffer(Buffer),
+    Image(Image),
+    Sampler(Sampler),
+    SampledImage(Image, Sampler),
+    Count(u32),
+}
+impl<'a> Variable<'a> {
+    pub fn ty(&self) -> VariableType {
+        match self {
+            Variable::HostMemory(_) => VariableType::HostMemory,
+            Variable::Buffer(_) => VariableType::Buffer,
+            Variable::Image(_) => VariableType::Image,
+            Variable::Sampler(_) => VariableType::Sampler,
+            Variable::SampledImage(_, _) => VariableType::SampledImage,
+            Variable::Count(_) => VariableType::Count,
+        }
+    }
+    pub fn is_instance_of(&self, ty: VariableType) -> bool {
+        self.ty == ty
+    }
+    pub fn to_host_mem(&self) -> Option<&'a [u8]> {
+        if let Variable::HostMemory(x) = self { Some(x) } else { None }
+    }
+    pub fn to_buf(&self) -> Option<Buffer> {
+        if let Variable::Buffer(x) = self { Some(x) } else { None }
+    }
+    pub fn to_img(&self) -> Option<Image> {
+        if let Variable::Image(x) = self { Some(x) } else { None }
+    }
+    pub fn to_sampler(&self) -> Option<Sampler> {
+        if let Variable::Sampler(x) = self { Some(x) } else { None }
+    }
+    pub fn to_sampled_img(&self) -> Option<(Image, Sampler)> {
+        if let Variable::SampledImage(x, y) = self {
+            Some(Image, Sampler)
+        } else { None }
+    }
+    pub fn to_count(&self) -> Option<u32> {
+        if let Variable::Count(x) = self { Some(x) } else { None }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RwState {
+    Write, Read
+}
+impl Default for RwState {
+    fn default() -> RwState {
+        RwState::Write
+    }
+}
+struct VariableState<'a> {
+    var: Variable<'a>,
+    stage: vk::PipelineStageFlags,
+    access: vk::AccessFlags,
+    qfam_idx: u32,
+    rw: RwState,
+}
+
+struct Recorder<'a> {
+    dev: &'a DeviceInner,
+    cmdbuf: vk::CommandBuffer,
+    state_dict: &'a HashMap<VariableToken, VariableState<'a>>,
+    desc_pools: Vec<vk::DescriptorPool>,
+
+    push_const: Option<&'a [u8]>,
+    // set -> bind -> var
+    desc_binds: HashMap<u32, HashMap<u32, Variable>>,
+    // attr -> var
+    vert_bufs: HashMap<u32, Buffer>,
+    idx_buf: Option<Buffer>,
+    // attm ->var
+    color_attm: HashMap<u32, Image>,
+    depth_attm: Option<Image>,
+}
+impl<'a> Recorder<'a> {
+    fn new(
+        dev: &'a DeviceInner,
+        cmdbuf: vk::CommandBuffer,
+        state_dict: &'a HashMap<VariableToken, Variable<'a>>
+    ) -> Recorder<'a> {
+        let stage_dict = state_dict.keys()
+            .map(|x| (x, vk::PipelineStageFlags::TOP_OF_PIPE))
+            .collect();
+        Recorder { dev, cmdbuf, state_dict, stage_dict }
+    }
+
+    fn stage_var(
+        &mut self,
+        token: VariableToken,
+        cmdbuf: vk::CommandBuffer,
+        stage: vk::PipelineStageFlags,
+        access: vk::AccessFlags,
+        qfam_idx: u32,
+        rw: RwState,
+    ) -> Variable {
+        fn make_buf_bar<'a>(
+            buf: &BufferInner,
+            state: &VariableState<'a>,
+            access: vk::AccessFlags,
+            qfam_idx: u32,
+        ) -> vk::BufferMemoryBarrier {
+            vk::BufferMemoryBarrier::builder()
+                .src_access_mask(state.access)
+                .dst_access_mask(access)
+                .src_queue_family_index(state.qfam_idx)
+                .dst_queue_family_index(qfam_idx)
+                .buffer(buf.buf)
+                .offset(0)
+                .size(buf.cfg.size)
+                .build()
+        }
+        fn make_img_bar<'a>(
+            img: &ImageInner,
+            state: &VariableState<'a>,
+            access: vk::AccessFlags,
+            qfam_idx: u32,
+        ) -> vk::ImageMemoryBarrier {
+            let subrsc_rng = vk::ImageSubresourceRange {
+                aspect_mask: img.aspect,
+                base_mip_level: 0,
+                level_count: img.cfg.nmip,
+                base_array_layer: 0,
+                layer_count: img.cfg.nlayer,
+            };
+            vk::ImageMemoryBarrier::builder()
+                .src_access_mask(state.access)
+                .dst_access_mask(access)
+                .old_layout(img.layout)
+                // TODO: (penguinliong) Adapt to different accesses, or, should
+                // we?
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(state.qfam_idx)
+                .dst_queue_family_index(qfam_idx)
+                .image(img.img)
+                .subresource_range(subrsc_rng)
+                .build()
+        }
+        let state = &self.state_dict[token];
+        // Don't barrier if the previous and the next RW state are both `Read`.
+        if rw == RwState::Write | self.rw == RwState::Write {
+            let (buf_bar, img_bar) = match state.var {
+                Variable::Buffer(buf) => {
+                    ([make_buf_bar(&buf.0, state, access, qfam_idx)], [])
+                },
+                Variable::Image(img) => {
+                    ([], [make_img_bar(&img.0, state, access, qfam_idx)])
+                },
+                Variable::SampledImage(img, _) => {
+                    ([], [make_img_bar(&img.0, state, access, qfam_idx)])
+                },
+                _ => ([], []),
+            };
+            self.dev.cmd_pipeline_barrier(
+                cmdbuf,
+                state.stage,
+                stage,
+                state.access,
+                access,
+                &[],
+                &buf_bar,
+                &img_bar,
+            );
+        }
+        state.stage = stage;
+        state.access = access;
+        state.qfam_idx = qfam_idx;
+        state.rw = rw;
+    }
+
+    fn bind_var(&mut self, bp: BindPoint, var: Variable) {
+        match {
+            BindPoint::Descriptor(set, bind) => {
+                self.desc_binds.entry(set).or_default()[bind] = var;
+            },
+            BindPoint::VertexInput(i) => {
+                self.vert_bufs[i] = var;
+            },
+            BindPoint::Index => {
+                self.idx_buf = var;
+            },
+            BindPoint::ColorAttachment(i) => {
+                self.color_attm[i] = var;
+            },
+            BindPoint::DepthAttachment => {
+                self.depth_attm = var;
+            },
+        }
+    }
+    fn unbind_var(&self, bp: BindPoint) {
+        match {
+            BindPoint::Descriptor(set, bind) => {
+                self.desc_binds.entry(set).or_default().remove(bind);
+            },
+            BindPoint::VertexInput(i) => {
+                self.vert_bufs.remove(i);
+            },
+            BindPoint::Index => {
+                self.idx_buf = None;
+            },
+            BindPoint::ColorAttachment(i) => {
+                self.color_attm.remove(i);
+            },
+            BindPoint::DepthAttachment => {
+                self.depth_attm = None;
+            },
+        }
+    }
+
+    #[inline]
+    fn bind_pipe(&self, pipe: &PipelineInner) {
+        unsafe {
+            self.dev.dev.cmd_bind_pipeline(self.cmdbuf, pipe.pipe_bp, pipe.pipe);
+        }
+    }
+    fn flush_push_consts(&mut self, pipe: &PipelineInner) {
+        if let Some(push_const) = self.push_const {
+            unsafe {
+                self.dev.dev.cmd_push_constants(
+                    self.cmdbuf,
+                    pipe.pipe_layout,
+                    vk::ShaderStageFlags::ALL,
+                    offset,
+                    push_const,
+                );
+            }
+        }
+    }
+    #[inline]
+    fn clear_push_consts(&mut self) {
+        self.push_const = None;
+    }
+    fn flush_desc_binds(&mut self, pipe: &PipelineInner) {
+        let shader_arr = &*pipe.shader_arr;
+        let desc_pool = {
+            let create_info = vk::DescriptorPoolCreateInfo::builder()
+                .max_sets(shader_arr.desc_set_layouts.len())
+                .pool_sizes(shader_arr.desc_pool_sizes)
+                .build();
+            unsafe {
+                self.dev.dev.create_desctiptor_pool(&create_info, None)?
+            }
+        };
+        // TODO: (penguinliong) Remember to destroy this; and allocated desc
+        // sets will be freed on destroy.
+        self.desc_pools.push(desc_pool);
+        // Bind descriptor sets.
+        for set, bind_var in self.desc_binds.iter() {
+            let desc_set = unsafe {
+                let alloc_info = vk::DescriptorSetAllocateInfo::builder()
+                    .descriptor_pool(desc_pool)
+                    .set_layout(shader_arr.desc_set_layouts[set])
+                    .build();
+                self.dev.dev.allocate_descriptor_set(&alloc_info)?
+            };
+            // DO NOT TRIGGER ANY REALLOC OR THERE WILL BE DANGLING POINTERS!!
+            let n = bind_var.len();
+            let buf_infos = Vec::with_capacity(n);
+            let img_infos = Vec::with_capacity(n);
+            let write_desc_sets = Vec::with_capacity(n);
+            for bind, var in bind_var {
+                let write_desc_set = {
+                    let write_base = |ty| {
+                        vk::WriteDescriptorSet::builder()
+                            .dst_set(set)
+                            .dst_binding(bind)
+                            .dst_array_element(0)
+                            .descriptor_type(ty)
+                    };
+                    let write_buf = |ty, buf| {
+                        let buf_info = vk::DescriptorBufferInfo {
+                            buffer: buf.buf,
+                            offset: 0,
+                            range: vk::WHOLE_SIZE,
+                        };
+                        let i = buf_infos.len();
+                        buf_infos.push(buf_info);
+                        write_base(ty)
+                            .buffer_info(&buf_infos[i:i + 1])
+                    };
+                    let write_img = |ty, img, sampler| {
+                        let sampler = sampler
+                            .map(|x| x.sampler)
+                            .unwrap_or(vk::Sampler::null());
+                        let image_view, image_layout = img
+                            .map(|x| (x.img_view, x.layout))
+                            .unwrap_or((
+                                vk::ImageView::null(),
+                                vk::ImageLayout::UNDEFINED,
+                            ));
+                        let img_info = vk::DescriptorImageInfo {
+                            sampler,
+                            image_view,
+                            image_layout,
+                        };
+                        let i = img_infos.len();
+                        img_infos.push(img_info);
+                        write_base(ty)
+                            .image_info(&img_infos[i:i + 1])
+                    };
+
+                    let desc_bind = DescriptorBinding::new(set, bind);
+                    let desc_ty = pipe.shader_arr.manifest.get_desc(desc_bind)
+                        .ok_or(Error::InvalidOperation)?;
+                    let desc_ty = spirq_desc_ty2vk_desc_ty(desc_ty);
+                    match desc_ty {
+                        vk::DescriptorType::UNIFORM_BUFFER,
+                        vk::DescriptorType::STORAGE_BUFFER => {
+                            let buf = var.to_buf()
+                                .ok_or(Error::InvalidOperation);
+                            write_buf(desc_ty, &*buf)
+                        },
+                        vk::DescriptorType::SAMPLED_IMAGE,
+                        vk::DescriptorType::STORAGE_IMAGE => {
+                            let img = var.to_img()
+                                .ok_or(Error::InvalidOperation)?;
+                            write_img(desc_ty, Some(&*img), None)
+                        },
+                        vk::DescriptorType::SAMPLER => {
+                            let sampler = var.to_sampler()
+                                .ok_or(Error::InvalidOperation)?;
+                            write_img(desc_ty, None, Some(*sampler))
+                        }
+                        vk::DescriptorType::COMBINED_IMAGE_SAMPLER => {
+                            let (img, sampler) = var.to_sampled_img()
+                                .ok_or(Error::InvalidOperation)?;
+                            write_img(desc_ty, Some(&*img), Some(*sampler))
+                        },
+                        // TODO: (penguinliong) Check out where does input
+                        // attachment go.
+                    }
+                };
+                write_desc_sets.push(write_desc_set);
+            }
+            self.dev.dev.update_descriptor_sets(&write_desc_sets, &[]);
+            unsafe {
+                self.dev.dev.cmd_bind_descriptor_sets(
+                    self.cmdbuf,
+                    pipe.pipe_bp,
+                    pipe.pipe_layout,
+                    set,
+                    &[desc_set],
+                    &([] as [u32]),
+                );
+            }
+            // We can safely discard the descriptor set here, because it will be
+            // freed when the descriptor pool is destroyed which we will do in
+            // `drop()`.
+        }
+    }
+    #[inline]
+    fn clear_desc_bind(&mut self) {
+        self.desc_binds.clear();
+    }
+    fn flush_vert_bufs(&mut self, pipe: &PipelineInner) {
+        for (vert_bind, vert_buf) self.vert_bufs.drain() {
+            unsafe {
+                self.dev.dev.cmd_bind_vertex_buffers(cmdbuf,
+                    vert_bind,
+                    &[vert_buf.buf],
+                    &[0],
+                );
+            }
+        }
+    }
+    #[inline]
+    fn clear_vert_bufs(&mut self) {
+        self.vert_bufs.clear();
+    }
+    fn flush_idx_buf(&mut self, pipe: &PipelineInner) {
+        if let Some(idx_buf) = self.idx_buf.take() {
+            self.dev.dev.cmd_bind_index_buffer(
+                cmdbuf, idx_buf.buf, 0, vk::IndexType::UINT16
+            );
+        }
+    }
+    #[inline]
+    fn clear_idx_buf(&mut self) {
+        self.idx_buf = None;
+    }
+
+    fn record_transfer(&mut self, args: TransferEventArgs) -> Result<()> {
+        fn buf_copy(src: &BufferInner, dst: &BufferInner) -> vk::BufferCopy {
+            vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: src.cfg.size,
+            }
+        }
+        fn img_copy(src: &ImageInner, dst: &ImageInner) -> vk::ImageCopy {
+            let src_subrsc = vk::ImageSubresourceLayers {
+                aspect_mask: src.aspect,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: src.cfg.nlayer,
+            };
+            let dst_subrsc = vk::ImageSubresourceLayers {
+                aspect_mask: dst.aspect,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: dst.cfg.nlayer,
+            };
+            let extent = Extent3D {
+                width: src.cfg.width,
+                height: src.cfg.height,
+                depth: src.cfg.depth,
+            };
+            vk::ImageCopy {
+                src_subresource: src_subrsc,
+                src_offset: Offset3D::default(),
+                dst_subresource: dst_subrsc,
+                dst_offset: Offset3D::default(),
+                extent,
+            }
+        }
+        fn buf_img_copy(
+            buf: &BufferInner,
+            img: &ImageInner
+        ) -> vk::BufferImageCopy {
+            let subrsc = vk::ImageSubresourceLayers {
+                aspect_mask: dst.aspect,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: dst.cfg.nlayer,
+            };
+            let extent = Extent3D {
+                width: dst.cfg.width,
+                height: dst.cfg.height,
+                depth: dst.cfg.depth,
+            };
+            vk::BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length: img.cfg.width,
+                buffer_image_height: img.cfg.height,
+                image_subresource: subrsc,
+                image_offset: Offset3D::default(),
+                image_extent: extent,
+            }
+        }
+        let src_var = self.stage_var(args.src_var_idx);
+        let dst_var = self.stage_var(args.dst_var_idx);
+        match (src_var, dst_var) {
+            (Variable::Buffer(src), Variable::Buffer(dst)) => {
+                unsafe {
+                    dev.cmd_copy_buffer(
+                        self.cmdbuf,
+                        src.buf,
+                        dst.buf,
+                        &[buf_copy(&*src, &*dst)],
+                    );
+                }
+            },
+            (VariableType::Image(src), VariableType::Image(dst)) => {
+                unsafe {
+                    dev.cmd_copy_image(
+                        self.cmdbuf,
+                        src.img,
+                        vk::ImageLayout::GENERAL,
+                        dst.img,
+                        vk::ImageLayout::GENERAL,
+                        &[img_copy(&*src, &*dst)],
+                    );
+                }
+            },
+            (VariableType::Buffer(src), VariableType::Image(dst)) => {
+                unsafe {
+                    dev.cmd_copy_buffer_to_image(
+                        self.cmdbuf,
+                        src.buf,
+                        dst.img,
+                        vk::ImageLayout::GENERAL,
+                        &[buf_img_copy(&*src, &*dst)],
+                    );
+                }
+            },
+            (VariableType::Image(src), VariableType::Buffer(dst)) => {
+                unsafe {
+                    dev.cmd_copy_image_to_buffer(
+                        self.cmdbuf,
+                        src.img,
+                        vk::ImageLayout::GENERAL,
+                        dst.buf,
+                        &[buf_img_copy(&*dst, &*src)],
+                    );
+                }
+            },
+            _ => Err(Error::InvalidOperation),
+        }
+        self.state_dict[args.src_var_idx].stage = vk::PipelineStageFlags::TRANSFER;
+        self.state_dict[args.dst_var_idx].stage = vk::PipelineStageFlags::TRANSFER;
+        Ok(())
+    }
+    fn record_push_const(
+        &mut self,
+        args: PushConstantEventArgs,
+    ) -> Result<()> {
+        let var = self.state_dict[args.push_const_var_idx];
+        if let Variable::HostMemory(host_mem) = var {
+            self.push_const = Some(host_mem);
+        } else {
+            Err(Error::InvalidOperation)
+        }
+    }
+    fn record_bind(
+        &mut self,
+        args: BindEventArgs,
+    ) -> Result<()> {
+        if let Some(var) = self.state_dict[args.var_idx] {
+            self.bind_var(bp, var);
+        } else {
+            self.unbind_var(bp);
+        }
+    }
+    fn record_dispatch(
+        &mut self,
+        args: DispatchEventArgs,
+    ) -> Result<()> {
+        self.flush_push_consts();
+        self.flush_desc_binds();
+
+        unsafe {
+            self.dev.dev.cmd_dispatch(self.cmdbuf,
+                self.state_dict[args.nworkgrp_x_var_idx],
+                self.state_dict[args.nworkgrp_y_var_idx],
+                self.state_dict[args.nworkgrp_z_var_idx],
+            );
+        }
+
+        self.clear_desc_binds();
+        self.clear_push_consts();
+    }
+    fn record_subpass(&mut self, no_idx: bool) -> Result<()> {
+        self.flush_push_consts();
+        self.flush_desc_binds();
+        self.flush_vert_bufs();
+        self.flush_idx_buf();
+
+        if no_idx {
+            self.dev.dev.cmd_draw(nvert, ninst, 0, 0);
+        } else {
+            self.dev.dev.cmd_draw_indexed(nvert, ninst, 0, 0);
+        }
+    }
+    fn record_draw(
+        &mut self,
+        args: DrawEventArgs,
+    ) -> Result<()> {
+        let no_idx = !self.idx_buf.empty();
+
+        let nvert = self.state_dict[args.nvert_var_idx].to_count();
+        let ninst = self.state_dict[args.ninst_var_idx].to_count();
+
+        let mut first = true;
+        for pipe in pass.pipes {
+            if first {
+                let pass = &*args.pass;
+                let begin_info = vk::RenderPassBeginInfo::builder()
+                    .render_pass(pass.pass)
+                    .framebuffer(pass.framebuf)
+                    .render_area(pass.imgs.first().ok_or(Error::InvalidOperation)?)
+                    .build();
+                // TODO: (penguinliong) Support attachment clear values.
+                // TODO: (penguinliong) Use secondary command buffer if possible.
+                unsafe {
+                    self.dev.dev.cmd_begin_render_pass(
+                        cmdbuf, &begin_info, vk::SubpassContent::INLINE
+                    );
+                }
+                first = false;
+            } else {
+                unsafe {
+                    self.dev.dev.cmd_next_subpass(
+                        cmdbuf, vk::SubpassContent::INLINE
+                    );
+                }
+            }
+            self.record_subpass(no_idx);
+        }
+
+        self.clear_idx_buf();
+        self.clear_vert_bufs();
+        self.clear_push_consts();
+        self.clear_desc_bind();
+    }
+    fn record_present<'a>(
+        &mut self,
+        cmdbuf: vk::CommandBuffer,
+        args: PresentEventArgs,
+        state_dict: &HashMap<VariableToken, Variable<'a>>,
+    ) -> Result<()> {
+        self.dev.dev.
+        unsafe {
+            let ext = self.dev.dev.present_detail
+                .unwrap_or(Error::InvalidOperation)?;
+            ext.queue_present(swapchain);///////////////////////////////////////
+        }
+    }
+    fn record_chunk<'a>(
+        &mut self,
+        dev: &vk::Device,
+        chunk: &Chunk,
+        state_dict: &HashMap<VariableToken, Variable<'a>>,
+    ) -> Result<(vk::CommandBuffer, vk::SubmitInfo)> {
+        let Some(qi) = chunk.qi;
+        for event in chunk.events {
+            match event {
+                Event::Transfer(args) => record_transfer(),
+                Event::PushConstant(args) => record_push_const(),
+                Event::Bind(args) => record_bind(),
+                Event::Dispatch(args) => record_dispatch(),
+                Event::Draw(args) => record_draw(),
+                Event::Present(args) => record_present(),
+            }
+        }
+    }
+}
+
+struct TransactionSubmitDetail {
+    queue: vk::Queue,
+    cmdbuf: vk::CommandBuffer,
+    wait_semas: Vec<vk::Semaphore>,
+    signal_sema: Option<vk::Semaphore>,
+}
 pub struct TransactionInner {
-    dev: Arc<DeviceInner>,
-    cmdpool: Vec<vk::CommandPool>,
-    /// Mapping from queue to command pool.
-    queue_map: HashMap<vk>,
-    cmdbufs: Vec<vk::CommandBuffer>,
+    devproc: Arc<DeviceProcInner>,
+    cmdpools: HashMap<vk::Queue, vk::CommandPool>,
+    submit_details: Vec<TransactionSubmitDetail>,
+    fence: vk::Fence,
+}
+impl Drop for TransactionInner {
+    fn drop(&mut self) {
+        let dev = &self.devproc.dev.dev;
+        for cmdpool in self.cmdpools.values() {
+            dev.destroy_command_pool(cmdpool, None);
+        }
+    }
 }
 impl_ptr_wrapper!(Transaction -> TransactionInner);
 pub struct Transaction(Arc<TransactionInner>);
 impl Transaction {
     fn create_cmdpool(
-        dev: &Device,
-        iq: QueueInterface) -> Result<vk::CommandPool>
-    {
-        if let Some(queue) = dev.qmap.get(&iq) {
-            let create_info = vk::CommandPoolCreateInfo::builder()
-                .queue_family_index(queue)
-                .build();
-            let cmdpool = unsafe {
-                dev.0.dev.create_command_pool(create_info, None)?
-            };
-            Ok(cmdpool)
-        } else { Err(Error::InvalidOperation) }
+        dev: &vk::Device,
+        queue: vk::Queue,
+    ) -> Result<vk::CommandPool> {
+        let create_info = vk::CommandPoolCreateInfo::builder()
+            .queue_family_index(queue)
+            .build();
+        let cmdpool = unsafe {
+            dev.0.dev.create_command_pool(&create_info, None)?
+        };
+        Ok(cmdpool)
     }
-    pub fn new(dev: &Device, devproc: &DeviceProc) -> Result<Transaction> {
-        let graph = &devproc.graph;
-        for chunk in graph.chunks.iter() {
-            for event in events.iter() {
-                push_event()
+    fn ensure_cmdpool(
+        dev: &vk::Device,
+        queue: vk::Queue,
+        q_cmdpools: HashMap<vk::Queue, vk::CommandPool>
+    ) -> Result<vk::CommandPool> {
+        std::collections::HashMap::Entry::{Vacant, Occupied};
+        let rv = match q_cmdpools.entry(queue) {
+            Vacant(entry) => {
+                Self::create_cmdpool(dev, queue)
+                    .map(|cmdpool| {
+                        entry.insert(cmdpool);
+                        cmdpool
+                    });
+            },
+            Occupied(entry) => entry.get(),
+        };
+        if rv.is_err() {
+            for cmdpool in cmdpools {
+                // Make sure previously allocated cmdpools are all destroyed.
+                unsafe { dev.destroy_command_pool(cmdpool, None) };
             }
         }
-        let inner = TransactionInner { dev, cmdpool, cmdbufs };
+        rv
+    }
+    fn alloc_cmdbuf(
+        dev: &vk::Device,
+        cmdpool: vk::CommandPool,
+    ) -> Result<vk::CommandBuffer> {
+        let alloc_info = vk::CommandBufferAllocateInfo::builder()
+            .command_pool(cmdpool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1)
+            .build();
+        let cmdbufs = unsafe { dev.allocate_command_buffers(&alloc_info)? };
+        Ok(cmdbufs[0])
+    }
+    fn create_sema(dev: &vk::Device) -> Result<vk::Semaphore> {
+        let create_info = vk::SemaphoreCreateInfo::builder()
+            .build();
+        let sema = unsafe { dev.create_semaphore(&create_info, None)? };
+        Ok(sema)
+    }
+    fn create_fence(dev: &vk::Device) -> Result<vk::Fence> {
+        let create_info = vk::FenceCreateInfo::builder()
+            .build();
+        let fence = unsafe { dev.create_fence(&create_info, None)? };
+        Ok(fence)
+    }
+    pub fn new(devproc: &DeviceProc) -> Result<Transaction> {
+        let devproc = devproc.0.clone();
+        let dev = &devproc.dev.dev;
+        let submit_details = {
+            let mut submit_details = Vec::with_capacity(graph.chunks.len());
+            let graph = &devproc.graph;
+            let ilast = graph.chunks.len() - 1;
+            for i, chunk in graph.chunks.iter().enumerate() {
+                let queue = chunk.qi
+                    .and_then(|qi| dev.qmap.get(&qi))
+                    // Unbound chunks are not allowed. It's also not allowed to do
+                    // anything on a unsupported queue interface.
+                    .ok_or(Error::InvalidOperation)?;
+                // No need to optimize recording using the same command buffer
+                // when consequential chunks use the same queue. If any two
+                // consequential chunks have the same destination queue, while
+                // are not fused in one, it must be forcefully divided by the
+                // user, when they design the flow graph.
+                let cmdpool = cmdpool
+                let cmdbuf = Self::alloc_cmdbuf(dev.dev, cmdpool)?;
+                let wait_semas = graph.rev_dep_map[i].iter()
+                    .map(|i| submit_details[i]);
+                let signal_sema = if i != ilast {
+                    Some(create_sema(dev)?)
+                } else { None };
+                let submit_detail = TransactionSubmitDetail {
+                    queue, cmdbuf, wait_semas, signal_sema
+                };
+                submit_details.push(submit_detail);
+            }
+        };
+        let fence = Self::create_fence(dev.dev)?;
+        let inner = TransactionInner {
+            devproc, cmdpools, submit_details, fence
+        };
         Transaction(Arc::new(inner))
     }
-    pub fn submit(&mut self) {
-        //self.dev.dev.queue_wait_idle();
+    pub fn arm<'a>(mut self, state_dict: &HashMap<String, Variable<'a>>) -> {
+        let dev = &self.devproc.dev;
+        let sym_map = &self.devproc.graph.sym_map;
+        let state_dict = state_dict.iter()
+            .filter_map(|(name, var)| {
+                sym_map.get(name)
+            });
+
+        for i, chunk in devproc.graph.chunks.iter().enumerate() {
+            let submit_detail = self.submit_details[i]
+            let rec = Recorder::new(dev, submit_detail, state_dict);
+            rec.record_chunk(dev, &chunk, state_dict);
+        }
+
     }
 }
-
-*/
-
-
-
-
-
-
-
-
-
+impl_ptr_wrapper!(ArmedTransaction -> TransactionInner);
+pub struct ArmedTransaction<'a>(Arc<TransactionInner>, PhantomData<'a>);
+impl ArmedTransaction {
+    pub fn submit(mut self) -> Result<PendingTransaction> {
+        let transact = self.0;
+        let dev = &transact.devproc.dev.dev;
+        let ilast = transact.submit_details.len() - 1;
+        for i, submit_detail in transact.submit_details.iter().enumerate() {
+            let queue = submit_detail.queue;
+            let signal_sema = if let Some(sema) = submit_detail {
+                [sema]
+            } else { [] };
+            let submit_info = vk::SubmitInfo::builder()
+                .wait_semaphores(&submit_detail.wait_semas)
+                .signal_semaphore(&signal_sema)
+                .command_buffer(submit_detail.cmdbuf)
+                .build();
+            let fence = if i == ilast {
+                transact.fence
+            } else {
+                vk::Fence::null()
+            };
+            unsafe {
+                dev.queue_submit(queue, &[submit_info], fence)?;
+            }
+        }
+        Ok(PendingTransaction(transact))
+    }
+}
+impl_ptr_wrapper!(PendingTransaction -> TransactionInner);
+pub struct PendingTransaction<'a>(Arc<TransactionInner>, PhantomData<'a>);
+impl PendingTransaction {
+    pub fn wait(
+        mut self,
+        timeout: u64,
+    ) -> std::result::Result<Transaction, PendingTransaction> {
+        let transact = self.0;
+        let dev = &transact.devproc.dev.dev;
+        // It doesn't matter whether to wait for all fences tho, but it should
+        // be noticed if we are accepting multiple fences in the future.
+        unsafe { dev.wait_for_fences(&[transact.fence], true, timeout) }
+            .map_err(|_| PendingTransaction(transact))?;
+        // Reset everything. (Also note that semaphores don't need to be reset.)
+        unsafe { dev.reset_fences(transact.fence)? };
+        for cmdpool in transact.cmdpools.values() {
+            unsafe { dev.reset_command_pool(cmdpool, Default::default())? };
+        }
+        Ok(Transaction(transact))
+    }
+}
 

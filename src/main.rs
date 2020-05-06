@@ -135,10 +135,10 @@ fn main() {
 
     let devproc = DeviceProc::new(|mut sym| {
         // TODO: Use macro to make this neat?
-        let indices        = sym.buf("indices");
-        let mesh           = sym.buf("mesh");
-        let sampler        = sym.sampler("sampler");
-        let nvert          = sym.count("nvert");
+        let indices = sym.buf("indices");
+        let mesh    = sym.buf("mesh");
+        let sampler = sym.sampler("sampler");
+        let nvert   = sym.count("nvert");
 
         // NOTE: Order is important.
         let read_pass = sym.flow()
@@ -149,8 +149,12 @@ fn main() {
 
         sym.graph(&read_pass)
     });
-    //let transact = Transaction::new(devproc).unwrap();
-    //transact.submit().unwrap();
+    let transact = Transaction::new(devproc).unwrap()
+    let submitted = transact.arm().unwrap()
+        .submit().unwrap();
+    while let Err(t) = transact.wait() {
+        transact = t;
+    }
 
 
 
