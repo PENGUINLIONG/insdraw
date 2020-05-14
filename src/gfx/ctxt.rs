@@ -449,14 +449,14 @@ impl Device {
         feats: &vk::PhysicalDeviceFeatures,
         qalloc: &QueueAllocation,
     ) -> Result<ash::Device> {
+        let priors = std::iter::repeat(0.5)
+            .take(NQUEUE_INTERFACE)
+            .collect::<Vec<_>>();
         let dqcis = qalloc.qfam_alloced.iter()
             .map(|(&qfam_idx, &nqueue)| {
-                let priors = (0..nqueue).into_iter()
-                    .map(|_| 0.5)
-                    .collect::<Vec<_>>();
                 vk::DeviceQueueCreateInfo::builder()
                     .queue_family_index(qfam_idx)
-                    .queue_priorities(&priors)
+                    .queue_priorities(&priors[..nqueue as usize])
                     .build()
             })
             .collect::<Vec<_>>();
@@ -620,6 +620,7 @@ impl Device {
         Ok(SwapchainImage { img, img_idx })
     }
 }
+const NQUEUE_INTERFACE: usize = 4;
 #[derive(PartialEq, Eq, Debug, Clone, Copy, Hash)]
 enum QueueInterface {
     Graphics,
@@ -1131,6 +1132,8 @@ impl DevicePresentationDetail {
         let qfam_idxs = [present_qfam_idx, graph_qfam_idx];
         let (share_mode, nqfam_idx) = if qfam_idxs[1] == !0 {
             warn!("present is enabled while graphics is not");
+            (vk::SharingMode::EXCLUSIVE, 1)
+        } else if present_qfam_idx == graph_qfam_idx {
             (vk::SharingMode::EXCLUSIVE, 1)
         } else {
             (vk::SharingMode::CONCURRENT, 2)
@@ -1905,9 +1908,6 @@ impl Drop for RenderPassInner {
     fn drop(&mut self) {
         let dev = &self.dev.dev;
         unsafe { dev.destroy_render_pass(self.pass, None); }
-        for pipe in self.pipes.iter() {
-            unsafe { dev.destroy_pipeline(pipe.pipe, None); }
-        }
     }
 }
 impl_ptr_wrapper!(RenderPass -> RenderPassInner);
@@ -2204,12 +2204,12 @@ impl RenderPass {
                         .dst_alpha_blend_factor(blend_cfg.dst_factor)
                         .alpha_blend_op(blend_cfg.blend_op)
                         .color_write_mask(vk::ColorComponentFlags::all())
-                        .build()
+                        .build();
                     (ab, blend_cfg.blend_consts)
                 } else {
-                    vk::PipelineColorBlendAttachmentState::builder()
+                    let ab = vk::PipelineColorBlendAttachmentState::builder()
                         .blend_enable(false)
-                        .build()
+                        .build();
                     (ab, Default::default())
                 }
             };
@@ -2675,7 +2675,8 @@ impl FlowGraph {
                 deps.extend(exref);
     
                 let events = chunk.events.clone();
-                chunks.push(Chunk { deps, events, qi: None });
+                let qi = chunk.qi;
+                chunks.push(Chunk { deps, events, qi });
             }
             let end = chunks.len();
             rng_map[flow_serial] = Some(beg..end);
