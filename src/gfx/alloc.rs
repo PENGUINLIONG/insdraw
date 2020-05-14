@@ -121,7 +121,7 @@ impl BuddyAllocator {
         let unit_idx = addr / self.unit;
         // Order number and reversed order number will be updated with actual
         // values.
-        let mut nbit_addr = unit_idx.trailing_zeros().min(self.max_order);
+        let nbit_addr = unit_idx.trailing_zeros().min(self.max_order);
         let mut rorder = self.max_order - nbit_addr;
 
         // Try getting the actual allocation order number.

@@ -2,19 +2,13 @@ pub mod gfx;
 pub mod math;
 
 use std::collections::HashMap;
-use std::convert::TryFrom;
 use ash::vk;
-use ash::extensions as ashex;
-use spirq::error::{Error as SpirvError, Result as SpirvResult};
 use spirq::{SpirvBinary};
-use spirq::sym::{Sym, Symbol};
 use crate::gfx::{Context, Device, ShaderModule, Buffer, BufferConfig,
     MemoryUsage, VertexHead, FragmentHead, AttributeBinding, DeviceProc,
-    /*Transaction,*/ BindPoint, AttachmentReference, FlowHead, ShaderArray,
+    Transaction, BindPoint, AttachmentReference, ShaderArray,
     GraphicsPipeline, RenderPass, GraphicsRasterizationConfig, Image,
     ImageConfig};
-
-use ash::version::DeviceV1_0;
 
 fn main() {
     use log::{debug, info, warn};
@@ -61,7 +55,7 @@ fn main() {
         size: 12,
         usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
     };
-    let buf = Buffer::new(&dev, &buf_cfg, MemoryUsage::Device).unwrap();
+    let buf = Buffer::new(&dev, buf_cfg, MemoryUsage::Device).unwrap();
 
     struct Head {
         attr_bind: AttributeBinding,
@@ -120,12 +114,12 @@ fn main() {
             nmip: 1,
             usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
         };
-        Image::new(&dev, &cfg, MemoryUsage::Device).unwrap()
+        Image::new(&dev, cfg, MemoryUsage::Device).unwrap()
     };
     let graph_pipe = GraphicsPipeline::new(
         &shader_arr, &head, &head, None, raster_cfg, None, None
     ).unwrap();
-    let pass = RenderPass::new(&dev, &[graph_pipe], &[], &[render_target]).unwrap();
+    let pass = RenderPass::new(&dev, &[graph_pipe], &[], (64, 64)).unwrap();
 
 
 
@@ -133,7 +127,7 @@ fn main() {
 
 
 
-    let devproc = DeviceProc::new(|mut sym| {
+    let devproc = DeviceProc::new(&dev, |sym| {
         // TODO: Use macro to make this neat?
         let indices = sym.buf("indices");
         let mesh    = sym.buf("mesh");
@@ -149,12 +143,12 @@ fn main() {
 
         sym.graph(&read_pass)
     });
-    let transact = Transaction::new(devproc).unwrap()
-    let submitted = transact.arm().unwrap()
-        .submit().unwrap();
-    while let Err(t) = transact.wait() {
-        transact = t;
-    }
+    let transact = Transaction::new(&devproc).unwrap();
+    //let mut submitted = transact.arm().unwrap()
+        //.submit_present(dev.acquire_swapchain_img(100).unwrap()).unwrap();
+    //while let Err(t) = submitted.wait(100) {
+        //submitted = t;
+    //}
 
 
 
@@ -225,7 +219,6 @@ use log::{info, error};
 use std::path::Path;
 
 fn collect_spirv_binaries<P: AsRef<Path>>(path: P) -> HashMap<String, SpirvBinary> {
-    use std::convert::TryInto;
     use std::ffi::OsStr;
     use std::fs::{read_dir, File};
     use std::io::Read;
