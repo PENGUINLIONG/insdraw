@@ -51,11 +51,38 @@ fn main() {
             }
         })
         .collect::<HashMap<_, _>>();
-    let buf_cfg = BufferConfig {
-        size: 12,
-        usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
-    };
-    let buf = Buffer::new(&dev, buf_cfg, MemoryUsage::Device).unwrap();
+
+    let verts: Vec<f32> = vec![
+        -0.5, -0.5,
+        -0.5, 0.5,
+        0.5, -0.5,
+    ];
+    let buf = Buffer::with_data(
+        &dev,
+        &verts,
+        vk::BufferUsageFlags::UNIFORM_BUFFER,
+        MemoryUsage::Push
+    ).unwrap();
+    let mut verts_back: Vec<f32> = std::iter::repeat(0.0)
+        .take(verts.len())
+        .collect();
+    buf.mem_slice().unwrap().copy_to(&mut verts_back);
+
+    return;
+
+
+
+
+
+
+/*
+
+
+
+
+
+
+
 
     struct Head {
         attr_bind: AttributeBinding,
@@ -125,11 +152,15 @@ fn main() {
 
 
 
+    let var_dict = [
+        ("mesh", buf.into())
+    ].into_iter()
+        .collect::<HashMap<_,_>>()
+
 
 
     let devproc = DeviceProc::new(&dev, |sym| {
         // TODO: Use macro to make this neat?
-        let indices = sym.buf("indices");
         let mesh    = sym.buf("mesh");
         let sampler = sym.sampler("sampler");
         let nvert   = sym.count("nvert");
@@ -144,15 +175,15 @@ fn main() {
         sym.graph(&read_pass)
     });
     let transact = Transaction::new(&devproc).unwrap();
-    //let mut submitted = transact.arm().unwrap()
-        //.submit_present(dev.acquire_swapchain_img(100).unwrap()).unwrap();
-    //while let Err(t) = submitted.wait(100) {
-        //submitted = t;
-    //}
+    let mut submitted = transact.arm().unwrap()
+        .submit_present(dev.acquire_swapchain_img(100).unwrap()).unwrap();
+    while let Err(t) = submitted.wait(100) {
+        submitted = t;
+    }
 
 
 
-
+*/
 
 
 /* USAGE CODE

@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
 use std::ffi::{CStr, CString};
 use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex, Weak};
@@ -740,19 +741,19 @@ struct MemoryProperty(vk::MemoryPropertyFlags);
 impl MemoryProperty {
     #[inline]
     fn device_local_bit(&self) -> u32 {
-        self.0.as_raw() & vk::MemoryPropertyFlags::DEVICE_LOCAL.as_raw()
+        (self.0.as_raw() / vk::MemoryPropertyFlags::DEVICE_LOCAL.as_raw()) & 1
     }
     #[inline]
     fn host_cached_bit(&self) -> u32 {
-        self.0.as_raw() & vk::MemoryPropertyFlags::HOST_CACHED.as_raw()
+        (self.0.as_raw() / vk::MemoryPropertyFlags::HOST_CACHED.as_raw()) & 1
     }
     #[inline]
     fn host_visible_bit(&self) -> u32 {
-        self.0.as_raw() & vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw()
+        (self.0.as_raw() / vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw()) & 1
     }
     #[inline]
     fn host_coherent_bit(&self) -> u32 {
-        self.0.as_raw() & vk::MemoryPropertyFlags::HOST_COHERENT.as_raw()
+        (self.0.as_raw() / vk::MemoryPropertyFlags::HOST_COHERENT.as_raw()) & 1
     }
 
     pub fn push_score(&self) -> u32 {
@@ -864,32 +865,34 @@ impl MemorySlice {
             Err(Error::InvalidOperation)
         }
     }
-    pub fn write(&self, src: &[u8]) -> Result<()> {
+    pub fn copy_from<T>(&self, src: &[T]) -> Result<()> {
+        let size = self.size.min(src.len() * std::mem::size_of::<T>());
+        let src = src.as_ptr() as *const u8;
         let dev_mem = self.mem.dev_mem;
         let dev = &self.mem.dev.dev;
         unsafe {
-            let offset = self.offset as u64;
             let dst = dev.map_memory(
                 dev_mem,
-                offset,
+                self.offset as u64,
                 self.size as u64,
                 vk::MemoryMapFlags::empty())? as *mut u8;
-            std::intrinsics::copy(src.as_ptr(), dst, self.size);
+            std::intrinsics::copy(src, dst, self.size);
             dev.unmap_memory(dev_mem);
         }
         Ok(())
     }
-    pub fn read(&self, dst: &mut [u8]) -> Result<()> {
+    pub fn copy_to<T>(&self, dst: &mut [T]) -> Result<()> {
+        let size = self.size.min(dst.len() * std::mem::size_of::<T>());
+        let dst = dst.as_mut_ptr() as *mut u8;
         let dev_mem = self.mem.dev_mem;
         let dev = &self.mem.dev.dev;
         unsafe {
-            let offset = self.offset as u64;
             let src = dev.map_memory(
                 dev_mem,
-                offset,
+                self.offset as u64,
                 self.size as u64,
-                vk::MemoryMapFlags::empty())? as *mut u8;
-            std::intrinsics::copy(src, dst.as_mut_ptr(), self.size);
+                vk::MemoryMapFlags::empty())? as *const u8;
+            std::intrinsics::copy(src, dst, self.size);
             dev.unmap_memory(dev_mem);
         }
         Ok(())
@@ -1053,18 +1056,18 @@ impl DeviceMemoryAllocationDetail {
             })
             .collect::<Vec<_>>();
 
-        mem_tys.sort_by_key(|mem_ty| mem_ty.mem_prop.dev_score());
+        mem_tys.sort_by_key(|mem_ty| Reverse(mem_ty.mem_prop.dev_score()));
         let dev_tys = mem_tys.iter()
             .cloned()
             .collect::<Vec<_>>();
 
-        mem_tys.sort_by_key(|mem_ty| mem_ty.mem_prop.push_score());
+        mem_tys.sort_by_key(|mem_ty| Reverse(mem_ty.mem_prop.push_score()));
         let push_tys = mem_tys.iter()
             .take_while(|mem_ty| mem_ty.mem_prop.host_visible_bit() != 0)
             .cloned()
             .collect::<Vec<_>>();
 
-        mem_tys.sort_by_key(|mem_ty| mem_ty.mem_prop.pull_score());
+        mem_tys.sort_by_key(|mem_ty| Reverse(mem_ty.mem_prop.pull_score()));
         let pull_tys = mem_tys.iter()
             .take_while(|mem_ty| mem_ty.mem_prop.host_visible_bit() != 0)
             .cloned()
@@ -1215,6 +1218,7 @@ impl DeviceComputeDetail {
     }
 }
 
+#[derive(Clone)]
 enum MemoryManagement {
     /// Resource has been managed by us (insdraw). We can access the memory
     /// content directly.
@@ -1225,10 +1229,16 @@ enum MemoryManagement {
     Implicit(Arc<DeviceInner>),
 }
 impl MemoryManagement {
-    pub fn dev(&self) -> &Arc<DeviceInner> {
+    fn dev(&self) -> &Arc<DeviceInner> {
         match &self {
-            MemoryManagement::Explicit(mem) => &mem.mem.dev,
+            MemoryManagement::Explicit(mem_slice) => &mem_slice.mem.dev,
             MemoryManagement::Implicit(dev) => dev,
+        }
+    }
+    pub fn mem_slice(&self) -> Option<&MemorySlice> {
+        match &self {
+            MemoryManagement::Explicit(mem_slice) => Some(mem_slice),
+            _ => None,
         }
     }
 }
@@ -1260,6 +1270,7 @@ impl Buffer {
         info!("created buffer");
         Ok(buf)
     }
+    // Create a new buffer object with allocated memory.
     pub fn new(
         dev: &Device,
         buf_cfg: BufferConfig,
@@ -1271,6 +1282,46 @@ impl Buffer {
         let mem = MemoryManagement::Explicit(mem);
         let inner = BufferInner { buf, mem, cfg: buf_cfg };
         Ok(Buffer(Arc::new(inner)))
+    }
+    // Create a new buffer object with predefined data.
+    pub fn with_data<T>(
+        dev: &Device,
+        data: &[T],
+        buf_usage: vk::BufferUsageFlags,
+        mem_usage: MemoryUsage,
+    ) -> Result<Buffer> {
+        let buf_cfg = BufferConfig {
+            size: data.len() * std::mem::size_of::<T>(),
+            usage: buf_usage,
+        };
+        let buf = Self::new(dev, buf_cfg, mem_usage)?;
+        buf.mem_slice().unwrap().copy_from(data)?;
+        Ok(buf)
+    }
+    // Create an abstract buffer object which the user don't have direct access
+    // to its underlying memory.
+    pub fn new_implicit(
+        dev: &Device,
+        buf_cfg: BufferConfig,
+        buf: vk::Buffer,
+    ) -> Buffer {
+        let mem = MemoryManagement::Implicit(dev.0.clone());
+        let inner = BufferInner { buf, mem, cfg: buf_cfg };
+        Buffer(Arc::new(inner))
+    }
+    // Create another buffer object refering to the same memory section.
+    pub fn new_aliased(buf: &Buffer) -> Result<Buffer> {
+        let cfg = buf.0.cfg.clone();
+        let inner = BufferInner {
+            buf: Self::create_buf(&**buf.mem.dev(), &cfg)?,
+            mem: buf.mem.clone(),
+            cfg: cfg,
+        };
+        Ok(Buffer(Arc::new(inner)))
+    }
+    // Get the undelying memory of the buffer if it's accessible.
+    pub fn mem_slice(&self) -> Option<&MemorySlice> {
+        self.mem.mem_slice()
     }
 }
 impl Drop for BufferInner {
@@ -1313,7 +1364,7 @@ pub struct Image(Arc<ImageInner>);
 impl Image {
     fn create_img(
         dev: &DeviceInner,
-        img_cfg: &ImageConfig
+        img_cfg: &ImageConfig,
     ) -> Result<vk::Image> {
         if img_cfg.usage.as_raw() == 0 { return Err(Error::InvalidOperation) }
         let flags = match img_cfg.view_ty {
@@ -2843,9 +2894,42 @@ impl<'a> Variable<'a> {
             Some((x, y))
         } else { None }
     }
-
     pub fn to_count(&self) -> Option<u32> {
         if let Variable::Count(x) = self { Some(*x) } else { None }
+    }
+}
+impl<'a, T: Sized> From<&'a [T]> for Variable<'a> {
+    fn from(x: &'a [T]) -> Self {
+        let ptr = x.as_ptr() as *const u8;
+        let len = x.len() * std::mem::size_of::<T>();
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+        Variable::HostMemory(slice)
+    }
+}
+impl<'a> From<Buffer> for Variable<'a> {
+    fn from(x: Buffer) -> Self {
+        Variable::Buffer(x)
+    }
+}
+impl<'a> From<Image> for Variable<'a> {
+    fn from(x: Image) -> Self {
+        Variable::Image(x)
+    }
+}
+impl<'a> From<Sampler> for Variable<'a> {
+    fn from(x: Sampler) -> Self {
+        Variable::Sampler(x)
+    }
+}
+impl<'a> From<(Image, Sampler)> for Variable<'a> {
+    fn from(x: (Image, Sampler)) -> Self {
+        let (img, sampler) = x;
+        Variable::SampledImage(img, sampler)
+    }
+}
+impl<'a> From<u32> for Variable<'a> {
+    fn from(x: u32) -> Self {
+        Variable::Count(x)
     }
 }
 
