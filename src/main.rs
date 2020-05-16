@@ -52,38 +52,6 @@ fn main() {
         })
         .collect::<HashMap<_, _>>();
 
-    let verts: Vec<f32> = vec![
-        -0.5, -0.5,
-        -0.5, 0.5,
-        0.5, -0.5,
-    ];
-    let buf = Buffer::with_data(
-        &dev,
-        &verts,
-        vk::BufferUsageFlags::UNIFORM_BUFFER,
-        MemoryUsage::Push
-    ).unwrap();
-    let mut verts_back: Vec<f32> = std::iter::repeat(0.0)
-        .take(verts.len())
-        .collect();
-    buf.mem_slice().unwrap().copy_to(&mut verts_back);
-
-    return;
-
-
-
-
-
-
-/*
-
-
-
-
-
-
-
-
     struct Head {
         attr_bind: AttributeBinding,
         attm_ref: AttachmentReference,
@@ -130,6 +98,7 @@ fn main() {
         wireframe: false,
         cull_mode: vk::CullModeFlags::NONE,
     };
+    /*
     let render_target = {
         let cfg = ImageConfig {
             fmt: vk::Format::R8_UNORM,
@@ -143,47 +112,68 @@ fn main() {
         };
         Image::new(&dev, cfg, MemoryUsage::Device).unwrap()
     };
+    */
     let graph_pipe = GraphicsPipeline::new(
         &shader_arr, &head, &head, None, raster_cfg, None, None
     ).unwrap();
     let pass = RenderPass::new(&dev, &[graph_pipe], &[], (64, 64)).unwrap();
 
 
-
-
-
-    let var_dict = [
-        ("mesh", buf.into())
-    ].into_iter()
-        .collect::<HashMap<_,_>>()
-
-
-
     let devproc = DeviceProc::new(&dev, |sym| {
         // TODO: Use macro to make this neat?
-        let mesh    = sym.buf("mesh");
-        let sampler = sym.sampler("sampler");
-        let nvert   = sym.count("nvert");
+        let mesh   = sym.buf("mesh");
+        let nvert  = sym.count("nvert");
+        let target = sym.img("target");
 
         // NOTE: Order is important.
         let read_pass = sym.flow()
-            .bind(BindPoint::Index, Some(indices))
             .bind(BindPoint::VertexInput(0), Some(mesh))
+            .bind(BindPoint::Attachment(0), Some(target))
             .draw(&pass, nvert, 1)
             .pause();
 
         sym.graph(&read_pass)
     });
-    let transact = Transaction::new(&devproc).unwrap();
-    let mut submitted = transact.arm().unwrap()
-        .submit_present(dev.acquire_swapchain_img(100).unwrap()).unwrap();
-    while let Err(t) = submitted.wait(100) {
-        submitted = t;
-    }
 
 
+    let mesh = {
+        let verts: Vec<f32> = vec![
+            -0.5, -0.5,
+            -0.5, 0.5,
+            0.5, -0.5,
+        ];
+        Buffer::with_data(
+            &dev,
+            &verts,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            MemoryUsage::Push,
+        ).unwrap()
+    };
+    let swapchain_img = dev.acquire_swapchain_img()
+        .unwrap();
 
-*/
+    let var_dict = [
+        ("mesh", mesh.into()),
+        ("nvert", 3.into()),
+        ("target", swapchain_img.img().into()),
+    ].into_iter()
+        .cloned()
+        .collect::<HashMap<_,_>>();
+    
+    while swapchain_img.wait(100).is_err() { }
+
+    let mut submitted = Transaction::new(&devproc)
+        .unwrap()
+        .arm(&var_dict)
+        .unwrap()
+        .submit()
+        .unwrap();
+    while submitted.wait(100).is_err() { }
+    let transact = submitted.reset().unwrap();
+
+    swapchain_img.present().unwrap();
+
+
 
 
 /* USAGE CODE

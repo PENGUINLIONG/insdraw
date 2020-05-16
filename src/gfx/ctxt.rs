@@ -1,6 +1,8 @@
+use std::borrow::Borrow;
+use std::hash::Hash;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::cmp::Reverse;
+use std::cmp::{Eq, Reverse};
 use std::ffi::{CStr, CString};
 use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex, Weak};
@@ -427,7 +429,6 @@ impl PhysicalDeviceSurfaceDetail {
     }
 }
 
-
 struct DeviceQueueDetail {
     qloc: QueueLocation,
     queue: vk::Queue,
@@ -519,9 +520,8 @@ impl Device {
         };
         let present_detail = {
             if qmap.contains_key(&QueueInterface::Present) {
-                Some(
-                    DevicePresentationDetail::new(physdev, &cap_detail, &qmap)?
-                )
+                Some(DevicePresentationDetail::new(physdev, &dev, &cap_detail,
+                    &qmap)?)
             } else {
                 None
             }
@@ -555,8 +555,8 @@ impl Device {
             .ok_or(Error::UnsupportedPlatform)?;
         if size > PagedMemoryAllocator::PAGE_SIZE {
             // Dedicated allocation.
-            let mem = Arc::new(Memory::new(dev.clone(), mem_ty, size, None)?);
-            Ok(MemorySlice::new(&mem, 0, size))
+            let mem = Memory::new(dev.clone(), mem_ty, size, None)?;
+            Ok(MemorySlice::new(mem.0, 0, size))
         } else {
             // Paged allocation.
             let weak_dev = Arc::downgrade(&dev);
@@ -597,12 +597,9 @@ impl Device {
             })
     }
 
-    pub fn acquire_swapchain_img(
-        &self,
-        timeout: u64,
-    ) -> Result<SwapchainImage> {
+    pub fn acquire_swapchain_img(&self) -> Result<SwapchainImage> {
+        let dev = &self.0;
         let (present_detail, khr_swapchain) = {
-            let dev = &*self.0;
             (
                 dev.present_detail.as_ref()
                     .ok_or(Error::InvalidOperation)?,
@@ -611,14 +608,18 @@ impl Device {
             )
         };
 
+        let fence = Fence::new(dev.clone())?;
         let (img_idx, _is_suboptimal) = unsafe {
-            khr_swapchain.acquire_next_image(present_detail.swapchain, timeout,
-                vk::Semaphore::null(), vk::Fence::null())?
+            khr_swapchain.acquire_next_image(present_detail.swapchain, 0,
+                vk::Semaphore::null(), fence.fence)?
         };
-        let img = present_detail.imgs[img_idx as usize];
-        let img_cfg = present_detail.img_cfg.clone();
-        let img = Image::new_implicit(self, img_cfg, img)?;
-        Ok(SwapchainImage { img, img_idx })
+        let img = Image::new_implicit(
+            dev.clone(),
+            present_detail.img_cfg.clone(),
+            present_detail.imgs[img_idx as usize],
+        )?;
+        let swapchain_img = SwapchainImage { img, idx: img_idx, fence };
+        Ok(swapchain_img)
     }
 }
 const NQUEUE_INTERFACE: usize = 4;
@@ -712,6 +713,36 @@ impl QueueAllocation {
             }
         }
         QueueAllocation { qloc_assign, qfam_alloced }
+    }
+}
+
+struct Fence {
+    dev: Arc<DeviceInner>,
+    fence: vk::Fence,
+}
+impl Fence {
+    pub fn new(dev: Arc<DeviceInner>) -> Result<Fence> {
+        let create_info = vk::FenceCreateInfo::builder()
+            .build();
+        let fence = unsafe { dev.dev.create_fence(&create_info, None)? };
+        Ok(Fence { dev, fence })
+    }
+    pub fn wait(&self, timeout: u64) -> std::result::Result<(), ()> {
+        // It doesn't matter whether to wait for all fences tho, but it should
+        // be noticed if we are accepting multiple fences in the future.
+        let res = unsafe {
+            self.dev.dev.wait_for_fences(&[self.fence], true, timeout)
+        };
+        match res {
+            Err(vk::Result::TIMEOUT) => Err(()),
+            Ok(_) => Ok(()),
+            Err(_) => unreachable!(),
+        }
+    }
+}
+impl Drop for Fence {
+    fn drop(&mut self) {
+        unsafe { self.dev.dev.destroy_fence(self.fence, None); }
     }
 }
 
@@ -827,7 +858,7 @@ impl Drop for MemoryInner {
 /// A section of memory in a large allocation.
 #[derive(Clone)]
 pub struct MemorySlice {
-    mem: Memory,
+    mem: Arc<MemoryInner>,
     /// Offset of the suballocation in the owner memory page. `page_offset` is
     /// always less than any current offset of the slice; and `offset + size` is
     /// always within the bound of the allocated range. E.g.
@@ -843,24 +874,23 @@ pub struct MemorySlice {
 impl MemorySlice {
     /// Create a new memory slice and refer to the `offset` if `mem` is paged.
     /// This should be used internally only.
-    fn new(mem: &Memory, offset: usize, size: usize) -> MemorySlice {
+    fn new(mem: Arc<MemoryInner>, offset: usize, size: usize) -> MemorySlice {
         if let Some(malloc) = mem.malloc.as_ref() {
             // Increase the reference count at the referred intra-page location
             // immediately.
             malloc.lock().unwrap().refer(offset);
         }
-        let mem = mem.clone();
         MemorySlice { mem, page_offset: offset, offset, size }
     }
     pub fn slice(&self, offset: usize, size: usize) -> Result<MemorySlice> {
         if offset + size <= self.size {
-            let mem = MemorySlice {
+            let mem_slice = MemorySlice {
                 mem: self.mem.clone(),
                 page_offset: self.page_offset,
                 offset: self.offset + offset,
-                size: size,
+                size
             };
-            Ok(mem)
+            Ok(mem_slice)
         } else {
             Err(Error::InvalidOperation)
         }
@@ -932,12 +962,12 @@ impl PagedMemoryAllocator {
         size: usize,
         align: usize,
     ) -> Option<MemorySlice> {
-        let cur_page = &mut self.pages[i];
+        let cur_page = &self.pages[i];
         let addr = {
             cur_page.malloc.as_ref().unwrap().lock().unwrap()
                 .alloc(size, align)
         };
-        addr.map(|offset| MemorySlice::new(&cur_page, offset, size))
+        addr.map(|offset| MemorySlice::new(cur_page.0.clone(), offset, size))
     }
     /// Allocate on a newly created page, added at the end of the page list.
     /// This method doesn't take alignment because the suballocation will
@@ -1170,6 +1200,7 @@ impl DevicePresentationDetail {
     }
     pub fn new(
         physdev: &PhysicalDevice,
+        dev: &ash::Device,
         cap_detail: &DeviceCapabilityDetail,
         qmap: &HashMap<QueueInterface, DeviceQueueDetail>,
     ) -> Result<DevicePresentationDetail> {
@@ -1189,11 +1220,6 @@ impl DevicePresentationDetail {
             .unwrap();
         unsafe { khr_swapchain.destroy_swapchain(self.swapchain, None) };
     }
-}
-
-pub struct SwapchainImage {
-    pub img: Image,
-    pub img_idx: u32,
 }
 
 
@@ -1300,28 +1326,24 @@ impl Buffer {
     }
     // Create an abstract buffer object which the user don't have direct access
     // to its underlying memory.
-    pub fn new_implicit(
-        dev: &Device,
+    fn new_implicit(
+        dev: Arc<DeviceInner>,
         buf_cfg: BufferConfig,
         buf: vk::Buffer,
     ) -> Buffer {
-        let mem = MemoryManagement::Implicit(dev.0.clone());
+        let mem = MemoryManagement::Implicit(dev);
         let inner = BufferInner { buf, mem, cfg: buf_cfg };
         Buffer(Arc::new(inner))
     }
-    // Create another buffer object refering to the same memory section.
-    pub fn new_aliased(buf: &Buffer) -> Result<Buffer> {
-        let cfg = buf.0.cfg.clone();
-        let inner = BufferInner {
-            buf: Self::create_buf(&**buf.mem.dev(), &cfg)?,
-            mem: buf.mem.clone(),
-            cfg: cfg,
-        };
-        Ok(Buffer(Arc::new(inner)))
-    }
-    // Get the undelying memory of the buffer if it's accessible.
+    // Get the undelying memory of the buffer if it's accessible and is visible
+    // from the host.
     pub fn mem_slice(&self) -> Option<&MemorySlice> {
         self.mem.mem_slice()
+            .and_then(|mem_slice| {
+                if mem_slice.mem.mem_prop.host_visible_bit() != 0 {
+                    Some(mem_slice)
+                } else { None }
+            })
     }
 }
 impl Drop for BufferInner {
@@ -1444,11 +1466,10 @@ impl Image {
         Ok(Image(Arc::new(inner)))
     }
     fn new_implicit(
-        dev: &Device,
+        dev: Arc<DeviceInner>,
         img_cfg: ImageConfig,
         img: vk::Image,
     ) -> Result<Image> {
-        let dev = dev.0.clone();
         let aspect = fmt2aspect(img_cfg.fmt)?;
         let img_view = Self::create_img_view(&dev.dev, &img_cfg, aspect, img)?;
         let layout = Cell::new(vk::ImageLayout::UNDEFINED);
@@ -2264,7 +2285,7 @@ impl RenderPass {
                     (ab, Default::default())
                 }
             };
-            let mut attm_blends = std::iter::repeat(attm_blend)
+            let attm_blends = std::iter::repeat(attm_blend)
                 .take(graph_pipe.attm_map.len())
                 .collect::<Vec<_>>();
 
@@ -2619,7 +2640,7 @@ impl Flow {
     /// not host visible. Due to pixel packing, images are always transfered via
     /// a staging buffer.
     ///
-    /// NOTE: `src` and `dst` MUST be `HostMemory`, `Buffer` or `Image`.
+    /// NOTE: `src` and `dst` MUST be `Buffer` or `Image`.
     pub fn transfer(&mut self, src: VariableToken, dst: VariableToken) -> &mut Self {
         let event = Event::Transfer(TransferEventArgs {
             src_var_idx: src,
@@ -2849,7 +2870,9 @@ impl DeviceProc {
             .map(|token| (*token, syms[*token]))
             .collect::<HashMap<_, _>>();
 
-        let inner = DeviceProcInner { dev, graph, name_map, ty_map };
+        let inner = DeviceProcInner {
+            dev, graph, name_map, ty_map,
+        };
         DeviceProc(Arc::new(inner))
     }
 }
@@ -2954,7 +2977,7 @@ impl<'a> VariableState<'a> {
         VariableState {
             var,
             stage: vk::PipelineStageFlags::TOP_OF_PIPE,
-            access: vk::AccessFlags::HOST_WRITE,
+            access: vk::AccessFlags::empty(),
             qfam_idx: !0,
             rw: RwState::Read,
         }
@@ -3044,6 +3067,76 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    
+    fn make_buf_bar(
+        buf: &BufferInner,
+        state: &VariableState<'a>,
+        access: vk::AccessFlags,
+        qfam_idx: u32,
+    ) -> vk::BufferMemoryBarrier {
+        vk::BufferMemoryBarrier::builder()
+            .src_access_mask(state.access)
+            .dst_access_mask(access)
+            .src_queue_family_index(state.qfam_idx)
+            .dst_queue_family_index(qfam_idx)
+            .buffer(buf.buf)
+            .offset(0)
+            .size(buf.cfg.size as u64)
+            .build()
+    }
+    fn make_img_bar(
+        img: &ImageInner,
+        state: &VariableState<'a>,
+        access: vk::AccessFlags,
+        qfam_idx: u32,
+    ) -> vk::ImageMemoryBarrier {
+        let subrsc_rng = vk::ImageSubresourceRange {
+            aspect_mask: img.aspect,
+            base_mip_level: 0,
+            level_count: img.cfg.nmip,
+            base_array_layer: 0,
+            layer_count: img.cfg.nlayer,
+        };
+        let old_layout = img.layout.get();
+        let new_layout = vk::ImageLayout::GENERAL;
+        img.layout.set(new_layout);
+        vk::ImageMemoryBarrier::builder()
+            .src_access_mask(state.access)
+            .dst_access_mask(access)
+            .old_layout(old_layout)
+            // TODO: (penguinliong) Adapt to different accesses, or, should
+            // we?
+            .new_layout(new_layout)
+            .src_queue_family_index(state.qfam_idx)
+            .dst_queue_family_index(qfam_idx)
+            .image(img.img)
+            .subresource_range(subrsc_rng)
+            .build()
+    }
+    #[inline]
+    fn barrier_var(
+        &self,
+        state: &mut VariableState<'a>,
+        token: VariableToken,
+        stage: vk::PipelineStageFlags,
+        access: vk::AccessFlags,
+        qfam_idx: u32,
+        buf_bar: &[vk::BufferMemoryBarrier],
+        img_bar: &[vk::ImageMemoryBarrier],
+        rw: RwState,
+    ) {
+        if (state.qfam_idx != !0) &&
+            (buf_bar.len() != 0 || img_bar.len() != 0) {
+            unsafe {
+                self.dev.dev.cmd_pipeline_barrier(self.cmdbuf, state.stage,
+                    stage, vk::DependencyFlags::empty(), &[], buf_bar, img_bar);
+            }
+        }
+        state.stage = stage;
+        state.access = access;
+        state.qfam_idx = qfam_idx;
+        state.rw = rw;
+    }
     // Get the variable referred by `token` and keep track of the state of the
     // dynamic variable.
     fn stage_var(
@@ -3054,101 +3147,59 @@ impl<'a> Recorder<'a> {
         qfam_idx: u32,
         rw: RwState,
     ) -> &Variable<'a> {
-        fn make_buf_bar<'a>(
-            buf: &BufferInner,
-            state: &VariableState<'a>,
-            access: vk::AccessFlags,
-            qfam_idx: u32,
-        ) -> vk::BufferMemoryBarrier {
-            vk::BufferMemoryBarrier::builder()
-                .src_access_mask(state.access)
-                .dst_access_mask(access)
-                .src_queue_family_index(state.qfam_idx)
-                .dst_queue_family_index(qfam_idx)
-                .buffer(buf.buf)
-                .offset(0)
-                .size(buf.cfg.size as u64)
-                .build()
-        }
-        fn make_img_bar<'a>(
-            img: &ImageInner,
-            state: &VariableState<'a>,
-            access: vk::AccessFlags,
-            qfam_idx: u32,
-        ) -> vk::ImageMemoryBarrier {
-            let subrsc_rng = vk::ImageSubresourceRange {
-                aspect_mask: img.aspect,
-                base_mip_level: 0,
-                level_count: img.cfg.nmip,
-                base_array_layer: 0,
-                layer_count: img.cfg.nlayer,
-            };
-            let old_layout = img.layout.get();
-            let new_layout = vk::ImageLayout::GENERAL;
-            img.layout.set(new_layout);
-            vk::ImageMemoryBarrier::builder()
-                .src_access_mask(state.access)
-                .dst_access_mask(access)
-                .old_layout(old_layout)
-                // TODO: (penguinliong) Adapt to different accesses, or, should
-                // we?
-                .new_layout(new_layout)
-                .src_queue_family_index(state.qfam_idx)
-                .dst_queue_family_index(qfam_idx)
-                .image(img.img)
-                .subresource_range(subrsc_rng)
-                .build()
-        }
         let mut state = self.state_dict[&token].borrow_mut();
         // Don't barrier if the previous and the next RW state are both `Read`.
         if (rw == RwState::Write) | (state.rw == RwState::Write) {
-            let bars = match state.var {
-                Variable::Buffer(buf) => {
-                    (
-                        vec![make_buf_bar(&buf.0, &state, access, qfam_idx)],
-                        vec![],
-                    )
-                },
-                Variable::Image(img) => {
-                    (
-                        vec![],
-                        vec![make_img_bar(&img.0, &state, access, qfam_idx)],
-                    )
-                },
-                Variable::SampledImage(img, _) => {
-                    (
-                        vec![],
-                        vec![make_img_bar(&img.0, &state, access, qfam_idx)],
-                    )
-                },
+            let mut buf_bar = Vec::new();
+            let mut img_bar = Vec::new();
+            match state.var {
+                Variable::Buffer(buf) => buf_bar.push(
+                    Self::make_buf_bar(&buf.0, &state, access, qfam_idx),
+                ),
+                Variable::Image(img) => img_bar.push(
+                    Self::make_img_bar(&img.0, &state, access, qfam_idx),
+                ),
+                Variable::SampledImage(img, _) => img_bar.push(
+                    Self::make_img_bar(&img.0, &state, access, qfam_idx),
+                ),
                 // Don't care readonly types.
-                _ => return &state.var,
-            };
-            let (buf_bar, img_bar) = bars;
-            unsafe {
-                self.dev.dev.cmd_pipeline_barrier(
-                    self.cmdbuf,
-                    state.stage,
-                    stage,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &buf_bar,
-                    &img_bar,
-                );
+                _ => {},
             }
+            self.barrier_var(&mut state, token, stage, access, qfam_idx,
+                &buf_bar, &img_bar, rw);
         }
-        state.stage = stage;
-        state.access = access;
-        state.qfam_idx = qfam_idx;
-        state.rw = rw;
         &state.var
     }
-    fn stage_var_host_const(
-        &mut self,
+    #[inline]
+    fn stage_var_host_const(&mut self, token: VariableToken) -> &Variable<'a> {
+        &self.state_dict[&token].borrow_mut().var
+    }
+    fn stage_attm(
+        &self,
         token: VariableToken,
-    ) -> &Variable<'a> {
-        self.stage_var(token, Default::default(), Default::default(), !0,
-            RwState::Read)
+        qfam_idx: u32,
+    ) -> Result<&Image> {
+        let mut state = self.state_dict[&token].borrow_mut();
+        let img = state.var
+            .to_img()
+            .ok_or(Error::InvalidOperation)?;
+        let (stage, access) = {
+            if !img.aspect.contains(vk::ImageAspectFlags::COLOR) {
+                (
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                )
+            } else {
+                (
+                    vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                )
+            }
+        };
+        let img_bar = [Self::make_img_bar(&img.0, &state, access, qfam_idx)];
+        self.barrier_var(&mut state, token, stage, access, qfam_idx, &[],
+            &img_bar, RwState::Write);
+        Ok(img)
     }
 
     fn bind_var(&mut self, bp: BindPoint, token: VariableToken) {
@@ -3450,16 +3501,7 @@ impl<'a> Recorder<'a> {
         let dev = &self.dev.dev;
         let mut attms = Vec::with_capacity(self.attms.len());
         for token in self.attms.values() {
-            let attm = self.stage_var(
-                    *token,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE |
-                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                    qfam_idx,
-                    RwState::Write,
-                )
-                .to_img()
-                .ok_or(Error::InvalidOperation)?;
+            let attm = self.stage_attm(*token, qfam_idx)?;
             attms.push(attm.img_view);
         }
 
@@ -3728,6 +3770,10 @@ impl<'a> Recorder<'a> {
     ) -> Result<()> {
         self.cmdbuf = cmdbuf;
         let qi = chunk.qi.unwrap();
+        let begin_info = vk::CommandBufferBeginInfo::builder()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+            .build();
+        unsafe { dev.begin_command_buffer(cmdbuf, &begin_info)?; }
         for event in chunk.events.iter() {
             match event {
                 Event::Transfer(args) => self.record_transfer(args)?,
@@ -3737,6 +3783,38 @@ impl<'a> Recorder<'a> {
                 Event::Draw(args) => self.record_draw(args)?,
             }
         }
+        unsafe { dev.end_command_buffer(cmdbuf)?; }
+        Ok(())
+    }
+}
+
+pub struct SwapchainImage {
+    img: Image,
+    idx: u32,
+    fence: Fence,
+}
+impl SwapchainImage {
+    pub fn img(&self) -> Image {
+        self.img.clone()
+    }
+    pub fn wait(&self, timeout: u64) -> std::result::Result<(), ()> {
+        self.fence.wait(timeout)
+    }
+    pub fn present(&self) -> Result<()> {
+        let dev = &*self.img.mem.dev();
+        let present_detail = dev.present_detail.as_ref()
+            .unwrap();
+        let khr_swapchain = dev.cap_detail.dev_exts.khr_swapchain.as_ref()
+            .unwrap();
+
+        let swapchain = [present_detail.swapchain];
+        let idx = [self.idx];
+        let queue = dev.qmap[&QueueInterface::Present].queue;
+        let present_info = vk::PresentInfoKHR::builder()
+            .swapchains(&swapchain)
+            .image_indices(&idx)
+            .build();
+        unsafe { khr_swapchain.queue_present(queue, &present_info)? };
         Ok(())
     }
 }
@@ -3755,7 +3833,6 @@ pub struct TransactionInner {
     desc_pools: Vec<vk::DescriptorPool>,
     framebufs: Vec<vk::Framebuffer>,
     submit_details: Vec<TransactionSubmitDetail>,
-    fence: vk::Fence,
 }
 impl Drop for TransactionInner {
     fn drop(&mut self) {
@@ -3828,12 +3905,6 @@ impl Transaction {
         let sema = unsafe { dev.dev.create_semaphore(&create_info, None)? };
         Ok(sema)
     }
-    fn create_fence(dev: &DeviceInner) -> Result<vk::Fence> {
-        let create_info = vk::FenceCreateInfo::builder()
-            .build();
-        let fence = unsafe { dev.dev.create_fence(&create_info, None)? };
-        Ok(fence)
-    }
     fn create_submit_details(
         dev: &DeviceInner,
         graph: &FlowGraph,
@@ -3881,45 +3952,44 @@ impl Transaction {
         let submit_details = {
             Self::create_submit_details(dev, &devproc.graph, &mut cmdpools)?
         };
-        let fence = Self::create_fence(dev)?;
         let inner = TransactionInner {
-            devproc, cmdpools, desc_pools, framebufs, submit_details, fence
+            devproc, cmdpools, desc_pools, framebufs, submit_details
         };
         Ok(Transaction(Box::new(inner)))
     }
-    pub fn arm<'a>(
+    pub fn arm<S: Hash + Eq + Borrow<str>>(
         self,
-        var_dict: &HashMap<String, Variable<'a>>,
-    ) -> Result<ArmedTransaction<'a>> {
+        var_dict: &HashMap<S, Variable<'_>>,
+    ) -> Result<ArmedTransaction> {
         let mut transact = self.0;
         let devproc = &*transact.devproc;
         let dev = &*devproc.dev;
-        let name_map = &devproc.name_map;
         let mut state_dict = HashMap::new();
-        for (name, token) in name_map.iter() {
+
+        for (name, token) in devproc.name_map.iter() {
             let var = var_dict.get(name)
                 .ok_or(Error::InvalidOperation)?;
             state_dict.insert(*token, RefCell::new(VariableState::new(var)));
         }
 
-        let mut rec = Recorder::new(dev, &state_dict,
-            &mut transact.desc_pools, &mut transact.framebufs);
+        let mut rec = Recorder::new(dev, &mut state_dict, &mut transact.desc_pools,
+            &mut transact.framebufs);
 
         for (i, chunk) in devproc.graph.chunks.iter().enumerate() {
             let submit_detail = &transact.submit_details[i];
             rec.record_chunk(&dev.dev, submit_detail.cmdbuf, &chunk)?;
         }
-        Ok(ArmedTransaction(transact, PhantomData))
+        Ok(ArmedTransaction(transact))
     }
 }
-pub struct ArmedTransaction<'a>(
-    Box<TransactionInner>,
-    PhantomData<&'a Variable<'a>>,
-);
-impl<'a> ArmedTransaction<'a> {
-    fn submit_impl(transact: &TransactionInner) -> Result<()> {
-        let dev = &transact.devproc.dev.dev;
+pub struct ArmedTransaction(Box<TransactionInner>);
+impl ArmedTransaction {
+    /// Submit the command buffers to the Vulkan implementation for execution.
+    pub fn submit(self) -> Result<PendingTransaction> {
+        let transact = self.0;
         let ilast = transact.submit_details.len() - 1;
+        let dev = &transact.devproc.dev;
+        let mut fence = None;
         for (i, submit_detail) in transact.submit_details.iter().enumerate() {
             let queue = submit_detail.queue;
             let signal_sema = [submit_detail.signal_sema];
@@ -3929,97 +3999,29 @@ impl<'a> ArmedTransaction<'a> {
                 .signal_semaphores(&signal_sema)
                 .command_buffers(&cmdbuf)
                 .build();
-            let fence = if i == ilast {
-                transact.fence
-            } else {
-                vk::Fence::null()
+            if i == ilast {
+                fence = Some(Fence::new(dev.clone())?);
             };
-            unsafe { dev.queue_submit(queue, &[submit_info], fence)? };
+            let fence = fence.as_ref()
+                .map(|x| x.fence)
+                .unwrap_or(vk::Fence::null());
+            unsafe { dev.dev.queue_submit(queue, &[submit_info], fence)? };
         }
-        Ok(())
-    }
-    fn present_impl(
-        transact: &TransactionInner,
-        swapchain_img: &SwapchainImage,
-    ) -> Result<()> {
-        let dev = &transact.devproc.dev;
-        let khr_swapchain = &dev.cap_detail.dev_exts.khr_swapchain.as_ref()
-            .ok_or(Error::InvalidOperation)?;
-        let present_detail = dev.present_detail.as_ref()
-            .ok_or(Error::InvalidOperation)?;
-        let wait_sema = {
-            if let Some(submit_detail) = transact.submit_details.last() {
-                [submit_detail.signal_sema]
-            } else {
-                [vk::Semaphore::null()]
-            }
-        };
-        let swapchain = [present_detail.swapchain];
-        let idx = [swapchain_img.img_idx];
-        let queue = dev.qmap[&QueueInterface::Present].queue;
-        let present_info = {
-            let mut x = vk::PresentInfoKHR::builder();
-            if wait_sema[0] == vk::Semaphore::null() {
-                x = x.wait_semaphores(&wait_sema);
-            }
-            x.swapchains(&swapchain)
-                .image_indices(&idx)
-                .build()
-        };
-        unsafe { khr_swapchain.queue_present(queue, &present_info)? };
-        Ok(())
-    }
-    /// Submit the command buffers to the Vulkan implementation for execution.
-    pub fn submit<'b: 'a>(self) -> Result<PendingTransaction<'b>> {
-        let transact = self.0;
-        {
-            let transact = &*transact;
-            Self::submit_impl(transact)?;
-        }
-        Ok(PendingTransaction(transact, PhantomData))
-    }
-    /// Submit the command buffers to the Vulkan implementation for execution
-    /// and present the latest acquired swapchain image.
-    pub fn submit_present<'b: 'a>(
-        self,
-        swapchain_img: &SwapchainImage,
-    ) -> Result<PendingTransaction<'b>> {
-        let transact = self.0;
-        {
-            let transact = &*transact;
-            Self::submit_impl(transact)?;
-            Self::present_impl(transact, swapchain_img)?;
-        }
-        Ok(PendingTransaction(transact, PhantomData))
+        Ok(PendingTransaction(transact, fence.unwrap()))
     }
 }
-pub struct PendingTransaction<'a>(
+pub struct PendingTransaction(
     Box<TransactionInner>,
-    PhantomData<&'a Variable<'a>>,
+    Fence,
 );
-impl<'a> PendingTransaction<'a> {
-    pub fn wait(
-        &self,
-        timeout: u64,
-    ) -> std::result::Result<(), ()> {
-        let transact = &*self.0;
-        let dev = &transact.devproc.dev.dev;
-        // It doesn't matter whether to wait for all fences tho, but it should
-        // be noticed if we are accepting multiple fences in the future.
-        let res = unsafe {
-            dev.wait_for_fences(&[transact.fence], true, timeout)
-        };
-        match res {
-            Err(vk::Result::TIMEOUT) => Err(()),
-            Ok(_) => Ok(()),
-            Err(_) => unreachable!(),
-        }
+impl PendingTransaction {
+    pub fn wait(&mut self, timeout: u64) -> std::result::Result<(), ()> {
+        self.1.wait(timeout)
     }
     pub fn reset(self) -> Result<Transaction> {
         let mut transact = self.0;
         let dev = &transact.devproc.dev.dev;
         // Reset everything. (Also note that semaphores don't need to be reset.)
-        unsafe { dev.reset_fences(&[transact.fence]) }?;
         for cmdpool in transact.cmdpools.values() {
             unsafe { dev.reset_command_pool(*cmdpool, Default::default()) }?;
         }
@@ -4038,3 +4040,14 @@ impl<'a> PendingTransaction<'a> {
 // TODO: (penguinliong): Clean up for all creation failures.
 // TODO: (penguinliong): Defer image layout change to when it's actually
 //       changed, i.e., after the wait.
+
+/*
+pub trait DeviceWaitable {
+    fn sema(&self) -> vk::Semaphore;
+    fn then(self, dev_waitable: DeviceWaitable) -> impl DeviceWaitable;
+}
+pub trait HostWaitable {
+    fn fence(&self) -> vk::Fence;
+    fn then(self, dev_waitable: DeviceWaitable) -> impl HostWaitable;
+    fn wait(&self, timeout: u64) -> std::result::Result<(), ()>;
+*/
