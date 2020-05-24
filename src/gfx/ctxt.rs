@@ -1,7 +1,7 @@
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, BTreeMap};
 use std::cmp::{Eq, Reverse};
 use std::ffi::{CStr, CString};
 use std::mem::MaybeUninit;
@@ -115,6 +115,7 @@ macro_rules! impl_ptr_wrapper {
 
 fn fmt2aspect(fmt: vk::Format) -> Result<vk::ImageAspectFlags> {
     // TODO: Check this format code limit.
+    // 2020-05-17 (penguinliong): WTF is this number?
     if fmt.as_raw() >= 1000156000 {
         return Err(Error::UnsupportedPlatform);
     }
@@ -620,6 +621,11 @@ impl Device {
         )?;
         let swapchain_img = SwapchainImage { img, idx: img_idx, fence };
         Ok(swapchain_img)
+    }
+    pub fn swapchain_img_cfg(&self) -> Result<&ImageConfig> {
+        self.present_detail.as_ref()
+            .map(|x| &x.img_cfg)
+            .ok_or(Error::InvalidOperation)
     }
 }
 const NQUEUE_INTERFACE: usize = 4;
@@ -1380,6 +1386,7 @@ pub struct ImageInner {
     cfg: ImageConfig,
     layout: Cell<vk::ImageLayout>,
     aspect: vk::ImageAspectFlags,
+    is_depth: bool,
 }
 impl_ptr_wrapper!(Image -> ImageInner);
 pub struct Image(Arc<ImageInner>);
@@ -1458,10 +1465,11 @@ impl Image {
         let mem = Device::alloc_img_mem(dev.clone(), img, mem_use)?;
         let mem = MemoryManagement::Explicit(mem);
         let aspect = fmt2aspect(img_cfg.fmt)?;
+        let is_depth = !aspect.contains(vk::ImageAspectFlags::COLOR);
         let img_view = Self::create_img_view(&dev.dev, &img_cfg, aspect, img)?;
         let layout = Cell::new(vk::ImageLayout::UNDEFINED);
         let inner = ImageInner {
-            img, img_view, mem, cfg: img_cfg, layout, aspect,
+            img, img_view, mem, cfg: img_cfg, layout, aspect, is_depth,
         };
         Ok(Image(Arc::new(inner)))
     }
@@ -1471,11 +1479,12 @@ impl Image {
         img: vk::Image,
     ) -> Result<Image> {
         let aspect = fmt2aspect(img_cfg.fmt)?;
+        let is_depth = !aspect.contains(vk::ImageAspectFlags::COLOR);
         let img_view = Self::create_img_view(&dev.dev, &img_cfg, aspect, img)?;
         let layout = Cell::new(vk::ImageLayout::UNDEFINED);
         let mem = MemoryManagement::Implicit(dev);
         let inner = ImageInner {
-            img, img_view, mem, cfg: img_cfg, layout, aspect,
+            img, img_view, mem, cfg: img_cfg, layout, aspect, is_depth,
         };
         Ok(Image(Arc::new(inner)))
     }
@@ -1654,6 +1663,22 @@ impl Drop for ShaderArrayInner {
         }
     }
 }
+impl ShaderArrayInner {
+    fn create_pipe_layout(&self) -> Result<vk::PipelineLayout> {
+        let dev = &self.entry_points.first().unwrap().shader_mod.dev;
+        let desc_set_layouts = self.desc_set_layouts.values()
+            .copied()
+            .collect::<Vec<_>>();
+        let create_info = vk::PipelineLayoutCreateInfo::builder()
+            .set_layouts(&desc_set_layouts)
+            .push_constant_ranges(&self.push_const_rng)
+            .build();
+        let pipe_layout = unsafe {
+            dev.dev.create_pipeline_layout(&create_info, None)?
+        };
+        Ok(pipe_layout)
+    }
+}
 impl_ptr_wrapper!(ShaderArray -> ShaderArrayInner);
 pub struct ShaderArray(Arc<ShaderArrayInner>);
 impl ShaderArray {
@@ -1787,12 +1812,14 @@ pub struct AttachmentReference {
     /// Blend state of the attachment. Any non-`None` value will enable
     /// attachment blending.
     pub blend_state: Option<vk::PipelineColorBlendAttachmentState>,
+    /// Initial layout after attachment read.
+    pub init_layout: vk::ImageLayout,
     /// Final layout after attachment write.
     pub final_layout: vk::ImageLayout,
 }
 pub trait FragmentHead {
-    fn attm_ref(&self, loc: u32) -> Option<&AttachmentReference>;
-    fn depth_attm_idx(&self, depth_attm_id: u32) -> Option<u32>;
+    fn color_attm_ref(&self, loc: u32) -> Option<&AttachmentReference>;
+    fn depth_attm_ref(&self) -> Option<&AttachmentReference> { None }
 }
 
 #[derive(Default)]
@@ -1823,8 +1850,8 @@ pub struct GraphicsPipeline {
     pub shader_arr: Arc<ShaderArrayInner>,
     pub attr_map: HashMap<InterfaceLocation, AttributeBinding>,
     pub attm_map: HashMap<InterfaceLocation, AttachmentReference>,
-    /// Index of the depth-stencil attachment to be written in the framebuffer.
-    pub depth_attm_idx: Option<u32>,
+    /// Depth-stencil attachment to be written in the framebuffer.
+    pub depth_attm_ref: Option<AttachmentReference>,
     pub raster_cfg: GraphicsRasterizationConfig,
     /// Any non-`None` value will enable depth testing.
     pub depth_cfg: Option<GraphicsDepthStencilConfig>,
@@ -1833,13 +1860,10 @@ pub struct GraphicsPipeline {
     pub blend_cfg: Option<GraphicsColorBlendConfig>,
 }
 impl GraphicsPipeline {
-    /// Note that `depth_attm_id` is NOT the index of attachment in framebuffer
-    /// but identifier to be used to query the provided `frag_head`.
     pub fn new<VH: VertexHead, FH: FragmentHead>(
         shader_arr: &ShaderArray,
         vert_head: &VH,
         frag_head: &FH,
-        depth_attm_id: Option<u32>,
         raster_cfg: GraphicsRasterizationConfig,
         depth_cfg: Option<GraphicsDepthStencilConfig>,
         blend_cfg: Option<GraphicsColorBlendConfig>,
@@ -1847,16 +1871,15 @@ impl GraphicsPipeline {
         // Ensure the vertex shader is the first and the fragment shader the
         // last.
         let manifest = &shader_arr.manifest;
-        let attr_map = Self::collect_attr_map(manifest, vert_head)?;
-        let attm_map = Self::collect_attm_map(manifest, frag_head)?;
-        let depth_attm_idx = if let Some(depth_attm_id) = depth_attm_id {
-            let depth_attm_idx = frag_head.depth_attm_idx(depth_attm_id)
-                .ok_or(Error::InvalidOperation)?;
-            Some(depth_attm_idx)
-        } else { None };
+        let mut attr_map = HashMap::new();
+        Self::collect_attr_map(manifest, vert_head, &mut attr_map)?;
+        let mut attm_map = HashMap::new();
+        let mut depth_attm_ref = None;
+        Self::collect_attm_map(manifest, frag_head, &mut attm_map,
+            &mut depth_attm_ref)?;
         let shader_arr = shader_arr.0.clone();
         let graph_pipe = GraphicsPipeline {
-            shader_arr, attr_map, attm_map, depth_attm_idx, raster_cfg,
+            shader_arr, attr_map, attm_map, depth_attm_ref, raster_cfg,
             depth_cfg, blend_cfg
         };
         Ok(graph_pipe)
@@ -1864,9 +1887,9 @@ impl GraphicsPipeline {
     fn collect_attr_map(
         manifest: &Manifest,
         vert_head: &dyn VertexHead,
-    ) -> Result<HashMap<InterfaceLocation, AttributeBinding>> {
+        mut attr_map: &mut HashMap<InterfaceLocation, AttributeBinding>,
+    ) -> Result<()> {
         use std::collections::hash_map::Entry::Vacant;
-        let mut attr_map = HashMap::new();
         for attr_res in manifest.inputs() {
             let location = attr_res.location;
             if let None = attr_res.ty.nbyte() {
@@ -1881,20 +1904,21 @@ impl GraphicsPipeline {
                 return Err(Error::PipelineMismatched("attribute location collision"));
             }
         }
-        Ok(attr_map)
+        Ok(())
     }
     fn collect_attm_map(
         manifest: &Manifest,
         frag_head: &dyn FragmentHead,
-    ) -> Result<HashMap<InterfaceLocation, AttachmentReference>> {
+        mut attm_map: &mut HashMap<InterfaceLocation, AttachmentReference>,
+        mut depth_attm_ref: &mut Option<AttachmentReference>,
+    ) -> Result<()> {
         use std::collections::hash_map::Entry::Vacant;
-        let mut attm_map = HashMap::new();
         for attm_ref in manifest.outputs() {
             let location = attm_ref.location;
             if let None = attm_ref.ty.nbyte() {
                 return Err(Error::PipelineMismatched("attachment cannot be opaque type"));
             }
-            let attm_ref = frag_head.attm_ref(location.loc())
+            let attm_ref = frag_head.color_attm_ref(location.loc())
                 .ok_or(Error::PipelineMismatched("attachment not supported by head"))?;
             if let Vacant(entry) = attm_map.entry(location) {
                 entry.insert(attm_ref.clone());
@@ -1902,7 +1926,10 @@ impl GraphicsPipeline {
                 return Err(Error::PipelineMismatched("attachment location collision"));
             }
         }
-        Ok(attm_map)
+        if let Some(attm_ref) = frag_head.depth_attm_ref() {
+            *depth_attm_ref = Some(attm_ref.clone());
+        }
+        Ok(())
     }
 }
 
@@ -1969,12 +1996,162 @@ impl Pipeline {
 }
 
 
+struct GraphicsPipelineDescriptionDetail {
+    entry_names: Vec<std::ffi::CString>,
+    psscis: Vec<vk::PipelineShaderStageCreateInfo>,
+    vert_binds: Vec<vk::VertexInputBindingDescription>,
+    vert_attrs: Vec<vk::VertexInputAttributeDescription>,
+    pvisci: vk::PipelineVertexInputStateCreateInfo,
+    piasci: vk::PipelineInputAssemblyStateCreateInfo,
+    prsci: vk::PipelineRasterizationStateCreateInfo,
+    pmsci: vk::PipelineMultisampleStateCreateInfo,
+    pdssci: vk::PipelineDepthStencilStateCreateInfo,
+    attm_blends: Vec<vk::PipelineColorBlendAttachmentState>,
+    pcbsci: vk::PipelineColorBlendStateCreateInfo,
+}
+impl GraphicsPipelineDescriptionDetail {
+    fn new(dev: &DeviceInner, graph_pipe: &GraphicsPipeline) -> Result<Self> {
+        let shader_arr = &graph_pipe.shader_arr;
+        let mut entry_names = Vec::with_capacity(shader_arr.entry_points.len());
+        let mut psscis = Vec::with_capacity(shader_arr.entry_points.len());
+        for entry_point in shader_arr.entry_points.iter() {
+            let entry_name = std::ffi::CString::new(entry_point.name())
+                .expect("invalid entry point name");
+            let pssci = vk::PipelineShaderStageCreateInfo::builder()
+                .stage(entry_point.stage().expect("invalid stage"))
+                .module(entry_point.shader_mod.shader_mod)
+                // .specialization_info(/* ... */) // TODO
+                .name(&entry_name)
+                .build();
+            entry_names.push(entry_name);
+            psscis.push(pssci)
+        }
+        let mut vert_bind_map = HashMap::new();
+        let mut vert_attr_map = HashMap::new();
+        for (location, attr_bind) in graph_pipe.attr_map.iter() {
+            use std::collections::hash_map::Entry::Vacant;
+            if let Vacant(entry) = vert_bind_map.entry(attr_bind.bind) {
+                let vert_bind = vk::VertexInputBindingDescription {
+                    binding: attr_bind.bind,
+                    stride: attr_bind.stride as u32,
+                    input_rate: vk::VertexInputRate::VERTEX,
+                };
+                entry.insert(vert_bind);
+            }
+            if let Vacant(entry) = vert_attr_map.entry(*location) {
+                let vert_attr = vk::VertexInputAttributeDescription {
+                    location: location.loc(),
+                    binding: attr_bind.bind,
+                    format: attr_bind.fmt,
+                    offset: attr_bind.offset as u32,
+                };
+                entry.insert(vert_attr);
+            }
+        }
+        let vert_binds = vert_bind_map.into_iter()
+            .map(|x| x.1)
+            .collect::<Vec<_>>();
+        let vert_attrs = vert_attr_map.into_iter()
+            .map(|x| x.1)
+            .collect::<Vec<_>>();
+        let pvisci = vk::PipelineVertexInputStateCreateInfo::builder()
+            .vertex_binding_descriptions(&vert_binds)
+            .vertex_attribute_descriptions(&vert_attrs)
+            .build();
+
+        let piasci = vk::PipelineInputAssemblyStateCreateInfo::builder()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+            // TODO: This one is interesting. Wanna look into it?
+            .primitive_restart_enable(false)
+            .build();
+
+        let poly_mode = if graph_pipe.raster_cfg.wireframe {
+            vk::PolygonMode::LINE
+        } else {
+            vk::PolygonMode::FILL
+        };
+        let prsci = vk::PipelineRasterizationStateCreateInfo::builder()
+            .depth_clamp_enable(false)
+            .rasterizer_discard_enable(false)
+            .polygon_mode(poly_mode)
+            .cull_mode(graph_pipe.raster_cfg.cull_mode)
+            .depth_bias_enable(false)
+            .line_width(1.0)
+            .build();
+
+        let pmsci = vk::PipelineMultisampleStateCreateInfo::builder()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+            .sample_shading_enable(false)
+            .min_sample_shading(1.0)
+            .build();
+
+        let mut pdssci = vk::PipelineDepthStencilStateCreateInfo::default();
+        if let Some(depth_cfg) = graph_pipe.depth_cfg.as_ref() {
+            pdssci.depth_test_enable = vk::TRUE;
+            pdssci.depth_compare_op = depth_cfg.cmp_op;
+            // This will be ignored if there is no depth-stencil
+            // attachment attached.
+            pdssci.depth_write_enable = vk::TRUE;
+            if dev.cap_detail.feats.depth_bounds != 0 {
+                if let Some((min_depth, max_depth)) = depth_cfg.depth_range.as_ref() {
+                    pdssci.depth_bounds_test_enable = vk::TRUE;
+                    pdssci.min_depth_bounds = *min_depth;
+                    pdssci.max_depth_bounds = *max_depth;
+                }
+            }
+            if let Some((front_op, back_op)) = depth_cfg.stencil_ops.as_ref() {
+                pdssci.stencil_test_enable = vk::TRUE;
+                pdssci.front = *front_op;
+                pdssci.back = *back_op;
+            }
+        }
+
+        let mut attm_blend = vk::PipelineColorBlendAttachmentState::default();
+        let mut blend_consts: [f32; 4] = Default::default();
+        if let Some(blend_cfg) = graph_pipe.blend_cfg.as_ref() {
+            attm_blend.blend_enable = vk::TRUE;
+            attm_blend.src_color_blend_factor = blend_cfg.src_factor;
+            attm_blend.dst_color_blend_factor = blend_cfg.dst_factor;
+            attm_blend.color_blend_op = blend_cfg.blend_op;
+            attm_blend.src_alpha_blend_factor = blend_cfg.src_factor;
+            attm_blend.dst_alpha_blend_factor = blend_cfg.dst_factor;
+            attm_blend.alpha_blend_op = blend_cfg.blend_op;
+            attm_blend.color_write_mask = vk::ColorComponentFlags::all();
+            blend_consts[0] = blend_cfg.blend_consts[0];
+            blend_consts[1] = blend_cfg.blend_consts[1];
+            blend_consts[2] = blend_cfg.blend_consts[2];
+            blend_consts[3] = blend_cfg.blend_consts[3];
+        }
+        let attm_blends = std::iter::repeat(attm_blend)
+            .take(graph_pipe.attm_map.len())
+            .collect::<Vec<_>>();
+
+        let pcbsci = vk::PipelineColorBlendStateCreateInfo::builder()
+            .attachments(&attm_blends)
+            .blend_constants(blend_consts)
+            .build();
+
+        let detail = GraphicsPipelineDescriptionDetail {
+            entry_names, psscis, vert_binds, vert_attrs, pvisci, piasci,
+            prsci, pmsci, pdssci, attm_blends, pcbsci,
+        };
+        Ok(detail)
+    }
+}
+struct SubpassAttachmentDetail {
+    init_layout: vk::ImageLayout,
+    final_layout: vk::ImageLayout,
+    is_depth: bool,
+}
+struct SubpassDetail {
+    pipe: Pipeline,
+    // attm index in framebuffer -> layout change rules
+    attm_details: HashMap<u32, SubpassAttachmentDetail>,
+}
 pub struct RenderPassInner {
     dev: Arc<DeviceInner>,
     pass: vk::RenderPass,
-    pipes: Vec<Pipeline>,
-    // (w, h)
-    framebuf_extent: (u32, u32),
+    subpass_details: Vec<SubpassDetail>,
 }
 impl Drop for RenderPassInner {
     fn drop(&mut self) {
@@ -1985,102 +2162,119 @@ impl Drop for RenderPassInner {
 impl_ptr_wrapper!(RenderPass -> RenderPassInner);
 pub struct RenderPass(Arc<RenderPassInner>);
 impl RenderPass {
+    fn collect_input_attms(
+        attm_refs: &[&AttachmentReference],
+        graph_pipe: &GraphicsPipeline,
+    ) -> Result<Vec<vk::AttachmentReference>> {
+        let mut input_attms = Vec::new();
+        for desc_res in graph_pipe.shader_arr.manifest.descs() {
+            if let DescriptorType::InputAttachment(nbind, idx) = desc_res.desc_ty {
+                let len = (*idx + *nbind) as usize;
+                input_attms.reserve(len);
+                while input_attms.len() < len {
+                    let attm_ref = vk::AttachmentReference {
+                        attachment: vk::ATTACHMENT_UNUSED,
+                        layout: Default::default(),
+                    };
+                    input_attms.push(attm_ref);
+                }
+                let attm_fmt = attm_refs.get(*idx as usize)
+                    .ok_or(Error::InvalidOperation)?
+                    .fmt;
+                let layout = if is_depth_fmt(attm_fmt) {
+                    vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                } else {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                };
+                for j in *idx..(*idx + *nbind) {
+                    let attm_ref = vk::AttachmentReference {
+                        attachment: j,
+                        layout,
+                    };
+                    input_attms[j as usize] = attm_ref;
+                }
+            }
+        }
+        Ok(input_attms)
+    }
+    fn collect_color_attms(
+        graph_pipe: &GraphicsPipeline,
+    ) -> Vec<vk::AttachmentReference> {
+        let mut color_attms = Vec::new();
+        for (location, attm_ref) in graph_pipe.attm_map.iter() {
+            let loc = location.loc() as usize;
+            if color_attms.len() < loc {
+                let stuff = (color_attms.len()..loc).into_iter()
+                    .map(|_| vk::AttachmentReference {
+                        attachment: vk::ATTACHMENT_UNUSED,
+                        layout: Default::default(),
+                    });
+                color_attms.extend(stuff);
+            }
+            let attm_ref = vk::AttachmentReference {
+                attachment: attm_ref.attm_idx,
+                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            };
+            color_attms.push(attm_ref);
+        }
+        color_attms
+    }
+    fn collect_depth_attm(
+        graph_pipe: &GraphicsPipeline,
+    ) -> Option<vk::AttachmentReference> {
+        graph_pipe.depth_attm_ref.as_ref()
+            .map(|attm_ref| vk::AttachmentReference {
+                attachment: attm_ref.attm_idx,
+                layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            })
+    }
     fn create_pass(
         dev: &DeviceInner,
         graph_pipes: &[GraphicsPipeline],
         deps: &[vk::SubpassDependency],
     ) -> Result<vk::RenderPass> {
-        // WARNING: Attachments indices from pipelines MUST NOT overlap.
-        let attm_ref_map = graph_pipes.iter()
+        // Collect attachments from all graphics pipelines.
+        //
+        // WARNING: Attachment indices from pipelines MUST NOT overlap, and MUST
+        //          be contigeous.
+        let mut attm_refs = graph_pipes.iter()
             .flat_map(|graph_pipe| {
                 graph_pipe.attm_map.values()
-                    .map(|attm_ref| (attm_ref.attm_idx, attm_ref))
-            })
-            .collect::<HashMap<_, _>>();
-        let attm_descs = attm_ref_map.iter()
-            .map(|(_attm_idx, attm_ref)| {
-                vk::AttachmentDescription {
-                    flags: Default::default(),
-                    format: attm_ref.fmt,
-                    samples: vk::SampleCountFlags::TYPE_1,
-                    load_op: attm_ref.load_op,
-                    store_op: attm_ref.store_op,
-                    stencil_load_op: attm_ref.load_op,
-                    stencil_store_op: attm_ref.store_op,
-                    initial_layout: vk::ImageLayout::UNDEFINED,
-                    final_layout: attm_ref.final_layout,
-                }
+                    .chain(graph_pipe.depth_attm_ref.iter())
             })
             .collect::<Vec<_>>();
+        attm_refs.sort_by_key(|attm_ref| attm_ref.attm_idx);
+
+        let attm_descs = attm_refs.iter()
+            .map(|attm_ref| vk::AttachmentDescription {
+                flags: Default::default(),
+                format: attm_ref.fmt,
+                samples: vk::SampleCountFlags::TYPE_1,
+                load_op: attm_ref.load_op,
+                store_op: attm_ref.store_op,
+                stencil_load_op: attm_ref.load_op,
+                stencil_store_op: attm_ref.store_op,
+                initial_layout: attm_ref.init_layout,
+                final_layout: attm_ref.final_layout,
+            })
+            .collect::<Vec<_>>();
+
         struct SubpassDescriptionDetail {
             input_attms: Vec<vk::AttachmentReference>,
             color_attms: Vec<vk::AttachmentReference>,
             depth_attm: Option<vk::AttachmentReference>,
         }
-        let mut subpass_desc_details = Vec::with_capacity(graph_pipes.len());
-        for graph_pipe in graph_pipes.iter() {
-            let mut input_attms = Vec::new();
-            for desc_res in graph_pipe.shader_arr.manifest.descs() {
-                if let DescriptorType::InputAttachment(nbind, idx) = desc_res.desc_ty {
-                    let (nbind, idx) = (*nbind, *idx);
-                    let len = (idx + nbind) as usize;
-                    input_attms.reserve(len);
-                    while input_attms.len() < len {
-                        let attm_ref = vk::AttachmentReference {
-                            attachment: vk::ATTACHMENT_UNUSED,
-                            layout: Default::default(),
-                        };
-                        input_attms.push(attm_ref);
-                    }
-                    let attm_fmt = attm_ref_map.get(&idx)
-                        .ok_or(Error::InvalidOperation)?
-                        .fmt;
-                    let layout = if is_depth_fmt(attm_fmt) {
-                        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-                    } else {
-                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-                    };
-                    for j in idx..(idx + nbind) {
-                        let attm_ref = vk::AttachmentReference {
-                            attachment: j,
-                            layout,
-                        };
-                        input_attms[j as usize] = attm_ref;
-                    }
-                }
-            }
-            let mut color_attms = Vec::new();
-            for (location, attm_ref) in graph_pipe.attm_map.iter() {
-                let loc = location.loc() as usize;
-                if color_attms.len() < loc {
-                    let stuff = (color_attms.len()..loc).into_iter()
-                        .map(|_| {
-                            vk::AttachmentReference {
-                                attachment: vk::ATTACHMENT_UNUSED,
-                                layout: Default::default(),
-                            }
-                        });
-                    color_attms.extend(stuff);
-                }
-                let attm_ref = vk::AttachmentReference {
-                    attachment: attm_ref.attm_idx,
-                    layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                };
-                color_attms.push(attm_ref);
-            }
-            let depth_attm = graph_pipe.depth_attm_idx
-                .map(|depth_attm_idx| {
-                    vk::AttachmentReference {
-                        attachment: depth_attm_idx,
-                        layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                    }
-                });
-            let subpass_desc_detail = SubpassDescriptionDetail {
-                color_attms, input_attms, depth_attm
-            };
-            subpass_desc_details.push(subpass_desc_detail);
-        };
-        
+        let mut subpass_desc_details =
+            Vec::<SubpassDescriptionDetail>::with_capacity(graph_pipes.len());
+        let subpass_desc_details = graph_pipes.iter()
+            .map(|graph_pipe| SubpassDescriptionDetail {
+                input_attms: Self::collect_input_attms(&attm_refs, &graph_pipe)
+                    .unwrap(),
+                color_attms: Self::collect_color_attms(&graph_pipe),
+                depth_attm: Self::collect_depth_attm(&graph_pipe),
+            })
+            .collect::<Vec<_>>();
+
         let subpass_descs = subpass_desc_details.iter()
             .map(|subpass_desc_detail| {
                 let mut x = vk::SubpassDescription::builder()
@@ -2099,268 +2293,87 @@ impl RenderPass {
             .subpasses(&subpass_descs)
             .dependencies(deps)
             .build();
-        let pass = unsafe {
-            dev.dev.create_render_pass(&create_info, None)?
-        };
+        let pass = unsafe { dev.dev.create_render_pass(&create_info, None)? };
         Ok(pass)
     }
-    fn create_graph_pipes(
+    fn create_subpass_details(
         dev: Arc<DeviceInner>,
         graph_pipes: &[GraphicsPipeline],
         pass: vk::RenderPass,
-        framebuf_extent: (u32, u32),
-    ) -> Result<Vec<Pipeline>> {
-        struct GraphicsPipelineDescriptionDetail {
-            entry_names: Vec<std::ffi::CString>,
-            psscis: Vec<vk::PipelineShaderStageCreateInfo>,
-            vert_binds: Vec<vk::VertexInputBindingDescription>,
-            vert_attrs: Vec<vk::VertexInputAttributeDescription>,
-            pvisci: vk::PipelineVertexInputStateCreateInfo,
-            piasci: vk::PipelineInputAssemblyStateCreateInfo,
-            ptsci: vk::PipelineTessellationStateCreateInfo,
-            pvsci: vk::PipelineViewportStateCreateInfo,
-            prsci: vk::PipelineRasterizationStateCreateInfo,
-            pmsci: vk::PipelineMultisampleStateCreateInfo,
-            pdssci: vk::PipelineDepthStencilStateCreateInfo,
-            attm_blends: Vec<vk::PipelineColorBlendAttachmentState>,
-            pcbsci: vk::PipelineColorBlendStateCreateInfo,
-            pdsci: vk::PipelineDynamicStateCreateInfo,
-            pipe_layout: vk::PipelineLayout,
-        }
+    ) -> Result<Vec<SubpassDetail>> {
         // WARNING: The following code should not break and if we are
         // introducing any optimization, PLEASE CHECK THAT NO DANGLING POINTER
-        // FORMS.
+        // FORMS. INCLUDING the parts in
+        // `GraphicsPipelineDescriptionDetail::new`.
 
-        let (width, height) = framebuf_extent;
-        let viewports = &[
-            vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: width as f32,
-                height: height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            },
+        // NOTE: Don't use tesselation and geometry shaders because
+        // these stages will generate unknown number of primitives,
+        // which will disable tile-based rendering which has been used
+        // broadly. At least for now we only want a minimal executable model.
+        let ptsci = vk::PipelineTessellationStateCreateInfo::default();
+
+        let pvsci = vk::PipelineViewportStateCreateInfo::default();
+
+        let dyn_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
         ];
-        let scissors = &[
-            vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D { width, height },
-            },
-        ];
+        let pdsci = vk::PipelineDynamicStateCreateInfo::builder()
+            .dynamic_states(&dyn_states)
+            .build();
 
-        let mut graph_pipe_desc_details = Vec::new();
-        for graph_pipe in graph_pipes {
-            let shader_arr = graph_pipe.shader_arr.clone();
-            let entry_names = shader_arr.entry_points.iter()
-                .map(|entry_point| {
-                    std::ffi::CString::new(entry_point.name())
-                        .expect("invalid entry point name")
-                })
-                .collect::<Vec<_>>();
-            let psscis = shader_arr.entry_points.iter()
-                .enumerate()
-                .map(|(i, entry_point)| {
-                    vk::PipelineShaderStageCreateInfo::builder()
-                        .stage(entry_point.stage().expect("invalid stage"))
-                        .module(entry_point.shader_mod.shader_mod)
-                        // .specialization_info(/* ... */) // TODO
-                        .name(&entry_names[i])
-                        .build()
-                })
-                .collect::<Vec<_>>();
-            let mut vert_bind_map = HashMap::new();
-            let mut vert_attr_map = HashMap::new();
-            for (location, attr_bind) in graph_pipe.attr_map.iter() {
-                use std::collections::hash_map::Entry::Vacant;
-                if let Vacant(entry) = vert_bind_map.entry(attr_bind.bind) {
-                    let vert_bind = vk::VertexInputBindingDescription {
-                        binding: attr_bind.bind,
-                        stride: attr_bind.stride as u32,
-                        input_rate: vk::VertexInputRate::VERTEX,
+        let mut subpass_details = Vec::with_capacity(graph_pipes.len());
+        for (i, graph_pipe) in graph_pipes.iter().enumerate() {
+            let pipe_layout = graph_pipe.shader_arr.create_pipe_layout()?;
+
+            let detail = GraphicsPipelineDescriptionDetail::new(&dev,
+                graph_pipe)?;
+            let create_info = vk::GraphicsPipelineCreateInfo::builder()
+                .stages(&detail.psscis)
+                .vertex_input_state(&detail.pvisci)
+                .input_assembly_state(&detail.piasci)
+                .tessellation_state(&ptsci)
+                .viewport_state(&pvsci)
+                .rasterization_state(&detail.prsci)
+                .multisample_state(&detail.pmsci)
+                .depth_stencil_state(&detail.pdssci)
+                .color_blend_state(&detail.pcbsci)
+                .dynamic_state(&pdsci)
+                .layout(pipe_layout)
+                .render_pass(pass)
+                .subpass(i as u32)
+                .build();
+            let pipe = unsafe {
+                dev.dev.create_graphics_pipelines(vk::PipelineCache::null(),
+                    &[create_info], None)
+            }.unwrap()[0];
+
+            let pipe = Pipeline::new(dev.clone(),
+                graph_pipes[i].shader_arr.clone(), pipe, pipe_layout,
+                vk::PipelineBindPoint::GRAPHICS);
+            let mut attm_details: HashMap<u32, SubpassAttachmentDetail> =
+                graph_pipe.attm_map.values()
+                .map(|attm_ref| {
+                    let attm_detail = SubpassAttachmentDetail {
+                        init_layout: attm_ref.init_layout,
+                        final_layout: attm_ref.final_layout,
+                        is_depth: false,
                     };
-                    entry.insert(vert_bind);
-                }
-                if let Vacant(entry) = vert_attr_map.entry(*location) {
-                    let vert_attr = vk::VertexInputAttributeDescription {
-                        location: location.loc(),
-                        binding: attr_bind.bind,
-                        format: attr_bind.fmt,
-                        offset: attr_bind.offset as u32,
-                    };
-                    entry.insert(vert_attr);
-                }
+                    (attm_ref.attm_idx, attm_detail)
+                })
+                .collect();
+            if let Some(attm_ref) = graph_pipe.depth_attm_ref.as_ref() {
+                let attm_detail = SubpassAttachmentDetail {
+                    init_layout: attm_ref.init_layout,
+                    final_layout: attm_ref.final_layout,
+                    is_depth: true,
+                };
+                attm_details.insert(attm_ref.attm_idx, attm_detail);
             }
-            let vert_binds = vert_bind_map.into_iter()
-                .map(|x| x.1)
-                .collect::<Vec<_>>();
-            let vert_attrs = vert_attr_map.into_iter()
-                .map(|x| x.1)
-                .collect::<Vec<_>>();
-            let pvisci = vk::PipelineVertexInputStateCreateInfo::builder()
-                .vertex_binding_descriptions(&vert_binds)
-                .vertex_attribute_descriptions(&vert_attrs)
-                .build();
-
-            
-            let piasci = vk::PipelineInputAssemblyStateCreateInfo::builder()
-                .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-                // TODO: This one is interesting. Wanna look into it?
-                .primitive_restart_enable(false)
-                .build();
-
-            // NOTE: Don't use tesselation and geometry shaders because
-            // these stages will generate unknown number of primitives,
-            // which will disable tile-based rendering which has been used
-            // broadly.
-            let ptsci = vk::PipelineTessellationStateCreateInfo::builder()
-                .build();
-
-            let pvsci = vk::PipelineViewportStateCreateInfo::builder()
-                .viewport_count(viewports.len() as u32)
-                .viewports(viewports)
-                .scissor_count(scissors.len() as u32)
-                .scissors(scissors)
-                .build();
-
-            let poly_mode = if graph_pipe.raster_cfg.wireframe {
-                vk::PolygonMode::LINE
-            } else {
-                vk::PolygonMode::FILL
-            };
-            let prsci = vk::PipelineRasterizationStateCreateInfo::builder()
-                .depth_clamp_enable(false)
-                .rasterizer_discard_enable(false)
-                .polygon_mode(poly_mode)
-                .cull_mode(graph_pipe.raster_cfg.cull_mode)
-                .depth_bias_enable(false)
-                .line_width(1.0)
-                .build();
-
-            let pmsci = vk::PipelineMultisampleStateCreateInfo::builder()
-                .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-                .sample_shading_enable(false)
-                .min_sample_shading(1.0)
-                .build();
-
-            let mut pdssci = vk::PipelineDepthStencilStateCreateInfo::builder()
-                .build();
-            if let Some(depth_cfg) = graph_pipe.depth_cfg.as_ref() {
-                pdssci.depth_test_enable = 1;
-                pdssci.depth_compare_op = depth_cfg.cmp_op;
-                // This will be ignored if there is no depth-stencil
-                // attachment attached.
-                pdssci.depth_write_enable = 1;
-                if dev.cap_detail.feats.depth_bounds != 0 {
-                    if let Some((min_depth, max_depth)) = depth_cfg.depth_range.as_ref() {
-                        pdssci.depth_bounds_test_enable = 1;
-                        pdssci.min_depth_bounds = *min_depth;
-                        pdssci.max_depth_bounds = *max_depth;
-                    }
-                }
-                if let Some((front_op, back_op)) = depth_cfg.stencil_ops.as_ref() {
-                    pdssci.stencil_test_enable = 1;
-                    pdssci.front = *front_op;
-                    pdssci.back = *back_op;
-                }
-            }
-
-            let (attm_blend, blend_consts) = {
-                if let Some(blend_cfg) = graph_pipe.blend_cfg.as_ref() {
-                    let ab = vk::PipelineColorBlendAttachmentState::builder()
-                        .blend_enable(true)
-                        .src_color_blend_factor(blend_cfg.src_factor)
-                        .dst_color_blend_factor(blend_cfg.dst_factor)
-                        .color_blend_op(blend_cfg.blend_op)
-                        .src_alpha_blend_factor(blend_cfg.src_factor)
-                        .dst_alpha_blend_factor(blend_cfg.dst_factor)
-                        .alpha_blend_op(blend_cfg.blend_op)
-                        .color_write_mask(vk::ColorComponentFlags::all())
-                        .build();
-                    (ab, blend_cfg.blend_consts)
-                } else {
-                    let ab = vk::PipelineColorBlendAttachmentState::builder()
-                        .blend_enable(false)
-                        .build();
-                    (ab, Default::default())
-                }
-            };
-            let attm_blends = std::iter::repeat(attm_blend)
-                .take(graph_pipe.attm_map.len())
-                .collect::<Vec<_>>();
-
-            let pcbsci = vk::PipelineColorBlendStateCreateInfo::builder()
-                .attachments(&attm_blends)
-                .blend_constants(blend_consts)
-                .build();
-
-            let pdsci = vk::PipelineDynamicStateCreateInfo::builder()
-                .build();
-
-            let desc_set_layouts = &shader_arr.desc_set_layouts;
-            let desc_set_layouts = desc_set_layouts.values()
-                .copied()
-                .collect::<Vec<_>>();
-            let create_info = vk::PipelineLayoutCreateInfo::builder()
-                .set_layouts(&desc_set_layouts)
-                .push_constant_ranges(&shader_arr.push_const_rng)
-                .build();
-            let pipe_layout = unsafe {
-                dev.dev.create_pipeline_layout(&create_info, None)?
-            };
-
-            let graph_pipe_desc_detail = GraphicsPipelineDescriptionDetail {
-                entry_names, psscis, vert_binds, vert_attrs, pvisci, piasci,
-                ptsci, pvsci, prsci, pmsci, pdssci, attm_blends, pcbsci,
-                pdsci, pipe_layout
-            };
-            graph_pipe_desc_details.push(graph_pipe_desc_detail);
+            let subpass_detail = SubpassDetail { pipe, attm_details };
+            subpass_details.push(subpass_detail);
         }
-
-        let create_infos = graph_pipe_desc_details.iter()
-            .enumerate()
-            .map(|(i, graph_pipe_desc_detail)| {
-                vk::GraphicsPipelineCreateInfo::builder()
-                    .stages(&graph_pipe_desc_detail.psscis)
-                    .vertex_input_state(&graph_pipe_desc_detail.pvisci)
-                    .input_assembly_state(&graph_pipe_desc_detail.piasci)
-                    .tessellation_state(&graph_pipe_desc_detail.ptsci)
-                    .viewport_state(&graph_pipe_desc_detail.pvsci)
-                    .rasterization_state(&graph_pipe_desc_detail.prsci)
-                    .multisample_state(&graph_pipe_desc_detail.pmsci)
-                    .depth_stencil_state(&graph_pipe_desc_detail.pdssci)
-                    .color_blend_state(&graph_pipe_desc_detail.pcbsci)
-                    .dynamic_state(&graph_pipe_desc_detail.pdsci)
-                    .layout(graph_pipe_desc_detail.pipe_layout)
-                    .render_pass(pass)
-                    .subpass(i as u32)
-                    .build()
-            })
-            .collect::<Vec<_>>();
-        let pipe_cache = vk::PipelineCache::null();
-        let pipes = unsafe {
-            dev.dev.create_graphics_pipelines(pipe_cache, &create_infos, None)
-        };
-        let pipes = match pipes {
-            Ok(pipes) => pipes,
-            Err((pipes, e)) => {
-                for pipe in pipes {
-                    if pipe != vk::Pipeline::null() {
-                        unsafe { dev.dev.destroy_pipeline(pipe, None) };
-                    }
-                }
-                return Err(e.into());
-            }
-        };
-        let pipes = pipes.into_iter()
-            .enumerate()
-            .map(|(i, pipe)| {
-                let pipe_layout = graph_pipe_desc_details[i].pipe_layout;
-                Pipeline::new(dev.clone(), graph_pipes[i].shader_arr.clone(),
-                    pipe, pipe_layout, vk::PipelineBindPoint::GRAPHICS)
-            })
-            .collect::<Vec<_>>();
-        Ok(pipes)
+        Ok(subpass_details)
     }
     /// `graph_pipes` should be sorted in order to represent the command
     /// recording order.
@@ -2368,15 +2381,14 @@ impl RenderPass {
         dev: &Device,
         graph_pipes: &[GraphicsPipeline],
         deps: &[vk::SubpassDependency],
-        framebuf_extent: (u32, u32),
     ) -> Result<RenderPass> {
         let dev = dev.0.clone();
         let pass = Self::create_pass(&dev, graph_pipes, deps)?;
-        let pipes = Self::create_graph_pipes(
-            dev.clone(), graph_pipes, pass, framebuf_extent
+        let subpass_details = Self::create_subpass_details(
+            dev.clone(), graph_pipes, pass,
         )?;
 
-        let inner = RenderPassInner { dev, pass, pipes, framebuf_extent };
+        let inner = RenderPassInner { dev, pass, subpass_details };
         Ok(RenderPass(Arc::new(inner)))
     }
 }
@@ -2920,6 +2932,17 @@ impl<'a> Variable<'a> {
     pub fn to_count(&self) -> Option<u32> {
         if let Variable::Count(x) = self { Some(*x) } else { None }
     }
+
+    /// Get a buffer from this variable if the variable is buffer-compatible.
+    fn get_buf(&self) -> Option<&Buffer> {
+        self.to_buf()
+    }
+    /// Get an image from this variable if the variable is image-compatible.
+    fn get_img(&self) -> Option<&Image> {
+        self.to_sampled_img()
+            .map(|x| x.0)
+            .or_else(|| self.to_img())
+    }
 }
 impl<'a, T: Sized> From<&'a [T]> for Variable<'a> {
     fn from(x: &'a [T]) -> Self {
@@ -2960,34 +2983,46 @@ impl<'a> From<u32> for Variable<'a> {
 enum RwState {
     Write, Read
 }
-impl Default for RwState {
-    fn default() -> RwState {
-        RwState::Write
-    }
+
+/// Used to identify stateful objects (which need to be synchronized for R/W).
+/// This is necessary because there exist cases like an image used in a same
+/// device procedure as both a sampled image and a storage image. They won't
+/// have the save variable token but they can be identified by a same handle.
+#[derive(Hash, PartialEq, Eq)]
+enum StatefulObjectId {
+    Buffer(vk::Buffer),
+    Image(vk::Image),
 }
-struct VariableState<'a> {
-    var: &'a Variable<'a>,
+#[derive(Clone, Copy)]
+struct InferenceState {
     stage: vk::PipelineStageFlags,
     access: vk::AccessFlags,
-    qfam_idx: u32,
     rw: RwState,
 }
-impl<'a> VariableState<'a> {
-    fn new(var: &'a Variable<'a>) -> VariableState<'a> {
-        VariableState {
-            var,
+impl Default for InferenceState {
+    fn default() -> Self {
+        InferenceState {
             stage: vk::PipelineStageFlags::TOP_OF_PIPE,
             access: vk::AccessFlags::empty(),
-            qfam_idx: !0,
             rw: RwState::Read,
         }
+    }
+}
+impl InferenceState {
+    // Returns whether a coming-up operation need to be synchronized.
+    fn needs_bar(&self, state: &InferenceState) -> bool {
+        // We don't need explicit queue family ownership transfer in our case.
+        // So here doesn't exists a thing like:
+        // (state.qfam_idx != self.qfam_idx) |
+        ((state.rw == RwState::Write) | (self.rw == RwState::Write))
     }
 }
 
 struct Recorder<'a> {
     dev: &'a DeviceInner,
     cmdbuf: vk::CommandBuffer,
-    state_dict: &'a HashMap<VariableToken, RefCell<VariableState<'a>>>,
+    var_dict: &'a HashMap<VariableToken, &'a Variable<'a>>,
+    infer_states: RefCell<HashMap<StatefulObjectId, InferenceState>>,
 
     desc_pools: &'a mut Vec<vk::DescriptorPool>,
     framebufs: &'a mut Vec<vk::Framebuffer>,
@@ -3035,28 +3070,29 @@ impl<'a> Recorder<'a> {
         dev: &ash::Device,
         pass: &RenderPassInner,
         attms: Vec<vk::ImageView>,
+        extent: &vk::Extent2D,
     ) -> Result<vk::Framebuffer> {
         let create_info = vk::FramebufferCreateInfo::builder()
             .render_pass(pass.pass)
             .attachments(&attms)
-            .width(pass.framebuf_extent.0)
-            .height(pass.framebuf_extent.1)
+            .width(extent.width)
+            .height(extent.height)
             .layers(1) // TODO: Support multilayer rendering in the future.
             .build();
         let framebuf = unsafe { dev.create_framebuffer(&create_info, None)? };
         Ok(framebuf)
     }
-
     fn new(
         dev: &'a DeviceInner,
-        state_dict: &'a HashMap<VariableToken, RefCell<VariableState<'a>>>,
+        var_dict: &'a HashMap<VariableToken, &'a Variable<'a>>,
         desc_pools: &'a mut Vec<vk::DescriptorPool>,
         framebufs: &'a mut Vec<vk::Framebuffer>,
     ) -> Recorder<'a> {
         Recorder {
             dev,
             cmdbuf: vk::CommandBuffer::null(),
-            state_dict,
+            var_dict,
+            infer_states: RefCell::new(HashMap::new()),
             desc_pools,
             framebufs,
             push_const: None,
@@ -3067,28 +3103,28 @@ impl<'a> Recorder<'a> {
         }
     }
 
-    
+    #[inline]
     fn make_buf_bar(
         buf: &BufferInner,
-        state: &VariableState<'a>,
-        access: vk::AccessFlags,
-        qfam_idx: u32,
+        from_state: &InferenceState,
+        to_state: &InferenceState,
     ) -> vk::BufferMemoryBarrier {
         vk::BufferMemoryBarrier::builder()
-            .src_access_mask(state.access)
-            .dst_access_mask(access)
-            .src_queue_family_index(state.qfam_idx)
-            .dst_queue_family_index(qfam_idx)
+            .src_access_mask(from_state.access)
+            .dst_access_mask(to_state.access)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .buffer(buf.buf)
             .offset(0)
             .size(buf.cfg.size as u64)
             .build()
     }
+    #[inline]
     fn make_img_bar(
         img: &ImageInner,
-        state: &VariableState<'a>,
-        access: vk::AccessFlags,
-        qfam_idx: u32,
+        from_state: &InferenceState,
+        to_state: &InferenceState,
+        to_layout: vk::ImageLayout,
     ) -> vk::ImageMemoryBarrier {
         let subrsc_rng = vk::ImageSubresourceRange {
             aspect_mask: img.aspect,
@@ -3097,108 +3133,155 @@ impl<'a> Recorder<'a> {
             base_array_layer: 0,
             layer_count: img.cfg.nlayer,
         };
-        let old_layout = img.layout.get();
-        let new_layout = vk::ImageLayout::GENERAL;
-        img.layout.set(new_layout);
+        let from_layout = img.layout.get();
         vk::ImageMemoryBarrier::builder()
-            .src_access_mask(state.access)
-            .dst_access_mask(access)
-            .old_layout(old_layout)
-            // TODO: (penguinliong) Adapt to different accesses, or, should
-            // we?
-            .new_layout(new_layout)
-            .src_queue_family_index(state.qfam_idx)
-            .dst_queue_family_index(qfam_idx)
+            .src_access_mask(from_state.access)
+            .dst_access_mask(to_state.access)
+            .old_layout(from_layout)
+            .new_layout(to_layout)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(img.img)
             .subresource_range(subrsc_rng)
             .build()
     }
     #[inline]
-    fn barrier_var(
+    fn record_bar(
         &self,
-        state: &mut VariableState<'a>,
-        token: VariableToken,
-        stage: vk::PipelineStageFlags,
-        access: vk::AccessFlags,
-        qfam_idx: u32,
+        from_stage: &vk::PipelineStageFlags,
+        to_stage: &vk::PipelineStageFlags,
         buf_bar: &[vk::BufferMemoryBarrier],
         img_bar: &[vk::ImageMemoryBarrier],
-        rw: RwState,
     ) {
-        if (state.qfam_idx != !0) &&
-            (buf_bar.len() != 0 || img_bar.len() != 0) {
-            unsafe {
-                self.dev.dev.cmd_pipeline_barrier(self.cmdbuf, state.stage,
-                    stage, vk::DependencyFlags::empty(), &[], buf_bar, img_bar);
-            }
+        unsafe {
+            self.dev.dev.cmd_pipeline_barrier(self.cmdbuf, *from_stage,
+                *to_stage, vk::DependencyFlags::empty(), &[], buf_bar, img_bar);
         }
-        state.stage = stage;
-        state.access = access;
-        state.qfam_idx = qfam_idx;
-        state.rw = rw;
     }
-    // Get the variable referred by `token` and keep track of the state of the
-    // dynamic variable.
-    fn stage_var(
+    fn record_buf_bar(
         &self,
-        token: VariableToken,
-        stage: vk::PipelineStageFlags,
-        access: vk::AccessFlags,
-        qfam_idx: u32,
-        rw: RwState,
-    ) -> &Variable<'a> {
-        let mut state = self.state_dict[&token].borrow_mut();
-        // Don't barrier if the previous and the next RW state are both `Read`.
-        if (rw == RwState::Write) | (state.rw == RwState::Write) {
-            let mut buf_bar = Vec::new();
-            let mut img_bar = Vec::new();
-            match state.var {
-                Variable::Buffer(buf) => buf_bar.push(
-                    Self::make_buf_bar(&buf.0, &state, access, qfam_idx),
-                ),
-                Variable::Image(img) => img_bar.push(
-                    Self::make_img_bar(&img.0, &state, access, qfam_idx),
-                ),
-                Variable::SampledImage(img, _) => img_bar.push(
-                    Self::make_img_bar(&img.0, &state, access, qfam_idx),
-                ),
-                // Don't care readonly types.
-                _ => {},
-            }
-            self.barrier_var(&mut state, token, stage, access, qfam_idx,
-                &buf_bar, &img_bar, rw);
-        }
-        &state.var
+        buf: &BufferInner,
+        from_state: &InferenceState,
+        to_state: &InferenceState,
+    ) {
+        let bar = Self::make_buf_bar(&buf, from_state, to_state);
+        self.record_bar(&from_state.stage, &to_state.stage, &[bar], &[]);
     }
+    fn record_img_bar(
+        &self,
+        img: &ImageInner,
+        from_state: &InferenceState,
+        to_state: &InferenceState,
+        to_layout: vk::ImageLayout,
+    ) {
+        let bar = Self::make_img_bar(&img, from_state, to_state, to_layout);
+        self.record_bar(&from_state.stage, &to_state.stage, &[], &[bar]);
+    }
+
+    // The following `get` family of methods only fail when the given token was
+    // not mapped to a variable.
     #[inline]
-    fn stage_var_host_const(&mut self, token: VariableToken) -> &Variable<'a> {
-        &self.state_dict[&token].borrow_mut().var
+    fn get_var(&self, token: VariableToken) -> Option<&Variable<'a>> {
+        self.var_dict.get(&token)
+            .copied()
     }
-    fn stage_attm(
+    fn get_host_mem(&self, token: VariableToken) -> Result<&'a [u8]> {
+        self.get_var(token)
+            .and_then(Variable::to_host_mem)
+            .ok_or(Error::InvalidOperation)
+    }
+    // WARNING: Variable state should be updated later externally.
+    fn get_buf(
         &self,
         token: VariableToken,
-        qfam_idx: u32,
-    ) -> Result<&Image> {
-        let mut state = self.state_dict[&token].borrow_mut();
-        let img = state.var
-            .to_img()
+        to_state: InferenceState,
+    ) -> Result<&Buffer> {
+        let buf = self.get_var(token)
+            .and_then(Variable::to_buf)
             .ok_or(Error::InvalidOperation)?;
-        let (stage, access) = {
-            if !img.aspect.contains(vk::ImageAspectFlags::COLOR) {
-                (
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                )
-            } else {
-                (
-                    vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                )
-            }
-        };
-        let img_bar = [Self::make_img_bar(&img.0, &state, access, qfam_idx)];
-        self.barrier_var(&mut state, token, stage, access, qfam_idx, &[],
-            &img_bar, RwState::Write);
+        let mut infer_states = self.infer_states.borrow_mut();
+        let mut from_state = infer_states
+            .entry(StatefulObjectId::Buffer(buf.buf))
+            .or_default();
+        if from_state.needs_bar(&to_state) {
+            self.record_buf_bar(&buf, &from_state, &to_state);
+        }
+        *from_state = to_state;
+        Ok(buf)
+    }
+    fn get_img(
+        &self,
+        token: VariableToken,
+        to_state: InferenceState,
+        to_layout: vk::ImageLayout,
+    ) -> Result<&Image> {
+        let img = self.get_var(token)
+            .and_then(Variable::to_img)
+            .ok_or(Error::InvalidOperation)?;
+        let mut infer_states = self.infer_states.borrow_mut();
+        let mut from_state = infer_states
+            .entry(StatefulObjectId::Image(img.img))
+            .or_default();
+        if from_state.needs_bar(&to_state) | (img.layout.get() != to_layout) {
+            self.record_img_bar(&img, from_state, &to_state, to_layout);
+        }
+        *from_state = to_state;
+        img.layout.set(to_layout);
+        Ok(img)
+    }
+    fn get_sampler(&self, token: VariableToken) -> Result<&Sampler> {
+        self.get_var(token)
+            .and_then(Variable::to_sampler)
+            .ok_or(Error::InvalidOperation)
+    }
+    fn get_sampled_img(
+        &self,
+        token: VariableToken,
+        to_state: InferenceState,
+        to_layout: vk::ImageLayout,
+    ) -> Result<(&Image, &Sampler)> {
+        let (img, sampler) = self.get_var(token)
+            .and_then(Variable::to_sampled_img)
+            .ok_or(Error::InvalidOperation)?;
+        let mut infer_states = self.infer_states.borrow_mut();
+        let mut from_state = infer_states
+            .entry(StatefulObjectId::Image(img.img))
+            .or_default();
+        if from_state.needs_bar(&to_state) | (img.layout.get() != to_layout) {
+            self.record_img_bar(&img, &from_state, &to_state, to_layout);
+        }
+        *from_state = to_state;
+        img.layout.set(to_layout);
+        Ok((img, sampler))
+    }
+    fn get_count(&self, token: VariableToken) -> Result<u32> {
+        self.get_var(token)
+            .and_then(Variable::to_count)
+            .ok_or(Error::InvalidOperation)
+    }
+
+    fn get_attm(
+        &self,
+        token: VariableToken,
+        to_state_r: InferenceState,
+        to_layout_r: vk::ImageLayout,
+        to_state_w: InferenceState,
+        to_layout_w: vk::ImageLayout,
+    ) -> Result<&Image> {
+        let img = self.get_var(token)
+            .and_then(Variable::to_img)
+            .ok_or(Error::InvalidOperation)?;
+        let mut infer_states = self.infer_states.borrow_mut();
+        let from_state = infer_states
+            .entry(StatefulObjectId::Image(img.img))
+            .or_default();
+        if from_state.needs_bar(&to_state_r) |
+            (img.layout.get() != to_layout_r)
+        {
+            self.record_img_bar(&img, &from_state, &to_state_r, to_layout_r);
+        }
+        *from_state = to_state_w;
+        img.layout.set(to_layout_w);
         Ok(img)
     }
 
@@ -3240,7 +3323,8 @@ impl<'a> Recorder<'a> {
     #[inline]
     fn bind_pipe(&self, pipe: &PipelineInner) {
         unsafe {
-            self.dev.dev.cmd_bind_pipeline(self.cmdbuf, pipe.pipe_bp, pipe.pipe);
+            self.dev.dev.cmd_bind_pipeline(self.cmdbuf, pipe.pipe_bp,
+                pipe.pipe);
         }
     }
     fn flush_push_const(&self, pipe: &PipelineInner) -> Result<()> {
@@ -3261,18 +3345,13 @@ impl<'a> Recorder<'a> {
     fn clear_push_const(&mut self) {
         self.push_const = None;
     }
-    fn flush_desc_binds(
-        &mut self,
-        pipe: &PipelineInner,
-        qfam_idx: u32,
-    ) -> Result<()> {
+    fn flush_desc_binds(&mut self, pipe: &PipelineInner) -> Result<()> {
         let dev = &self.dev.dev;
         let shader_arr = &*pipe.shader_arr;
         let desc_pool = Self::create_desc_pool(dev, shader_arr)?;
         // TODO: (penguinliong) Remember to destroy this.
         // Note that allocated desc sets will be freed on destroy.
         self.desc_pools.push(desc_pool);
-        let qfam_idx = qfam_idx;
         // Bind descriptor sets.
         for (set, bind_var) in self.desc_binds.iter() {
             let desc_set = {
@@ -3316,9 +3395,7 @@ impl<'a> Recorder<'a> {
                                     vk::ImageLayout::UNDEFINED,
                                 ));
                             let img_info = vk::DescriptorImageInfo {
-                                sampler,
-                                image_view,
-                                image_layout,
+                                sampler, image_view, image_layout,
                             };
                             let i = img_infos.len();
                             img_infos.push(img_info);
@@ -3334,91 +3411,78 @@ impl<'a> Recorder<'a> {
                     match desc_ty {
                         _ => unreachable!(),
                         vk::DescriptorType::UNIFORM_BUFFER => {
-                            let buf = self.stage_var(
-                                    *token,
-                                    vk::PipelineStageFlags::ALL_COMMANDS,
-                                    vk::AccessFlags::UNIFORM_READ,
-                                    qfam_idx,
-                                    RwState::Read,
-                                )
-                                .to_buf()
-                                .cloned()
-                                .ok_or(Error::InvalidOperation)?;
-                            write_buf(desc_ty, buf)
+                            let to_state = InferenceState {
+                                stage: vk::PipelineStageFlags::ALL_COMMANDS,
+                                access: vk::AccessFlags::UNIFORM_READ,
+                                rw: RwState::Read,
+                            };
+                            let buf = self.get_buf(*token, to_state)?;
+                            write_buf(desc_ty, buf.clone())
                         },
                         vk::DescriptorType::STORAGE_BUFFER => {
-                            let buf = self.stage_var(
-                                    *token,
-                                    vk::PipelineStageFlags::ALL_COMMANDS,
-                                    vk::AccessFlags::SHADER_READ |
+                            let to_state = InferenceState {
+                                stage: vk::PipelineStageFlags::ALL_COMMANDS,
+                                access: vk::AccessFlags::SHADER_READ |
                                     vk::AccessFlags::SHADER_WRITE,
-                                    qfam_idx,
-                                    // TODO: (penguinliong) Allow SPIR-Q to
-                                    //       extract `readonly` decorations. 
-                                    RwState::Write,
-                                )
-                                .to_buf()
-                                .cloned()
-                                .ok_or(Error::InvalidOperation)?;
-                            write_buf(desc_ty, buf)
+                                rw: RwState::Write,
+                            };
+                            let buf = self.get_buf(*token, to_state)?;
+                            write_buf(desc_ty, buf.clone())
                         },
                         vk::DescriptorType::SAMPLED_IMAGE => {
-                            let img = self.stage_var(
-                                    *token,
-                                    vk::PipelineStageFlags::ALL_COMMANDS,
-                                    vk::AccessFlags::SHADER_READ,
-                                    qfam_idx,
-                                    RwState::Read,
-                                )
-                                .to_img()
-                                .cloned()
-                                .ok_or(Error::InvalidOperation)?;
-                            write_img(desc_ty, Some(img), None)
+                            let to_state = InferenceState {
+                                stage: vk::PipelineStageFlags::ALL_COMMANDS,
+                                access: vk::AccessFlags::SHADER_READ,
+                                rw: RwState::Read,
+                            };
+                            let img = self.get_img(
+                                *token, to_state,
+                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            )?;
+                            write_img(desc_ty, Some(img.clone()), None)
                         },
                         vk::DescriptorType::STORAGE_IMAGE => {
-                            let img = self.stage_var(
-                                    *token,
-                                    vk::PipelineStageFlags::ALL_COMMANDS,
-                                    vk::AccessFlags::SHADER_READ |
+                            let to_state = InferenceState {
+                                stage: vk::PipelineStageFlags::ALL_COMMANDS,
+                                access: vk::AccessFlags::SHADER_READ |
                                     vk::AccessFlags::SHADER_WRITE,
-                                    qfam_idx,
-                                    // TODO: (penguinliong) Allow SPIR-Q to
-                                    //       extract `readonly` decorations. 
-                                    RwState::Write,
-                                )
-                                .to_img()
-                                .cloned()
-                                .ok_or(Error::InvalidOperation)?;
-                            write_img(desc_ty, Some(img), None)
+                                rw: RwState::Write,
+                            };
+                            let img = self.get_img(
+                                *token, to_state,
+                                vk::ImageLayout::GENERAL,
+                            )?;
+                            write_img(desc_ty, Some(img.clone()), None)
                         },
                         vk::DescriptorType::SAMPLER => {
-                            let sampler = self.stage_var(
-                                    *token,
-                                    vk::PipelineStageFlags::ALL_COMMANDS,
-                                    vk::AccessFlags::SHADER_READ,
-                                    qfam_idx,
-                                    RwState::Read,
-                                )
-                                .to_sampler()
-                                .cloned()
-                                .ok_or(Error::InvalidOperation)?;
-                            write_img(desc_ty, None, Some(sampler))
+                            let sampler = self.get_sampler(*token)?;
+                            write_img(desc_ty, None, Some(sampler.clone()))
                         }
                         vk::DescriptorType::COMBINED_IMAGE_SAMPLER => {
-                            let (img, sampler) = self.stage_var(
-                                    *token,
-                                    vk::PipelineStageFlags::ALL_COMMANDS,
-                                    vk::AccessFlags::SHADER_READ,
-                                    qfam_idx,
-                                    RwState::Read,
-                                )
-                                .to_sampled_img()
-                                .ok_or(Error::InvalidOperation)?;
+                            let to_state = InferenceState {
+                                stage: vk::PipelineStageFlags::ALL_COMMANDS,
+                                access: vk::AccessFlags::SHADER_READ,
+                                rw: RwState::Read,
+                            };
+                            let (img, sampler) = self.get_sampled_img(
+                                *token, to_state,
+                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            )?;
                             write_img(desc_ty, Some(img.clone()),
                                 Some(sampler.clone()))
                         },
-                        // TODO: (penguinliong) Check out where does input
-                        // attachment go.
+                        vk::DescriptorType::INPUT_ATTACHMENT => {
+                            let to_state = InferenceState {
+                                stage: vk::PipelineStageFlags::ALL_COMMANDS,
+                                access: vk::AccessFlags::SHADER_READ,
+                                rw: RwState::Read,
+                            };
+                            let img = self.get_img(
+                                *token, to_state,
+                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            )?;
+                            write_img(desc_ty, Some(img.clone()), None)
+                        }
                     }
                 };
                 write_desc_sets.push(write_desc_set);
@@ -3444,17 +3508,14 @@ impl<'a> Recorder<'a> {
     fn clear_desc_binds(&mut self) {
         self.desc_binds.clear();
     }
-    fn flush_vert_bufs(&self, qfam_idx: u32) -> Result<()> {
+    fn flush_vert_bufs(&self) -> Result<()> {
         for (vert_bind, token) in self.vert_bufs.iter() {
-            let vert_buf = self.stage_var(
-                    *token,
-                    vk::PipelineStageFlags::VERTEX_INPUT,
-                    vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
-                    qfam_idx,
-                    RwState::Read,
-                )
-                .to_buf()
-                .ok_or(Error::InvalidOperation)?;
+            let to_state = InferenceState {
+                stage: vk::PipelineStageFlags::VERTEX_INPUT,
+                access: vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
+                rw: RwState::Read,
+            };
+            let vert_buf = self.get_buf(*token, to_state)?;
             unsafe {
                 self.dev.dev.cmd_bind_vertex_buffers(
                     self.cmdbuf,
@@ -3470,20 +3531,17 @@ impl<'a> Recorder<'a> {
     fn clear_vert_bufs(&mut self) {
         self.vert_bufs.clear();
     }
-    fn flush_idx_buf(&mut self, qfam_idx: u32) -> Result<()> {
+    fn flush_idx_buf(&mut self) -> Result<()> {
         if let Some(token) = self.idx_buf.take() {
-            let idx_buf = self.stage_var(
-                    token,
-                    vk::PipelineStageFlags::VERTEX_INPUT,
-                    vk::AccessFlags::INDEX_READ,
-                    qfam_idx,
-                    RwState::Read,
-                )
-                .to_buf()
-                .ok_or(Error::InvalidOperation)?;
+            let to_state = InferenceState {
+                stage: vk::PipelineStageFlags::VERTEX_INPUT,
+                access: vk::AccessFlags::INDEX_READ,
+                rw: RwState::Read,
+            };
+            let idx_buf = self.get_buf(token, to_state)?;
             unsafe {
                 self.dev.dev.cmd_bind_index_buffer(
-                    self.cmdbuf, idx_buf.buf, 0, vk::IndexType::UINT16
+                    self.cmdbuf, idx_buf.buf, 0, vk::IndexType::UINT16,
                 );
             }
         }
@@ -3495,17 +3553,65 @@ impl<'a> Recorder<'a> {
     }
     fn flush_attms(
         &mut self,
-        qfam_idx: u32,
         pass: &RenderPassInner,
-    ) -> Result<vk::Framebuffer> {
+        isubpass: usize,
+    ) -> Result<(vk::Framebuffer, vk::Extent2D)> {
+        // At this point all attachments, of all subpasses, shuold have been
+        // bound.
         let dev = &self.dev.dev;
         let mut attms = Vec::with_capacity(self.attms.len());
-        for token in self.attms.values() {
-            let attm = self.stage_attm(*token, qfam_idx)?;
+        let mut extent = None;
+        let subpass_detail = &pass.subpass_details[isubpass];
+        for (iattm, token) in self.attms.iter() {
+            let attm_detail = subpass_detail.attm_details.get(iattm)
+                .ok_or(Error::InvalidOperation)?;
+            let attm = if attm_detail.is_depth {
+                let to_state_r = InferenceState {
+                    stage: vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                    access: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+                    rw: RwState::Write,
+                };
+                let to_state_w = InferenceState {
+                    stage: vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                    access: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    rw: RwState::Write,
+                };
+                self.get_attm(
+                    *token,
+                    to_state_r,
+                    attm_detail.init_layout,
+                    to_state_w,
+                    attm_detail.final_layout)?
+            } else {
+                let to_state_r = InferenceState {
+                    stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    access: vk::AccessFlags::COLOR_ATTACHMENT_READ,
+                    rw: RwState::Write,
+                };
+                let to_state_w = InferenceState {
+                    stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    rw: RwState::Write,
+                };
+                self.get_attm(
+                    *token,
+                    to_state_r,
+                    attm_detail.init_layout,
+                    to_state_w,
+                    attm_detail.final_layout)?
+            };
             attms.push(attm.img_view);
+            if extent.is_none() {
+                let img_cfg = &attm.cfg;
+                extent = Some(vk::Extent2D {
+                    width: img_cfg.width,
+                    height: img_cfg.height,
+                });
+            }
         }
-
-        Self::create_framebuf(dev, pass, attms)
+        let extent = extent.unwrap();
+        let framebuf = Self::create_framebuf(dev, pass, attms, &extent)?;
+        Ok((framebuf, extent))
     }
     #[inline]
     fn clear_attms(&mut self) {
@@ -3570,28 +3676,19 @@ impl<'a> Recorder<'a> {
                 image_extent: extent,
             }
         }
-        let qfam_idx = self.dev.qmap
-            .get(&QueueInterface::Transfer)
-            .ok_or(Error::InvalidOperation)?
-            .qloc
-            .qfam_idx;
         let dev = &self.dev.dev;
-        let src_var = self.stage_var(
-                args.src_var_idx,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::AccessFlags::TRANSFER_READ,
-                qfam_idx,
-                RwState::Read,
-            );
-        let dst_var = self.stage_var(
-            args.dst_var_idx,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::AccessFlags::TRANSFER_WRITE,
-            qfam_idx,
-            RwState::Write, 
-        );
-        match (src_var, dst_var) {
-            (Variable::Buffer(src), Variable::Buffer(dst)) => {
+        let src_to_state = InferenceState {
+            stage: vk::PipelineStageFlags::TRANSFER,
+            access: vk::AccessFlags::TRANSFER_READ,
+            rw: RwState::Read,
+        };
+        let dst_to_state = InferenceState {
+            stage: vk::PipelineStageFlags::TRANSFER,
+            access: vk::AccessFlags::TRANSFER_WRITE,
+            rw: RwState::Write,
+        };
+        if let Ok(src) = self.get_buf(args.src_var_idx, src_to_state) {
+            if let Ok(dst) = self.get_buf(args.dst_var_idx, dst_to_state) {
                 unsafe {
                     dev.cmd_copy_buffer(
                         self.cmdbuf,
@@ -3600,8 +3697,43 @@ impl<'a> Recorder<'a> {
                         &[buf_copy(&*src, &*dst)],
                     );
                 }
-            },
-            (Variable::Image(src), Variable::Image(dst)) => {
+            } else if let Ok(dst) = self.get_img(
+                args.dst_var_idx,
+                dst_to_state,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            ) {
+                unsafe {
+                    dev.cmd_copy_buffer_to_image(
+                        self.cmdbuf,
+                        src.buf,
+                        dst.img,
+                        vk::ImageLayout::GENERAL,
+                        &[buf_img_copy(&*src, &*dst)],
+                    );
+                }
+            } else {
+                return Err(Error::InvalidOperation);
+            }
+        } else if let Ok(src) = self.get_img(
+            args.src_var_idx,
+            src_to_state,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        ) {
+            if let Ok(dst) = self.get_buf(args.dst_var_idx, dst_to_state) {
+                unsafe {
+                    dev.cmd_copy_image_to_buffer(
+                        self.cmdbuf,
+                        src.img,
+                        vk::ImageLayout::GENERAL,
+                        dst.buf,
+                        &[buf_img_copy(&*dst, &*src)],
+                    );
+                }
+            } else if let Ok(dst) = self.get_img(
+                args.dst_var_idx,
+                dst_to_state,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            ) {
                 unsafe {
                     dev.cmd_copy_image(
                         self.cmdbuf,
@@ -3612,30 +3744,11 @@ impl<'a> Recorder<'a> {
                         &[img_copy(&*src, &*dst)],
                     );
                 }
-            },
-            (Variable::Buffer(src), Variable::Image(dst)) => {
-                unsafe {
-                    dev.cmd_copy_buffer_to_image(
-                        self.cmdbuf,
-                        src.buf,
-                        dst.img,
-                        vk::ImageLayout::GENERAL,
-                        &[buf_img_copy(&*src, &*dst)],
-                    );
-                }
-            },
-            (Variable::Image(src), Variable::Buffer(dst)) => {
-                unsafe {
-                    dev.cmd_copy_image_to_buffer(
-                        self.cmdbuf,
-                        src.img,
-                        vk::ImageLayout::GENERAL,
-                        dst.buf,
-                        &[buf_img_copy(&*dst, &*src)],
-                    );
-                }
-            },
-            _ => return Err(Error::InvalidOperation),
+            } else {
+                return Err(Error::InvalidOperation);
+            }
+        } else {
+            return Err(Error::InvalidOperation);
         }
         Ok(())
     }
@@ -3643,9 +3756,7 @@ impl<'a> Recorder<'a> {
         &mut self,
         args: &PushConstantEventArgs,
     ) -> Result<()> {
-        let host_mem = self.stage_var_host_const(args.push_const_var_idx)
-            .to_host_mem()
-            .ok_or(Error::InvalidOperation)?;
+        let host_mem = self.get_host_mem(args.push_const_var_idx)?;
         self.push_const = Some(host_mem);
         Ok(())
     }
@@ -3656,28 +3767,14 @@ impl<'a> Recorder<'a> {
             self.unbind_var(args.bp);
         }
     }
-    fn record_dispatch(
-        &mut self,
-        args: &DispatchEventArgs,
-    ) -> Result<()> {
-        let qfam_idx = self.dev.qmap.get(&QueueInterface::Compute)
-            .ok_or(Error::InvalidOperation)?
-            .qloc
-            .qfam_idx;
-
-        let x = self.stage_var_host_const(args.nworkgrp_x_var_idx)
-            .to_count()
-            .ok_or(Error::InvalidOperation)?;
-        let y = self.stage_var_host_const(args.nworkgrp_y_var_idx)
-            .to_count()
-            .ok_or(Error::InvalidOperation)?;
-        let z = self.stage_var_host_const(args.nworkgrp_z_var_idx)
-            .to_count()
-            .ok_or(Error::InvalidOperation)?;
+    fn record_dispatch(&mut self, args: &DispatchEventArgs) -> Result<()> {
+        let x = self.get_count(args.nworkgrp_x_var_idx)?;
+        let y = self.get_count(args.nworkgrp_y_var_idx)?;
+        let z = self.get_count(args.nworkgrp_z_var_idx)?;
 
         let dev = &self.dev.dev;
         for comp_pipe in args.task.pipes.iter() {
-            self.flush_desc_binds(&comp_pipe, qfam_idx)?;
+            self.flush_desc_binds(&comp_pipe)?;
             self.flush_push_const(&comp_pipe)?;
             self.bind_pipe(&comp_pipe);
             unsafe { dev.cmd_dispatch(self.cmdbuf, x, y, z); }
@@ -3688,37 +3785,25 @@ impl<'a> Recorder<'a> {
         Ok(())
     }
     fn record_draw(&mut self, args: &DrawEventArgs) -> Result<()> {
-        let qfam_idx = self.dev.qmap.get(&QueueInterface::Graphics)
-            .ok_or(Error::InvalidOperation)?
-            .qloc
-            .qfam_idx;
-
+        let pass = &*args.pass;
         let no_idx = self.idx_buf.is_none();
-        let framebuf = self.flush_attms(qfam_idx, &*args.pass)?;
-        self.framebufs.push(framebuf);
-        self.flush_vert_bufs(qfam_idx)?;
-        self.flush_idx_buf(qfam_idx)?;
+        self.flush_vert_bufs()?;
+        self.flush_idx_buf()?;
 
-        let nvert = self.stage_var_host_const(args.nvert_var_idx)
-            .to_count()
-            .ok_or(Error::InvalidOperation)?;
-        let ninst = self.stage_var_host_const(args.ninst_var_idx)
-            .to_count()
-            .ok_or(Error::InvalidOperation)?;
+        let nvert = self.get_count(args.nvert_var_idx)?;
+        let ninst = self.get_count(args.ninst_var_idx)?;
 
         let dev = &self.dev.dev;
         let mut first = true;
-        for pipe in args.pass.pipes.iter() {
-            self.flush_push_const(&pipe);
-            self.flush_desc_binds(&pipe, qfam_idx)?;
+        for (i, subpass_detail) in pass.subpass_details.iter().enumerate() {
+            let (framebuf, extent) = self.flush_attms(pass, i)?;
+            self.framebufs.push(framebuf);
+            self.flush_push_const(&subpass_detail.pipe);
+            self.flush_desc_binds(&subpass_detail.pipe)?;
             if first {
-                let pass = &*args.pass;
                 let render_area = vk::Rect2D {
                     offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: pass.framebuf_extent.0,
-                        height: pass.framebuf_extent.1,
-                    },
+                    extent,
                 };
                 let begin_info = vk::RenderPassBeginInfo::builder()
                     .render_pass(pass.pass)
@@ -3727,7 +3812,7 @@ impl<'a> Recorder<'a> {
                     .build();
                 // TODO: (penguinliong) Support attachment clear values.
                 // TODO: (penguinliong) Use secondary command buffer if
-                //       possible.
+                //       possible. (Should we?)
                 unsafe {
                     dev.cmd_begin_render_pass(
                         self.cmdbuf, &begin_info, vk::SubpassContents::INLINE
@@ -3742,8 +3827,22 @@ impl<'a> Recorder<'a> {
                 }
             }
 
-            self.flush_push_const(&pipe)?;
-            self.bind_pipe(&pipe);
+            self.flush_push_const(&subpass_detail.pipe)?;
+            self.bind_pipe(&subpass_detail.pipe);
+            let viewport = vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: extent.width as f32,
+                height: extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            unsafe { dev.cmd_set_viewport(self.cmdbuf, 0, &[viewport]); }
+            let scissor = vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent,
+            };
+            unsafe { dev.cmd_set_scissor(self.cmdbuf, 0, &[scissor]); }
             if no_idx {
                 unsafe {
                     dev.cmd_draw(self.cmdbuf, nvert, ninst, 0, 0);
@@ -3964,15 +4063,15 @@ impl Transaction {
         let mut transact = self.0;
         let devproc = &*transact.devproc;
         let dev = &*devproc.dev;
-        let mut state_dict = HashMap::new();
 
+        let mut v_dict = HashMap::new();
         for (name, token) in devproc.name_map.iter() {
             let var = var_dict.get(name)
                 .ok_or(Error::InvalidOperation)?;
-            state_dict.insert(*token, RefCell::new(VariableState::new(var)));
+            v_dict.insert(*token, var);
         }
 
-        let mut rec = Recorder::new(dev, &mut state_dict, &mut transact.desc_pools,
+        let mut rec = Recorder::new(dev, &mut v_dict, &mut transact.desc_pools,
             &mut transact.framebufs);
 
         for (i, chunk) in devproc.graph.chunks.iter().enumerate() {

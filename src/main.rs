@@ -39,6 +39,7 @@ fn main() {
         .unwrap();
 
     let dev = Device::new(&physdev).unwrap();
+    let swapchain_img_cfg = dev.swapchain_img_cfg().unwrap().clone();
     let shader_mods = collect_spirv_binaries("assets/effects/example")
         .into_iter()
         .filter_map(|(name, spv)| {
@@ -57,7 +58,7 @@ fn main() {
         attm_ref: AttachmentReference,
     };
     impl Head {
-        fn new() -> Head {
+        fn new(swapchain_img_cfg: &ImageConfig) -> Head {
             Head {
                 attr_bind: AttributeBinding {
                     bind: 0,
@@ -67,10 +68,11 @@ fn main() {
                 },
                 attm_ref: AttachmentReference {
                     attm_idx: 0,
-                    fmt: vk::Format::R8G8B8A8_UNORM,
+                    fmt: swapchain_img_cfg.fmt,
                     load_op: vk::AttachmentLoadOp::DONT_CARE,
                     store_op: vk::AttachmentStoreOp::STORE,
                     blend_state: None,
+                    init_layout: vk::ImageLayout::PRESENT_SRC_KHR,
                     final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
                 }
             }
@@ -82,16 +84,16 @@ fn main() {
         }
     }
     impl FragmentHead for Head {
-        fn attm_ref(&self, location: u32) -> Option<&AttachmentReference> {
+        fn color_attm_ref(&self, location: u32) -> Option<&AttachmentReference> {
             if location == 0 { Some(&self.attm_ref) } else { None }
         }
-        fn depth_attm_idx(&self, depth_attm_id: u32) -> Option<u32> {
+        fn depth_attm_ref(&self) -> Option<&AttachmentReference> {
             None
         }
     }
     let vert = shader_mods["example.vert"].entry_points().next().unwrap().unwrap();
     let frag = shader_mods["example.frag"].entry_points().next().unwrap().unwrap();
-    let head = Head::new();
+    let head = Head::new(&swapchain_img_cfg);
     // Note that this is sorted in stage order.
     let shader_arr = ShaderArray::new(&[vert, frag]).unwrap();
     let raster_cfg = GraphicsRasterizationConfig {
@@ -114,9 +116,9 @@ fn main() {
     };
     */
     let graph_pipe = GraphicsPipeline::new(
-        &shader_arr, &head, &head, None, raster_cfg, None, None
+        &shader_arr, &head, &head, raster_cfg, None, None
     ).unwrap();
-    let pass = RenderPass::new(&dev, &[graph_pipe], &[], (64, 64)).unwrap();
+    let pass = RenderPass::new(&dev, &[graph_pipe], &[]).unwrap();
 
 
     let devproc = DeviceProc::new(&dev, |sym| {
