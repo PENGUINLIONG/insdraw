@@ -331,8 +331,8 @@ impl PhysicalDevice {
         Ok(dev_exts)
     }
     fn filter_feats(
-        ctxt: &Context,
-        physdev: vk::PhysicalDevice,
+        _ctxt: &Context,
+        _physdev: vk::PhysicalDevice,
     ) -> Result<vk::PhysicalDeviceFeatures> {
         let feats = vk::PhysicalDeviceFeatures::default();
         Ok(feats)
@@ -521,7 +521,7 @@ impl Device {
         };
         let present_detail = {
             if qmap.contains_key(&QueueInterface::Present) {
-                Some(DevicePresentationDetail::new(physdev, &dev, &cap_detail,
+                Some(DevicePresentationDetail::new(physdev, &cap_detail,
                     &qmap)?)
             } else {
                 None
@@ -912,7 +912,7 @@ impl MemorySlice {
                 self.offset as u64,
                 self.size as u64,
                 vk::MemoryMapFlags::empty())? as *mut u8;
-            std::intrinsics::copy(src, dst, self.size);
+            std::intrinsics::copy(src, dst, size);
             dev.unmap_memory(dev_mem);
         }
         Ok(())
@@ -928,7 +928,7 @@ impl MemorySlice {
                 self.offset as u64,
                 self.size as u64,
                 vk::MemoryMapFlags::empty())? as *const u8;
-            std::intrinsics::copy(src, dst, self.size);
+            std::intrinsics::copy(src, dst, size);
             dev.unmap_memory(dev_mem);
         }
         Ok(())
@@ -1019,7 +1019,7 @@ impl PagedMemoryAllocator {
             .or_else(|_| self.alloc_on_new_page(dev, size))
     }
     /// Drop all unused memory pages.
-    pub fn shrink_to_fit(&mut self, dev: &Device) {
+    pub fn shrink_to_fit(&mut self) {
         let mut i = 0;
         while i < self.pages.len() {
             let unused = {
@@ -1157,7 +1157,6 @@ impl DevicePresentationDetail {
             .min(physdev_surf_detail.surf_cap.max_image_count);
         let fmt = physdev_surf_detail.surf_fmt.format;
         let color_space = physdev_surf_detail.surf_fmt.color_space;
-        let trans = physdev_surf_detail.surf_cap.current_transform;
 
         let width = ctxt_surf_detail.width;
         let height = ctxt_surf_detail.height;
@@ -1200,13 +1199,12 @@ impl DevicePresentationDetail {
 
         let img_cfg = ImageConfig {
             fmt, view_ty: vk::ImageViewType::TYPE_2D, width, height, depth: 1,
-            nlayer: 1, nmip: 1, usage: vk::ImageUsageFlags::COLOR_ATTACHMENT 
+            nlayer: 1, nmip: 1, usage: vk::ImageUsageFlags::COLOR_ATTACHMENT
         };
         Ok((swapchain, img_cfg))
     }
     pub fn new(
         physdev: &PhysicalDevice,
-        dev: &ash::Device,
         cap_detail: &DeviceCapabilityDetail,
         qmap: &HashMap<QueueInterface, DeviceQueueDetail>,
     ) -> Result<DevicePresentationDetail> {
@@ -1355,12 +1353,12 @@ impl Buffer {
 impl Drop for BufferInner {
     fn drop(&mut self) {
         match &self.mem {
-            MemoryManagement::Explicit(buf) => {
-                let dev = &self.mem.dev().dev;
+            MemoryManagement::Explicit(mem) => {
+                let dev = &mem.mem.dev.dev;
                 unsafe { dev.destroy_buffer(self.buf, None) };
                 info!("destroyed buffer");
             },
-            MemoryManagement::Implicit(buf) => {
+            MemoryManagement::Implicit(dev) => {
                 unimplemented!();
             }
         }
@@ -1493,7 +1491,7 @@ impl Drop for ImageInner {
     fn drop(&mut self) {
         match &self.mem {
             MemoryManagement::Explicit(mem) => {
-                let dev = &self.mem.dev().dev;
+                let dev = &mem.mem.dev.dev;
                 unsafe {
                     dev.destroy_image(self.img, None);
                     info!("destroyed image");
@@ -1690,7 +1688,7 @@ impl ShaderArray {
         let manifest = {
             let mut manifest = Manifest::default();
             for entry_point in entry_points {
-                manifest.merge(entry_point.manifest());
+                manifest.merge(entry_point.manifest())?;
             }
             manifest
         };
@@ -1887,7 +1885,7 @@ impl GraphicsPipeline {
     fn collect_attr_map(
         manifest: &Manifest,
         vert_head: &dyn VertexHead,
-        mut attr_map: &mut HashMap<InterfaceLocation, AttributeBinding>,
+        attr_map: &mut HashMap<InterfaceLocation, AttributeBinding>,
     ) -> Result<()> {
         use std::collections::hash_map::Entry::Vacant;
         for attr_res in manifest.inputs() {
@@ -1909,8 +1907,8 @@ impl GraphicsPipeline {
     fn collect_attm_map(
         manifest: &Manifest,
         frag_head: &dyn FragmentHead,
-        mut attm_map: &mut HashMap<InterfaceLocation, AttachmentReference>,
-        mut depth_attm_ref: &mut Option<AttachmentReference>,
+        attm_map: &mut HashMap<InterfaceLocation, AttachmentReference>,
+        depth_attm_ref: &mut Option<AttachmentReference>,
     ) -> Result<()> {
         use std::collections::hash_map::Entry::Vacant;
         for attm_ref in manifest.outputs() {
@@ -2075,6 +2073,7 @@ impl GraphicsPipelineDescriptionDetail {
             .rasterizer_discard_enable(false)
             .polygon_mode(poly_mode)
             .cull_mode(graph_pipe.raster_cfg.cull_mode)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .depth_bias_enable(false)
             .line_width(1.0)
             .build();
@@ -2107,9 +2106,14 @@ impl GraphicsPipelineDescriptionDetail {
         }
 
         let mut attm_blend = vk::PipelineColorBlendAttachmentState::default();
-        let mut blend_consts: [f32; 4] = Default::default();
+        let mut blend_consts: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+        // Blending must be enabled to output color.
+        //
+        // > If blending is not enabled, the source fragment’s color for that
+        // > attachment is passed through unmodified.
+        attm_blend.blend_enable = vk::TRUE;
+        attm_blend.color_write_mask = vk::ColorComponentFlags::all();
         if let Some(blend_cfg) = graph_pipe.blend_cfg.as_ref() {
-            attm_blend.blend_enable = vk::TRUE;
             attm_blend.src_color_blend_factor = blend_cfg.src_factor;
             attm_blend.dst_color_blend_factor = blend_cfg.dst_factor;
             attm_blend.color_blend_op = blend_cfg.blend_op;
@@ -2121,6 +2125,11 @@ impl GraphicsPipelineDescriptionDetail {
             blend_consts[1] = blend_cfg.blend_consts[1];
             blend_consts[2] = blend_cfg.blend_consts[2];
             blend_consts[3] = blend_cfg.blend_consts[3];
+        } else {
+            attm_blend.src_color_blend_factor = vk::BlendFactor::ONE;
+            attm_blend.dst_color_blend_factor = vk::BlendFactor::ONE;
+            attm_blend.src_alpha_blend_factor = vk::BlendFactor::ONE;
+            attm_blend.dst_alpha_blend_factor = vk::BlendFactor::ONE;
         }
         let attm_blends = std::iter::repeat(attm_blend)
             .take(graph_pipe.attm_map.len())
@@ -2264,8 +2273,6 @@ impl RenderPass {
             color_attms: Vec<vk::AttachmentReference>,
             depth_attm: Option<vk::AttachmentReference>,
         }
-        let mut subpass_desc_details =
-            Vec::<SubpassDescriptionDetail>::with_capacity(graph_pipes.len());
         let subpass_desc_details = graph_pipes.iter()
             .map(|graph_pipe| SubpassDescriptionDetail {
                 input_attms: Self::collect_input_attms(&attm_refs, &graph_pipe)
@@ -3207,7 +3214,7 @@ impl<'a> Recorder<'a> {
             .and_then(Variable::to_buf)
             .ok_or(Error::InvalidOperation)?;
         let mut infer_states = self.infer_states.borrow_mut();
-        let mut from_state = infer_states
+        let from_state = infer_states
             .entry(StatefulObjectId::Buffer(buf.buf))
             .or_default();
         if from_state.needs_bar(&to_state) {
@@ -3226,7 +3233,7 @@ impl<'a> Recorder<'a> {
             .and_then(Variable::to_img)
             .ok_or(Error::InvalidOperation)?;
         let mut infer_states = self.infer_states.borrow_mut();
-        let mut from_state = infer_states
+        let from_state = infer_states
             .entry(StatefulObjectId::Image(img.img))
             .or_default();
         if from_state.needs_bar(&to_state) | (img.layout.get() != to_layout) {
@@ -3251,7 +3258,7 @@ impl<'a> Recorder<'a> {
             .and_then(Variable::to_sampled_img)
             .ok_or(Error::InvalidOperation)?;
         let mut infer_states = self.infer_states.borrow_mut();
-        let mut from_state = infer_states
+        let from_state = infer_states
             .entry(StatefulObjectId::Image(img.img))
             .or_default();
         if from_state.needs_bar(&to_state) | (img.layout.get() != to_layout) {
@@ -3806,17 +3813,26 @@ impl<'a> Recorder<'a> {
         for (i, subpass_detail) in pass.subpass_details.iter().enumerate() {
             let (framebuf, extent) = self.flush_attms(pass, i)?;
             self.framebufs.push(framebuf);
-            self.flush_push_const(&subpass_detail.pipe);
+            self.flush_push_const(&subpass_detail.pipe)?;
             self.flush_desc_binds(&subpass_detail.pipe)?;
             if first {
                 let render_area = vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent,
                 };
+                let clear_values = [
+                    vk::ClearValue {
+                        color: vk::ClearColorValue {
+                            float32: [0.0, 0.0, 0.0, 1.0],
+                        }
+                    }
+                ];
+
                 let begin_info = vk::RenderPassBeginInfo::builder()
                     .render_pass(pass.pass)
                     .framebuffer(framebuf)
                     .render_area(render_area)
+                    .clear_values(&clear_values)
                     .build();
                 // TODO: (penguinliong) Support attachment clear values.
                 // TODO: (penguinliong) Use secondary command buffer if
@@ -4023,7 +4039,6 @@ impl Transaction {
         let mut submit_details = {
             Vec::<TransactionSubmitDetail>::with_capacity(graph.chunks.len())
         };
-        let ilast = graph.chunks.len() - 1;
         for (i, chunk) in graph.chunks.iter().enumerate() {
             let queue_detail = chunk.qi
                 // Unbound chunks are not allowed. It's also not allowed to do

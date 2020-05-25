@@ -24,7 +24,7 @@ fn main() {
 
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
-        .with_min_inner_size(LogicalSize::new(1024.0, 768.0))
+        //.with_min_inner_size(LogicalSize::new(1024.0, 768.0))
         .with_title("insdraw lab")
         .with_transparent(true)
         .build(&event_loop)
@@ -69,7 +69,7 @@ fn main() {
                 attm_ref: AttachmentReference {
                     attm_idx: 0,
                     fmt: swapchain_img_cfg.fmt,
-                    load_op: vk::AttachmentLoadOp::DONT_CARE,
+                    load_op: vk::AttachmentLoadOp::CLEAR,
                     store_op: vk::AttachmentStoreOp::STORE,
                     blend_state: None,
                     init_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -125,13 +125,14 @@ fn main() {
         // TODO: Use macro to make this neat?
         let mesh   = sym.buf("mesh");
         let nvert  = sym.count("nvert");
+        let ninst  = sym.count("ninst");
         let target = sym.img("target");
 
         // NOTE: Order is important.
         let read_pass = sym.flow()
             .bind(BindPoint::VertexInput(0), Some(mesh))
             .bind(BindPoint::Attachment(0), Some(target))
-            .draw(&pass, nvert, 1)
+            .draw(&pass, nvert, ninst)
             .pause();
 
         sym.graph(&read_pass)
@@ -151,62 +152,7 @@ fn main() {
             MemoryUsage::Push,
         ).unwrap()
     };
-    let swapchain_img = dev.acquire_swapchain_img()
-        .unwrap();
 
-    let var_dict = [
-        ("mesh", mesh.into()),
-        ("nvert", 3.into()),
-        ("target", swapchain_img.img().into()),
-    ].into_iter()
-        .cloned()
-        .collect::<HashMap<_,_>>();
-    
-    while swapchain_img.wait(100).is_err() { }
-
-    let mut submitted = Transaction::new(&devproc)
-        .unwrap()
-        .arm(&var_dict)
-        .unwrap()
-        .submit()
-        .unwrap();
-    while submitted.wait(100).is_err() { }
-    let transact = submitted.reset().unwrap();
-
-    swapchain_img.present().unwrap();
-
-
-
-
-/* USAGE CODE
-
-    let pass = RenderPass::new(&dev, ..);
-    let img = Image(dev, .., usage);
-    let buf = Buffer(dev, .., usage);
-    let param = RenderPassParameterPack::new(&pass);
-    param.vert_input(buf);
-    param.push_const(&[0,0,0,0] as Bytes);
-    param.desc_bind(0, 0, buf);
-    param.desc_bind(0, 1, img);
-    let vert_input = VertexInput::new(&[data]);
-
-    img.push(data, dev_offset); // <- should be equivalent to:
-    let dev_offset = 0;
-    while let Err(nbyte_txed) = buf.try_push(data, dev_offset) {
-        data = &data[nbyte_txed..];
-        dev_offset += nbyte_txed;
-        dev.sync_data();
-    }
-
-    let mut trans = Transaction::new(&dev);
-    trans.then(pass, param)
-        .then(task, param);
-    trans.commit()
-        .await!();
-
-*/
-
-/*
     event_loop.run(move |event, _, control_flow| {
         match event {
             Event::EventsCleared => {
@@ -215,7 +161,28 @@ fn main() {
                 window.request_redraw();
             },
             Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
-
+                let swapchain_img = dev.acquire_swapchain_img()
+                    .unwrap();
+                let var_dict = [
+                    ("mesh", mesh.clone().into()),
+                    ("nvert", 3.into()),
+                    ("ninst", 1.into()),
+                    ("target", swapchain_img.img().into()),
+                ].iter()
+                    .cloned()
+                    .collect::<HashMap<_,_>>();
+                while swapchain_img.wait(100).is_err() { }
+                let mut submitted = Transaction::new(&devproc)
+                    .unwrap()
+                    .arm(&var_dict)
+                    .unwrap()
+                    .submit()
+                    .unwrap();
+                while submitted.wait(100).is_err() { }
+                let transact = submitted.reset().unwrap();
+            
+                let _ = swapchain_img.present();
+                window.request_redraw()
             },
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
                 info!("terminating insdraw...");
@@ -225,17 +192,6 @@ fn main() {
         }
     });
     info!("insdraw terminated");
-*/
-
-/*
-    let bind1 = VertexBindingPoint::new(pass, stride, input_rate);
-    let attr1 = VertexAttribute::new(bind1, attr, offset, fmt);
-    let attrs = vec![attr1];
-    let vert = Stage::new(, attrs);
-    let geom = Stage::new();
-    let attms = StageFunctor::new(vert);
-    let framebuf = Framebuffer::new(attms);
-*/
 }
 
 use log::{info, error};
