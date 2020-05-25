@@ -72,7 +72,7 @@ fn main() {
                     load_op: vk::AttachmentLoadOp::DONT_CARE,
                     store_op: vk::AttachmentStoreOp::STORE,
                     blend_state: None,
-                    init_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+                    init_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                     final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
                 }
             }
@@ -147,7 +147,7 @@ fn main() {
         Buffer::with_data(
             &dev,
             &verts,
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
             MemoryUsage::Push,
         ).unwrap()
     };

@@ -2213,7 +2213,7 @@ impl RenderPass {
             }
             let attm_ref = vk::AttachmentReference {
                 attachment: attm_ref.attm_idx,
-                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                layout: attm_ref.init_layout,
             };
             color_attms.push(attm_ref);
         }
@@ -2312,7 +2312,14 @@ impl RenderPass {
         // broadly. At least for now we only want a minimal executable model.
         let ptsci = vk::PipelineTessellationStateCreateInfo::default();
 
-        let pvsci = vk::PipelineViewportStateCreateInfo::default();
+        let viewport = [vk::Viewport::default()];
+        let scissor = [vk::Rect2D::default()];
+        let pvsci = vk::PipelineViewportStateCreateInfo::builder()
+            .viewport_count(1)
+            .viewports(&viewport)
+            .scissor_count(1)
+            .scissors(&scissor)
+            .build();
 
         let dyn_states = [
             vk::DynamicState::VIEWPORT,
@@ -3347,6 +3354,7 @@ impl<'a> Recorder<'a> {
     }
     fn flush_desc_binds(&mut self, pipe: &PipelineInner) -> Result<()> {
         let dev = &self.dev.dev;
+        if self.desc_binds.len() == 0 { return Ok(()); }
         let shader_arr = &*pipe.shader_arr;
         let desc_pool = Self::create_desc_pool(dev, shader_arr)?;
         // TODO: (penguinliong) Remember to destroy this.
@@ -3852,6 +3860,9 @@ impl<'a> Recorder<'a> {
                     dev.cmd_draw_indexed(self.cmdbuf, nvert, ninst, 0, 0, 0);
                 }
             }
+        }
+        unsafe {
+            dev.cmd_end_render_pass(self.cmdbuf);
         }
 
         self.clear_push_const();
