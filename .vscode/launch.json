@@ -1,0 +1,25 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/insdraw.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                { "name": "RUST_LOG", "value": "trace" },
+                { "name": "RUST_BACKTRACE", "value": "1" },
+                //{ "name": "VK_INSTANCE_LAYERS", "value": "VK_LAYER_LUNARG_api_dump;VK_LAYER_KHRONOS_validation" }
+                { "name": "VK_INSTANCE_LAYERS", "value": "VK_LAYER_KHRONOS_validation" }
+            ],
+            "externalConsole": false
+        }
+
+    ]
+}

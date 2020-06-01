@@ -1,7 +1,5 @@
 #version 450 core
 
-layout(constant_id=0) const int NLIGHT = 1;
-
 // # Input
 //
 // Interpolated fragment representation.
@@ -27,11 +25,11 @@ struct Light {
     vec3 pos;
     vec3 color;
 };
-layout(std140, set=1) readonly
-uniform Lighting {
+layout(std430, set=1, binding=0) readonly
+buffer Lighting {
     vec4 cam_pos;
-    Light[NLIGHT] lights;
-};
+    Light[] lights;
+} l[2];
 //
 // Material information.
 layout(std140, binding=1)
@@ -39,12 +37,20 @@ uniform Material {
     vec3 albedo;
     float metalicity;
     float roughness;
-};
+    mat3 fdsa[2];
+} mat[2];
 //
+
+layout(input_attachment_index=0, binding=2)
+uniform subpassInput someImage;
+layout(binding=3)
+uniform sampler2D imgggg;
 
 const float PI = 3.1415926;
 const float TAU = PI * 2;
 
 void main() {
-    color = vec4(0.0, 0.0, 1.0, 1.0);
+    float x = mat[0].metalicity;
+    vec4 ccc = l[0].cam_pos;
+    color = vec4(0.0, 0.0, 1.0, 1.0) + subpassLoad(someImage).rgba + texture(imgggg, vec2(0.0, 0.0));
 }

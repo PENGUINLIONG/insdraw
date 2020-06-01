@@ -1,6 +1,7 @@
 use std::fmt;
 use std::error;
 use ash::{LoadingError, InstanceError};
+use spirq::error::Error as SpirqError;
 type VkResultCode = ash::vk::Result;
 
 #[derive(Debug)]
@@ -8,7 +9,14 @@ pub enum Error {
     LibraryError(LoadingError),
     RuntimeError(InstanceError),
     VulkanError(VkResultCode),
-    NoCapablePhysicalDevice,
+    MissingExtension(&'static std::ffi::CStr),
+    UnsupportedPlatform,
+    InflexibleMemory,
+    InvalidOperation,
+    InvalidName(bool), // Whether the name is expected to exist before the op.
+    SpirqError(SpirqError),
+    PipelineMismatched(&'static str),
+    OutOfMemory,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -17,7 +25,15 @@ impl fmt::Display for Error {
             LibraryError(err) => write!(f, "{}", err),
             RuntimeError(err) => write!(f, "{}", err),
             VulkanError(errcode) => write!(f, "{}", errcode.as_raw()),
-            NoCapablePhysicalDevice => write!(f, "no capable device available"),
+            MissingExtension(ext_name) => write!(f, "{:?} is required but unsupported", ext_name),
+            UnsupportedPlatform => write!(f, "unsupported platform"),
+            InflexibleMemory => write!(f, "memory cannot be resized"),
+            InvalidOperation => write!(f, "an invalid operation was invoked"),
+            InvalidName(true) => write!(f, "expect an existing name"),
+            InvalidName(false) => write!(f, "expect an absent name"),
+            SpirqError(err) => write!(f, "reflection error: {}", err),
+            PipelineMismatched(msg) => msg.fmt(f),
+            OutOfMemory => write!(f, "out of managed memory"),
         }
     }
 }
@@ -27,6 +43,7 @@ impl error::Error for Error {
         match self {
             LibraryError(err) => Some(err),
             RuntimeError(err) => Some(err),
+            SpirqError(err) => Some(err),
             _ => None,
         }
     }
@@ -41,3 +58,8 @@ impl From<InstanceError> for Error {
 impl From<VkResultCode> for Error {
     fn from(x: VkResultCode) -> Error { Error::VulkanError(x) }
 }
+impl From<SpirqError> for Error {
+    fn from(x: SpirqError) -> Error { Error::SpirqError(x) }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
