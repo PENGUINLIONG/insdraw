@@ -1687,8 +1687,12 @@ impl ShaderArray {
         if entry_points.len() == 0 { return Err(Error::InvalidOperation) }
         let manifest = {
             let mut manifest = Manifest::default();
-            for entry_point in entry_points {
-                manifest.merge(entry_point.manifest())?;
+            for (i, entry_point) in entry_points.into_iter().enumerate() {
+                if i == 0 {
+                    manifest.merge_pipe(entry_point.manifest(), true, false)?;
+                } else {
+                    manifest.merge_pipe(entry_point.manifest(), false, true)?;
+                }
             }
             manifest
         };
@@ -3820,19 +3824,11 @@ impl<'a> Recorder<'a> {
                     offset: vk::Offset2D::default(),
                     extent,
                 };
-                let clear_values = [
-                    vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: [0.0, 0.0, 0.0, 1.0],
-                        }
-                    }
-                ];
-
                 let begin_info = vk::RenderPassBeginInfo::builder()
                     .render_pass(pass.pass)
                     .framebuffer(framebuf)
                     .render_area(render_area)
-                    .clear_values(&clear_values)
+                    //.clear_values(&clear_values)
                     .build();
                 // TODO: (penguinliong) Support attachment clear values.
                 // TODO: (penguinliong) Use secondary command buffer if

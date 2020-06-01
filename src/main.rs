@@ -54,38 +54,48 @@ fn main() {
         .collect::<HashMap<_, _>>();
 
     struct Head {
-        attr_bind: AttributeBinding,
-        attm_ref: AttachmentReference,
+        attr_binds: Vec<AttributeBinding>,
+        attm_refs: Vec<AttachmentReference>,
     };
     impl Head {
         fn new(swapchain_img_cfg: &ImageConfig) -> Head {
             Head {
-                attr_bind: AttributeBinding {
-                    bind: 0,
-                    offset: 0,
-                    stride: 2 * std::mem::size_of::<f32>(),
-                    fmt: vk::Format::R32G32_SFLOAT,
-                },
-                attm_ref: AttachmentReference {
-                    attm_idx: 0,
-                    fmt: swapchain_img_cfg.fmt,
-                    load_op: vk::AttachmentLoadOp::CLEAR,
-                    store_op: vk::AttachmentStoreOp::STORE,
-                    blend_state: None,
-                    init_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
-                }
+                attr_binds: vec![
+                    AttributeBinding {
+                        bind: 0,
+                        offset: 0,
+                        stride: 5 * std::mem::size_of::<f32>(),
+                        fmt: vk::Format::R32G32_SFLOAT,
+                    },
+                    AttributeBinding {
+                        bind: 0,
+                        offset: 2 * std::mem::size_of::<f32>(),
+                        stride: 5 * std::mem::size_of::<f32>(),
+                        fmt: vk::Format::R32G32B32_SFLOAT,
+                    },
+                ],
+                attm_refs: vec![
+                    AttachmentReference {
+                        attm_idx: 0,
+                        fmt: swapchain_img_cfg.fmt,
+                        load_op: vk::AttachmentLoadOp::DONT_CARE,
+                        store_op: vk::AttachmentStoreOp::STORE,
+                        blend_state: None,
+                        init_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+                    },
+                ],
             }
         }
     }
     impl VertexHead for Head {
         fn attr_bind(&self, location: u32) -> Option<&AttributeBinding> {
-            if location == 0 { Some(&self.attr_bind) } else { None }
+            Some(&self.attr_binds[location as usize])
         }
     }
     impl FragmentHead for Head {
         fn color_attm_ref(&self, location: u32) -> Option<&AttachmentReference> {
-            if location == 0 { Some(&self.attm_ref) } else { None }
+            Some(&self.attm_refs[location as usize])
         }
         fn depth_attm_ref(&self) -> Option<&AttachmentReference> {
             None
@@ -141,9 +151,9 @@ fn main() {
 
     let mesh = {
         let verts: Vec<f32> = vec![
-            -0.5, -0.5,
-            -0.5, 0.5,
-            0.5, -0.5,
+            -0.25, 0.433, 1.0, 0.0, 0.0,
+             0.0, -0.433, 0.0, 1.0, 0.0,
+             0.25, 0.433, 0.0, 0.0, 1.0,
         ];
         Buffer::with_data(
             &dev,
