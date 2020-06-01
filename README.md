@@ -4,6 +4,14 @@ Insdraw is an attempt to empower vulkan with automatically deduced image layout 
 
 It will be published as a library as long as I keep working on it. (Who knows!)
 
-# Sorta Warning
+## Demo
+
+```bash
+cargo run
+```
+
+![Instraw demo](./demo.png)
+
+## Sorta Warning
 
 This is only an experimental project which I would prefer you not to rely on in some important projects.
